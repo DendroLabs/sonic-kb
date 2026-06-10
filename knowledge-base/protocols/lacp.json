@@ -760,12 +760,12 @@
     {
       "note": "The SONiC LACP pipeline is: CONFIG_DB -> teammgrd (writes teamd JSON config) -> teamd (LACP state machine) -> teamsyncd (netlink listener) -> APPL_DB LAG_MEMBER_TABLE -> orchagent -> ASIC_DB -> syncd -> ASIC. A failure at any stage stops LAG state from reaching hardware. When a PortChannel member does not forward traffic, always check both the teamd state and the ASIC_DB LAG member programming.",
       "human_error_risk": "MEDIUM",
-      "source_ref": "sonic-buildimage:src/sonic-swss/cfgmgr/teammgrd.cpp and src/sonic-swss/orchagent/lagorch.cpp"
+      "source_ref": "sonic-swss:cfgmgr/teammgrd.cpp and sonic-swss:orchagent/portsorch.cpp (LAG handling)"
     },
     {
       "note": "The minimum-links (min_links) parameter controls when a PortChannel is operationally down. If the number of active (DISTRIBUTING) member ports drops below min_links, the PortChannel interface goes operationally down even if some members are still physically up. The default min_links is 1. Set min_links higher only if you explicitly need the PortChannel to fail when redundancy is lost -- in many deployments min_links=1 is the correct setting.",
       "human_error_risk": "MEDIUM",
-      "source_ref": "SONiC PortChannel design and sonic-swss/orchagent/lagorch.cpp"
+      "source_ref": "SONiC PortChannel design and sonic-swss/orchagent/portsorch.cpp (LAG handling)"
     },
     {
       "note": "For MCLAG deployments, both MCLAG peers must present the same LACP System ID (system_mac + system_priority) to the client switch. The client switch sees a single LACP endpoint spanning both physical switches. Configure 'mclag_system_mac' in CONFIG_DB MCLAG_DOMAIN table and ensure it propagates to the PORTCHANNEL config on both peers via iccpd. Failure to match system MACs is the most common MCLAG LACP failure and causes split-brain LAG behavior.",
@@ -785,7 +785,7 @@
     {
       "note": "SONiC 202211 and later versions support PortChannel per-member port hashing for load balancing. The hash is computed over packet fields (IP src/dst, TCP/UDP ports, etc.) by orchagent and programmed into the ASIC. If traffic appears unbalanced across LAG members (one member at 100%, others idle), check the load-balance hash configuration: 'show hash'. Asymmetric traffic patterns (e.g., all traffic has the same source IP) cannot be fixed by LACP -- this is a hash policy issue, not an LACP issue.",
       "human_error_risk": "LOW",
-      "source_ref": "SONiC load balance design and sonic-swss/orchagent/lagorch.cpp"
+      "source_ref": "SONiC load balance design and sonic-swss/orchagent/portsorch.cpp (LAG hash handling)"
     },
     {
       "note": "teamd in SONiC supports both 'activebackup' and 'lacp' runner types. The LACP runner is used for dynamic LAG negotiation. The 'activebackup' runner does NOT use LACP -- it is a simple active/standby without negotiation. Verify the runner type in the teamd config file or via 'teamdctl <PortChannel> config dump' to confirm LACP is actually running and not a static bond.",

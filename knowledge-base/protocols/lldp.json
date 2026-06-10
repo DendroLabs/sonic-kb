@@ -584,17 +584,17 @@
     {
       "note": "LLDP in SONiC runs inside the 'lldp' Docker container. It consists of three processes managed by supervisord: lldpd (the protocol daemon), lldpmgrd (reads CONFIG_DB and configures lldpd), and lldpsyncd (reads lldpd neighbor table and writes to STATE_DB). All three must be running for end-to-end LLDP functionality. Check all three with 'docker exec lldp supervisorctl status' before assuming a single-process failure.",
       "human_error_risk": "MEDIUM",
-      "source_ref": "sonic-buildimage:src/lldpd/ and src/sonic-lldp/"
+      "source_ref": "sonic-buildimage:dockers/docker-lldp/ (lldpd packaging, lldpmgrd) and sonic-dbsyncd:src/lldp_syncd/"
     },
     {
       "note": "lldpmgrd is the CONFIG_DB-to-lldpd bridge, analogous to bgpcfgd for BGP. It calls lldpcli (lldpd's CLI tool) to configure lldpd at runtime whenever CONFIG_DB changes. Direct lldpcli commands made outside of lldpmgrd may be overwritten on the next lldpmgrd CONFIG_DB sync event. For persistent LLDP configuration, always use 'config lldp ...' SONiC CLI commands or modify CONFIG_DB directly and let lldpmgrd pick up the change.",
       "human_error_risk": "HIGH",
-      "source_ref": "sonic-buildimage:src/sonic-lldp/lldpmgrd.py"
+      "source_ref": "sonic-buildimage:dockers/docker-lldp/lldpmgrd"
     },
     {
       "note": "lldpsyncd uses polling (not event-driven) to read lldpd's neighbor table via 'lldpcli -f json show neighbors'. It polls at a fixed interval (typically 10 seconds) and diffs against the current STATE_DB state. This means STATE_DB LLDP neighbor data can be up to 10 seconds stale relative to what lldpd knows internally. Use 'docker exec lldp lldpcli show neighbors' for the freshest view of LLDP state.",
       "human_error_risk": "LOW",
-      "source_ref": "sonic-buildimage:src/sonic-lldp/lldpsyncd.py"
+      "source_ref": "sonic-dbsyncd:src/lldp_syncd/daemon.py"
     },
     {
       "note": "LLDP multicast frames (01:80:C2:00:00:0E) are not forwarded by switches operating as Layer 2 bridges -- this is by IEEE design. If a SONiC switch is acting as a pure L2 switch, LLDP only discovers directly connected neighbors one hop away. It cannot see topology beyond the local link. This is a common source of confusion when operators expect LLDP to behave like CDP in a multi-hop context.",
@@ -614,7 +614,7 @@
     {
       "note": "In SONiC, the 'show lldp neighbors' and 'show lldp table' commands read from STATE_DB (Redis DB 6) LLDP_ENTRY_TABLE. If lldpsyncd is stopped, these commands will show stale data from the last sync. Always cross-check with 'docker exec lldp lldpcli show neighbors' which reads directly from lldpd in-memory state to determine if the issue is in the protocol layer or in the SONiC sync pipeline.",
       "human_error_risk": "LOW",
-      "source_ref": "SONiC show commands: src/sonic-utilities/show/lldp.py"
+      "source_ref": "SONiC show commands: sonic-utilities:show/main.py (lldp group) and scripts/lldpshow"
     }
   ],
   "sonic_frr_mapping": {
@@ -622,8 +622,8 @@
     "container": "lldp",
     "lldpd_socket": "/var/run/lldpd.socket (lldpcli control socket)",
     "lldpcli_path": "/usr/sbin/lldpcli",
-    "lldpmgrd_source": "sonic-buildimage:src/sonic-lldp/lldpmgrd.py",
-    "lldpsyncd_source": "sonic-buildimage:src/sonic-lldp/lldpsyncd.py",
+    "lldpmgrd_source": "sonic-buildimage:dockers/docker-lldp/lldpmgrd",
+    "lldpsyncd_source": "sonic-dbsyncd:src/lldp_syncd/daemon.py",
     "supervisor_config": "/etc/supervisor/conf.d/lldpd.conf (inside lldp container)",
     "config_managed_by": "lldpmgrd (reads CONFIG_DB DEVICE_METADATA and PORT tables, calls lldpcli to configure lldpd)"
   },

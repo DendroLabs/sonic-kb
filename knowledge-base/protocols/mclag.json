@@ -816,7 +816,7 @@
     {
       "note": "In SONiC MC-LAG, configuration must be applied via 'config mclag ...' CLI commands or direct CONFIG_DB writes -- not via vtysh or teamd configuration files. The MCLAG_DOMAIN and MCLAG_INTERFACE tables in CONFIG_DB are the source of truth. mclagsyncd reads these tables and passes configuration to iccpd. Direct iccpd configuration file edits are overwritten on restart.",
       "human_error_risk": "HIGH",
-      "source_ref": "SONiC MCLAG configuration guide and sonic-buildimage:src/sonic-utilities/mclagdctl/"
+      "source_ref": "SONiC MCLAG configuration guide and sonic-buildimage:src/iccpd/src/mclagdctl/"
     },
     {
       "note": "The keepalive link (used for ICCP session maintenance) must be physically separate from the peer link. If a single cable or switch carries both the peer link portchannel and the keepalive interface, a failure of that switch or cable will simultaneously kill both paths, causing guaranteed split-brain. Best practice is to route the keepalive path over the management network (eth0/Management0) so it is independent of the data plane.",
@@ -841,7 +841,7 @@
     {
       "note": "The 'show mclag' and 'show mclag brief' commands read from STATE_DB (Redis DB 6). If iccpd or mclagsyncd has crashed and STATE_DB entries are stale, these commands may show outdated information. Always cross-check with 'docker exec teamd supervisorctl status' and 'sudo ss -tnp | grep 8888' for current daemon and TCP connection state.",
       "human_error_risk": "LOW",
-      "source_ref": "sonic-utilities:show/mclag.py"
+      "source_ref": "sonic-buildimage:src/iccpd/src/mclagdctl/mclagdctl.c (MCLAG state CLI)"
     }
   ],
   "sonic_frr_mapping": {

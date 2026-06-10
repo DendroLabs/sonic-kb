@@ -272,18 +272,6 @@
     ],
     "purpose": "MACsec manager daemon. Manages MACsec encryption configuration from CONFIG_DB."
   },
-  "routesyncd": {
-    "def_id": "daemon:routesyncd",
-    "process_name": "routesyncd",
-    "container": "swss",
-    "subscribes_to": [
-      "kernel:netlink (route events)"
-    ],
-    "writes_to": [
-      "db:appl_db"
-    ],
-    "purpose": "Route synchronization daemon. Monitors kernel routing table via netlink for directly-connected and locally-originated routes, writes them to APPL_DB:ROUTE_TABLE."
-  },
   "bgpd": {
     "def_id": "daemon:bgpd",
     "process_name": "bgpd",
@@ -452,14 +440,26 @@
     "process_name": "stpmgrd",
     "container": "stp",
     "subscribes_to": [
-      "db:config_db",
-      "db:state_db"
+      "db:config_db"
+    ],
+    "writes_to": [
+      "daemon:stpd (internal IPC)"
+    ],
+    "purpose": "STP manager daemon. Subscribes to CONFIG_DB:STP, STP_VLAN, STP_PORT, and STP_VLAN_PORT tables (bridge priority, port cost, forward delay, hello time) and relays validated configuration to the stpd process, which runs the actual protocol state machines. Part of the swss cfgmgr family but runs inside the stp container."
+  },
+  "stpd": {
+    "def_id": "daemon:stpd",
+    "process_name": "stpd",
+    "container": "stp",
+    "subscribes_to": [
+      "daemon:stpmgrd (internal IPC)",
+      "kernel:raw sockets (BPDUs)"
     ],
     "writes_to": [
       "db:appl_db",
       "db:state_db"
     ],
-    "purpose": "STP manager daemon. Implements STP/RSTP/PVST+ state machines. Subscribes to CONFIG_DB:STP tables for bridge priority, port cost, and global STP parameters. Sends and receives BPDUs via raw sockets. Writes port forwarding state (Forwarding/Blocking/Disabled) to APPL_DB:STP_PORT_TABLE for orchagent to program ASIC port state accordingly."
+    "purpose": "STP protocol daemon. Implements the STP/RSTP/PVST+ state machines: sends and receives BPDUs via raw sockets, runs port role selection and topology change handling. Receives configuration from stpmgrd and writes port forwarding state (Forwarding/Blocking/Disabled) to APPL_DB:STP_PORT_TABLE for orchagent to program ASIC port STP state."
   },
   "gbsyncd": {
     "def_id": "daemon:gbsyncd",

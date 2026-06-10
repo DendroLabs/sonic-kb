@@ -13,7 +13,6 @@
     "daemon:neighsyncd",
     "daemon:portsyncd",
     "daemon:nbrmgrd",
-    "daemon:routesyncd",
     "daemon:tunnelmgrd",
     "daemon:buffermgrd",
     "daemon:coppmgrd",
@@ -90,15 +89,6 @@
       }
     },
     {
-      "name": "routesyncd",
-      "role": "Listens to Linux kernel netlink for route table changes (RTM_NEWROUTE, RTM_DELROUTE) in the main routing table. Writes route entries into APPL_DB ROUTE_TABLE for orchagent/RouteOrch to program into the ASIC FIB. Primary path for FRR (zebra) routes reaching hardware.",
-      "critical": true,
-      "db_interactions": {
-        "reads": ["Linux kernel netlink socket (RTMGRP_IPV4_ROUTE, RTMGRP_IPV6_ROUTE)"],
-        "writes": ["APPL_DB: ROUTE_TABLE, LABEL_ROUTE_TABLE"]
-      }
-    },
-    {
       "name": "tunnelmgrd",
       "role": "Manages VXLAN and IP tunnel lifecycle. Watches CONFIG_DB VXLAN_TUNNEL_TABLE, VXLAN_EVPN_NVO_TABLE. Creates Linux VXLAN netdevices, writes tunnel state to APPL_DB for orchagent VxlanOrch.",
       "critical": false,
@@ -156,8 +146,8 @@
   "key_data_flows": [
     {
       "flow": "Route programming (FRR -> ASIC)",
-      "path": "FRR zebra -> Linux kernel routing table -> routesyncd (netlink) -> APPL_DB:ROUTE_TABLE -> orchagent:RouteOrch -> ASIC_DB:ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY -> syncd -> SAI -> ASIC",
-      "notes": "Any break in this chain stops route programming. Check each hop independently."
+      "path": "FRR zebra -> FPM socket (TCP 2620) -> fpmsyncd (bgp container) -> APPL_DB:ROUTE_TABLE -> orchagent:RouteOrch -> ASIC_DB:ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY -> syncd -> SAI -> ASIC",
+      "notes": "Any break in this chain stops route programming. Check each hop independently. fpmsyncd runs in the bgp container, not swss; only the orchagent half of the chain lives in this container."
     },
     {
       "flow": "Neighbor resolution (ARP -> ASIC)",
@@ -212,7 +202,6 @@
     "vlanmgrd": "/var/log/swss/vlanmgrd.log",
     "neighsyncd": "/var/log/swss/neighsyncd.log",
     "portsyncd": "/var/log/swss/portsyncd.log",
-    "routesyncd": "/var/log/swss/routesyncd.log",
     "buffermgrd": "/var/log/swss/buffermgrd.log",
     "coppmgrd": "/var/log/swss/coppmgrd.log",
     "other_daemons": "/var/log/swss/<daemon_name>.log",

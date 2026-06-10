@@ -4,7 +4,7 @@
     "container_name": "swss",
     "startup_order": 3,
     "purpose": "Central orchestration -- APPL_DB to ASIC_DB translation",
-    "key_daemons": ["orchagent", "portmgrd", "intfmgrd", "vlanmgrd", "neighsyncd", "portsyncd", "routesyncd", "buffermgrd", "coppmgrd", "tunnelmgrd"],
+    "key_daemons": ["orchagent", "portmgrd", "intfmgrd", "vlanmgrd", "neighsyncd", "portsyncd", "fdbsyncd", "buffermgrd", "coppmgrd", "tunnelmgrd"],
     "depends_on": ["database-container", "syncd-container"],
     "critical": true
   },
