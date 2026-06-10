@@ -1,0 +1,120 @@
+{
+  "path_id": "fdb-learn",
+  "display_name": "Hardware-learned MAC address propagation to SONiC databases",
+  "trigger": "ASIC hardware-learns a source MAC address on a bridge port (first packet from unknown source in a VLAN)",
+  "version": "202511",
+  "def_refs": ["daemon:syncd", "daemon:orchagent", "db:asic_db", "db:state_db"],
+
+  "steps": [
+    {
+      "step": 1,
+      "actor": "vendor SAI (ASIC driver)",
+      "action": "ASIC hardware-learns source MAC on ingress bridge port. Vendor SAI fires the registered on_fdb_event callback with SAI_FDB_EVENT_LEARNED event type, MAC address, bv_id (bridge/VLAN OID), and bridge_port_id attribute.",
+      "source_file": "sonic-sairedis:syncd/SwitchNotifications.h",
+      "source_function": "SwitchNotifications::Slot::onFdbEvent()",
+      "output": "SAI fdb_event callback invoked with sai_fdb_event_notification_data_t[] array containing MAC, bv_id, bridge_port_id",
+      "verify": "No direct CLI; confirm MAC learned by checking step 3 ASIC_DB write"
+    },
+    {
+      "step": 2,
+      "actor": "syncd (NotificationHandler)",
+      "action": "SAI callback lands in syncd's registered handler. NotificationHandler::onFdbEvent() serializes the fdb_event_notification_data array using sai_serialize_fdb_event_ntf() and calls enqueueNotification(), placing the item on the internal NotificationQueue. The notification processor thread is signaled.",
+      "source_file": "sonic-sairedis:syncd/NotificationHandler.cpp",
+      "source_function": "NotificationHandler::onFdbEvent()",
+      "output": "Serialized FDB event string enqueued on NotificationQueue; processor thread unblocked",
+      "verify": "grep 'fdb event' /var/log/syncd/syncd.log"
+    },
+    {
+      "step": 3,
+      "actor": "syncd (NotificationProcessor)",
+      "action": "Notification processor thread dequeues item, dispatches to syncProcessNotification() which routes SAI_SWITCH_NOTIFICATION_NAME_FDB_EVENT to handle_fdb_event(). That function deserializes, calls process_on_fdb_event() which: (a) validates OIDs, (b) translates hardware RIDs to virtual IDs (VIDs), (c) calls redisPutFdbEntryToAsicView() to write the learned FDB entry into ASIC_DB as ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY with type SAI_FDB_ENTRY_TYPE_DYNAMIC, then (d) serializes the VID-translated event and calls sendNotification() to publish it on the ASIC_DB NOTIFICATIONS channel so orchagent subscribers receive it.",
+      "source_file": "sonic-sairedis:syncd/NotificationProcessor.cpp",
+      "source_function": "NotificationProcessor::process_on_fdb_event()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY:{\"bvid\":\"oid:0x...\",\"mac\":\"<mac>\",\"switch_id\":\"oid:0x...\"}",
+        "fields": [
+          "SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID",
+          "SAI_FDB_ENTRY_ATTR_TYPE",
+          "SAI_FDB_ENTRY_ATTR_PACKET_ACTION"
+        ]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY*'"
+    },
+    {
+      "step": 4,
+      "actor": "orchagent (FdbOrch)",
+      "action": "FdbOrch subscribes to ASIC_DB NOTIFICATIONS channel via NotificationConsumer (initialized at startup with 'NOTIFICATIONS' channel name). doTask(NotificationConsumer&) pops the event, matches op == 'fdb_event', deserializes with sai_deserialize_fdb_event_ntf(), then calls FdbOrch::update() for each FDB entry in the batch.",
+      "source_file": "sonic-swss:orchagent/fdborch.cpp",
+      "source_function": "FdbOrch::doTask()",
+      "output": "FDB event deserialized, FdbOrch::update() invoked with event type, fdb_entry, bridge_port_id",
+      "verify": "grep 'FDB event\\|LEARN notification' /var/log/swss/orchagent.log"
+    },
+    {
+      "step": 5,
+      "actor": "orchagent (FdbOrch)",
+      "action": "FdbOrch::update() resolves bridge_port_id to a Port object via PortsOrch, resolves bv_id to a VLAN Port object, then for SAI_FDB_EVENT_LEARNED calls storeFdbEntryState(). storeFdbEntryState() upserts the FDB entry into m_entries (in-memory FDB table), constructs key 'Vlan<id>:<mac>', and writes fields {port, type} to STATE_DB FDB_TABLE.",
+      "source_file": "sonic-swss:orchagent/fdborch.cpp",
+      "source_function": "FdbOrch::storeFdbEntryState()",
+      "db_write": {
+        "db": "db:state_db",
+        "table": "FDB_TABLE",
+        "key_pattern": "FDB_TABLE|Vlan<id>:<mac>",
+        "fields": ["port", "type"]
+      },
+      "verify": "redis-cli -n 6 HGETALL 'FDB_TABLE|Vlan<id>:<mac>'"
+    },
+    {
+      "step": 6,
+      "actor": "fdbshow (sonic-utilities)",
+      "action": "'show mac' / fdbshow reads learned MAC addresses from ASIC_DB (not STATE_DB). FdbShow.fetch_fdb_data() connects to ASIC_DB, queries ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY:* keys, resolves bridge_port_id OIDs to interface names using the COUNTERS_DB port OID map, and resolves bv_id to VLAN ID. Results are tabulated as Vlan/MacAddress/Port/Type.",
+      "source_file": "sonic-utilities:scripts/fdbshow",
+      "source_function": "FdbShow.fetch_fdb_data()",
+      "output": "Table of Vlan, MacAddress, Port, Type printed to stdout",
+      "verify": "show mac  OR  fdbshow  OR  redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY*'"
+    }
+  ],
+
+  "notes": [
+    "Direction: this path flows UPWARD — hardware event to software, opposite of config-apply paths.",
+    "syncd performs TWO actions in step 3: it writes ASIC_DB directly (redisPutFdbEntryToAsicView) AND publishes a notification on the ASIC_DB NOTIFICATIONS channel. orchagent consumes the notification channel, not the ASIC_DB key itself.",
+    "fdbshow reads ASIC_DB, not STATE_DB. The STATE_DB FDB_TABLE entry written in step 5 is consumed by fdbsyncd for EVPN MAC sync (see below).",
+    "EVPN / fdbsyncd: fdbsyncd (sonic-swss:fdbsyncd/) subscribes to STATE_DB FDB_TABLE via SubscriberStateTable. FdbSync::processStateFdb() reads new entries and calls updateLocalMac() which programs the kernel bridge FDB via 'bridge fdb replace' netlink — but only when EVPN NVO is configured (m_isEvpnNvoExist). This is a separate, conditional side-path for VXLAN-EVPN MAC distribution and does not affect basic L2 forwarding."
+  ],
+
+  "failure_injection_points": [
+    {
+      "between_steps": [1, 2],
+      "failure": "Vendor SAI not firing on_fdb_event callback",
+      "symptom": "MACs appear in hardware (vendor SDK show commands) but ASIC_DB ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY is empty; 'show mac' shows no entries",
+      "diagnosis": "Check syncd log for any fdb event messages: grep 'fdb event' /var/log/syncd/syncd.log. Verify SAI switch notifications are registered: check syncd startup logs for 'onFdbEvent' registration. Issue may be vendor SAI configuration (FDB learn mode not set to hardware-and-notify)."
+    },
+    {
+      "between_steps": [2, 3],
+      "failure": "NotificationProcessor dropping FDB events due to invalid OIDs",
+      "symptom": "ASIC_DB FDB_TABLE empty even though SAI callback is firing; syncd log shows 'invalid OIDs in fdb notifications, NOT translating and NOT storing in ASIC DB'",
+      "diagnosis": "grep 'invalid OIDs' /var/log/syncd/syncd.log. Root cause: orchagent has not yet created the VLAN/bridge objects in SAI, so the bv_id RID returned by SAI is not yet present in syncd's local ASIC DB. Transient on startup — MACs should be re-learned once VLAN programming completes."
+    },
+    {
+      "between_steps": [3, 4],
+      "failure": "orchagent not receiving FDB notifications from ASIC_DB",
+      "symptom": "ASIC_DB shows ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY entries but STATE_DB FDB_TABLE is empty; 'show mac' shows entries (reads ASIC_DB) but state table is stale",
+      "diagnosis": "Check orchagent: docker exec swss supervisorctl status orchagent. Check if FdbOrch NotificationConsumer is running: grep 'fdbNotificationConsumer\\|NOTIFICATIONS' /var/log/swss/orchagent.log. Verify orchagent allPortsReady flag is set (FdbOrch::doTask guards on this)."
+    },
+    {
+      "between_steps": [4, 5],
+      "failure": "FdbOrch::update() failing to resolve bridge_port_id to a Port",
+      "symptom": "STATE_DB FDB_TABLE missing entries for specific ports; orchagent log shows 'Failed to get port by bridge port ID'",
+      "diagnosis": "grep 'Failed to get port by bridge port ID' /var/log/swss/orchagent.log. Cause: the bridge port was removed (VLAN member removed) while FDB entries still exist. PortsOrch may not have the bridge port registered. Verify VLAN membership: show vlan brief."
+    },
+    {
+      "between_steps": [5, 6],
+      "failure": "fdbshow showing no entries despite ASIC_DB populated",
+      "symptom": "'show mac' returns empty table; ASIC_DB keys exist",
+      "diagnosis": "fdbshow requires bridge port OID map from COUNTERS_DB (if_br_oid_map). Run: redis-cli -n 2 KEYS 'COUNTERS_DB*' to verify COUNTERS_DB is populated. Also check if if_br_oid_map is empty: fdbshow falls back silently if port_util.get_bridge_port_map() returns empty. Restart swss container to repopulate COUNTERS_DB bridge port mappings."
+    }
+  ],
+
+  "related_paths": ["vlan-create", "lag-create", "port-config", "vxlan-vtep-create", "arp-resolution"]
+}

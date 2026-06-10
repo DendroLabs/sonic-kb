@@ -1,0 +1,132 @@
+{
+  "path_id": "vxlan-vtep-create",
+  "display_name": "VXLAN VTEP creation to ASIC",
+  "trigger": "User runs 'config vxlan add <name> <src_ip>' to configure a VXLAN tunnel endpoint",
+  "version": "202511",
+  "def_refs": ["daemon:orchagent", "daemon:syncd", "db:config_db", "db:appl_db", "db:asic_db", "db:state_db"],
+
+  "steps": [
+    {
+      "step": 1,
+      "actor": "config CLI (sonic-utilities)",
+      "action": "User runs 'config vxlan add <vtep_name> <src_ip>'. The add_vxlan() click command validates the source IP and interface name, enforces single-VTEP policy, then writes VXLAN_TUNNEL entry to CONFIG_DB with field src_ip=<src_ip>.",
+      "source_file": "sonic-utilities:config/vxlan.py",
+      "source_function": "add_vxlan()",
+      "db_write": {
+        "db": "db:config_db",
+        "table": "VXLAN_TUNNEL",
+        "key_pattern": "VXLAN_TUNNEL|<vtep_name>",
+        "fields": ["src_ip"]
+      },
+      "verify": "redis-cli -n 4 HGETALL 'VXLAN_TUNNEL|<vtep_name>'"
+    },
+    {
+      "step": 2,
+      "actor": "vxlanmgrd (swss container)",
+      "action": "Subscribed to CONFIG_DB CFG_VXLAN_TUNNEL_TABLE_NAME via Consumer. doTask() dispatches to doVxlanTunnelCreateTask(), which caches the tunnel's src_ip and writes the entry to APPL_DB VXLAN_TUNNEL_TABLE using ProducerStateTable m_appVxlanTunnelTable.",
+      "source_file": "sonic-swss:cfgmgr/vxlanmgr.cpp",
+      "source_function": "VxlanMgr::doVxlanTunnelCreateTask()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "VXLAN_TUNNEL_TABLE",
+        "key_pattern": "VXLAN_TUNNEL_TABLE:<vtep_name>",
+        "fields": ["src_ip"]
+      },
+      "verify": "redis-cli -n 0 HGETALL 'VXLAN_TUNNEL_TABLE:<vtep_name>'"
+    },
+    {
+      "step": 3,
+      "actor": "vxlanmgrd (swss container) — optional VLAN-VNI map",
+      "action": "When user subsequently runs 'config vxlan map add <vtep> <vlan> <vni>', doVxlanTunnelMapCreateTask() creates a per-VNI Linux VXLAN netdevice (<vtep>-<vlan_id>) via ip-link and bridge commands, then writes the map entry to APPL_DB VXLAN_TUNNEL_MAP_TABLE.",
+      "source_file": "sonic-swss:cfgmgr/vxlanmgr.cpp",
+      "source_function": "VxlanMgr::doVxlanTunnelMapCreateTask()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "VXLAN_TUNNEL_MAP_TABLE",
+        "key_pattern": "VXLAN_TUNNEL_MAP_TABLE:<vtep_name>:map_<vni>_Vlan<vlan_id>",
+        "fields": ["vni", "vlan"]
+      },
+      "verify": "ip -d link show type vxlan; redis-cli -n 0 KEYS 'VXLAN_TUNNEL_MAP_TABLE:*'"
+    },
+    {
+      "step": 4,
+      "actor": "orchagent (VxlanTunnelOrch)",
+      "action": "ConsumerStateTable on APPL_DB VXLAN_TUNNEL_TABLE fires addOperation(). A VxlanTunnel object is constructed in-memory (tunnel not yet in hardware at this stage — hardware creation is deferred until a map entry arrives).",
+      "source_file": "sonic-swss:orchagent/vxlanorch.cpp",
+      "source_function": "VxlanTunnelOrch::addOperation()",
+      "output": "VxlanTunnel object created in vxlan_tunnel_table_ map; tunnel not yet in ASIC_DB",
+      "verify": "docker exec swss supervisorctl status orchagent; grep 'Vxlan tunnel.*was added' /var/log/swss/orchagent.log"
+    },
+    {
+      "step": 5,
+      "actor": "orchagent (VxlanTunnelMapOrch)",
+      "action": "ConsumerStateTable on APPL_DB VXLAN_TUNNEL_MAP_TABLE fires addOperation(). On first map entry for this tunnel, createTunnelHw() is called which: (a) creates SAI tunnel map objects (SAI_OBJECT_TYPE_TUNNEL_MAP) for VNI-to-VLAN and VLAN-to-VNI via create_tunnel_map(); (b) creates the SAI tunnel object (SAI_OBJECT_TYPE_TUNNEL, type VXLAN, encap src IP) via create_tunnel(); (c) creates the tunnel termination entry (SAI_OBJECT_TYPE_TUNNEL_TERM_TABLE_ENTRY, P2MP) via create_tunnel_termination(). Then creates the VNI-to-VLAN map entry (SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY) via create_tunnel_map_entry(). All of these are written to ASIC_DB.",
+      "source_file": "sonic-swss:orchagent/vxlanorch.cpp",
+      "source_function": "VxlanTunnelMapOrch::addOperation()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_TUNNEL",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_TUNNEL:<oid>",
+        "fields": [
+          "SAI_TUNNEL_ATTR_TYPE",
+          "SAI_TUNNEL_ATTR_UNDERLAY_INTERFACE",
+          "SAI_TUNNEL_ATTR_ENCAP_SRC_IP",
+          "SAI_TUNNEL_ATTR_PEER_MODE",
+          "SAI_TUNNEL_ATTR_DECAP_MAPPERS",
+          "SAI_TUNNEL_ATTR_ENCAP_MAPPERS"
+        ]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_TUNNEL*'; redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_TUNNEL_TERM_TABLE_ENTRY*'; redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_TUNNEL_MAP*'"
+    },
+    {
+      "step": 6,
+      "actor": "syncd",
+      "action": "Reads ASIC_DB create notifications for SAI_OBJECT_TYPE_TUNNEL_MAP, SAI_OBJECT_TYPE_TUNNEL, SAI_OBJECT_TYPE_TUNNEL_TERM_TABLE_ENTRY, and SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY via processSingleEvent() -> processQuadEvent(). Calls vendor SAI library sai_tunnel_api->create_tunnel_map(), create_tunnel(), create_tunnel_term_table_entry(), and create_tunnel_map_entry() to program the hardware VTEP and VNI decap/encap tables.",
+      "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+      "source_function": "Syncd::processSingleEvent()",
+      "sai_calls": [
+        "sai_tunnel_api->create_tunnel_map(SAI_OBJECT_TYPE_TUNNEL_MAP, ...)",
+        "sai_tunnel_api->create_tunnel(SAI_OBJECT_TYPE_TUNNEL, ...)",
+        "sai_tunnel_api->create_tunnel_term_table_entry(SAI_OBJECT_TYPE_TUNNEL_TERM_TABLE_ENTRY, ...)",
+        "sai_tunnel_api->create_tunnel_map_entry(SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY, ...)"
+      ],
+      "output": "VTEP and VNI-to-VLAN decap/encap programmed in hardware",
+      "verify": "show vxlan tunnel; show vxlan vlanvnimap; redis-cli -n 1 HGETALL 'ASIC_STATE:SAI_OBJECT_TYPE_TUNNEL:<oid>'"
+    }
+  ],
+
+  "failure_injection_points": [
+    {
+      "between_steps": [1, 2],
+      "failure": "vxlanmgrd not processing CONFIG_DB entry",
+      "symptom": "VXLAN_TUNNEL entry in CONFIG_DB but no corresponding entry in APPL_DB VXLAN_TUNNEL_TABLE",
+      "diagnosis": "Check vxlanmgrd: docker exec swss supervisorctl status vxlanmgrd; check /var/log/swss/vxlanmgrd.log for errors; verify swss container is healthy"
+    },
+    {
+      "between_steps": [2, 3],
+      "failure": "vxlanmgrd cannot create Linux VXLAN netdevice for tunnel map",
+      "symptom": "VXLAN_TUNNEL_TABLE written to APPL_DB but VXLAN_TUNNEL_MAP_TABLE missing; ip link shows no vxlan interfaces",
+      "diagnosis": "Check vxlanmgrd log for 'Vxlan Net Dev creation failure'; verify VLAN exists before mapping (show vlan brief); check kernel module: lsmod | grep vxlan"
+    },
+    {
+      "between_steps": [3, 4],
+      "failure": "orchagent not consuming APPL_DB VXLAN_TUNNEL_TABLE",
+      "symptom": "VXLAN_TUNNEL_TABLE present in APPL_DB but no SAI objects in ASIC_DB; show vxlan tunnel shows no tunnels",
+      "diagnosis": "Check orchagent: docker exec swss supervisorctl status orchagent; grep 'vxlan tunnel' /var/log/swss/orchagent.log; verify orchagent is subscribed to APPL_DB"
+    },
+    {
+      "between_steps": [4, 5],
+      "failure": "orchagent fails to create SAI tunnel hardware objects on map entry",
+      "symptom": "Tunnel in APPL_DB and orchagent in-memory state but no ASIC_DB SAI_OBJECT_TYPE_TUNNEL entries; map write triggers SAI error",
+      "diagnosis": "Check orchagent log for 'Can't create a tunnel object' or 'Can't create tunnel map'; verify underlay RIF (gUnderlayIfId) is initialized; check VLAN state: redis-cli -n 6 HGETALL 'VLAN_TABLE|Vlan<id>'"
+    },
+    {
+      "between_steps": [5, 6],
+      "failure": "syncd SAI vendor library returns error on tunnel create",
+      "symptom": "ASIC_DB SAI_OBJECT_TYPE_TUNNEL entry present but syncd logs SAI_STATUS_FAILURE; VTEP not forwarding traffic",
+      "diagnosis": "Check syncd: docker exec syncd supervisorctl status syncd; grep SAI_STATUS /var/log/syncd/syncd.log; check if ASIC supports P2MP mode: redis-cli -n 1 HGETALL 'ASIC_STATE:SAI_OBJECT_TYPE_SWITCH:oid:*'"
+    }
+  ],
+
+  "related_paths": ["vlan-create", "fdb-learn", "route-install-bgp", "arp-resolution"]
+}

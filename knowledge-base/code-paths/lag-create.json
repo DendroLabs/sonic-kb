@@ -1,0 +1,189 @@
+{
+  "path_id": "lag-create",
+  "display_name": "LAG creation and member add to ASIC",
+  "trigger": "'config portchannel add PortChannel01' followed by 'config portchannel member add PortChannel01 EthernetX'",
+  "version": "202511",
+  "def_refs": ["daemon:teammgrd", "daemon:teamsyncd", "daemon:orchagent", "daemon:syncd", "db:config_db", "db:appl_db", "db:asic_db", "db:state_db"],
+
+  "steps": [
+    {
+      "step": 1,
+      "actor": "config CLI (sonic-utilities)",
+      "action": "User runs 'config portchannel add PortChannel01'. add_portchannel() validates the name and writes an entry to CONFIG_DB PORTCHANNEL table with fields admin_status=up, mtu=9100, lacp_key=auto, fast_rate.",
+      "source_file": "sonic-utilities:config/main.py",
+      "source_function": "add_portchannel()",
+      "db_write": {
+        "db": "db:config_db",
+        "table": "PORTCHANNEL",
+        "key_pattern": "PORTCHANNEL|PortChannel01",
+        "fields": ["admin_status", "mtu", "lacp_key", "fast_rate", "min_links", "fallback"]
+      },
+      "verify": "redis-cli -n 4 HGETALL 'PORTCHANNEL|PortChannel01'"
+    },
+    {
+      "step": 2,
+      "actor": "teammgrd",
+      "action": "TeamMgr::doTask() dispatches CONFIG_DB PORTCHANNEL set-event to doLagTask(). doLagTask() calls addLag() which spawns 'teamd -r -t PortChannel01 -c <json-config> -d' with a generated LACP JSON config containing device name, MAC, runner=lacp. The kernel creates a team netdevice for PortChannel01.",
+      "source_file": "sonic-swss:cfgmgr/teammgr.cpp",
+      "source_function": "TeamMgr::addLag()",
+      "output": "teamd process running for PortChannel01; team net device visible in kernel",
+      "verify": "docker exec teamd teamdctl PortChannel01 state view"
+    },
+    {
+      "step": 3,
+      "actor": "teammgrd",
+      "action": "After addLag() returns task_success, doLagTask() calls setLagMtu() which issues 'ip link set dev PortChannel01 mtu 9100' and writes mtu field to APPL_DB LAG_TABLE via m_appLagTable.set(). Also calls setLagAdminStatus() to bring the interface up.",
+      "source_file": "sonic-swss:cfgmgr/teammgr.cpp",
+      "source_function": "TeamMgr::setLagMtu()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "LAG_TABLE",
+        "key_pattern": "LAG_TABLE:PortChannel01",
+        "fields": ["mtu"]
+      },
+      "verify": "redis-cli -n 0 HGETALL 'LAG_TABLE:PortChannel01'"
+    },
+    {
+      "step": 4,
+      "actor": "teamsyncd",
+      "action": "TeamSync::onMsg() receives RTM_NEWLINK netlink event for PortChannel01 (type=team). Calls TeamSync::addLag() which writes admin_status, oper_status, mtu fields to APPL_DB LAG_TABLE and initialises a TeamPortSync instance that connects to teamd via libteam to listen for port-change events. STATE_DB LAG_TABLE is also updated with state=ok.",
+      "source_file": "sonic-swss:teamsyncd/teamsync.cpp",
+      "source_function": "TeamSync::addLag()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "LAG_TABLE",
+        "key_pattern": "LAG_TABLE:PortChannel01",
+        "fields": ["admin_status", "oper_status", "mtu"]
+      },
+      "verify": "redis-cli -n 0 HGETALL 'LAG_TABLE:PortChannel01' && redis-cli -n 6 HGETALL 'LAG_TABLE|PortChannel01'"
+    },
+    {
+      "step": 5,
+      "actor": "config CLI (sonic-utilities)",
+      "action": "User runs 'config portchannel member add PortChannel01 EthernetX'. add_portchannel_member() validates that the port exists, is not already in a portchannel, has matching speed/MTU, and writes CONFIG_DB PORTCHANNEL_MEMBER entry.",
+      "source_file": "sonic-utilities:config/main.py",
+      "source_function": "add_portchannel_member()",
+      "db_write": {
+        "db": "db:config_db",
+        "table": "PORTCHANNEL_MEMBER",
+        "key_pattern": "PORTCHANNEL_MEMBER|PortChannel01|EthernetX",
+        "fields": ["NULL"]
+      },
+      "verify": "redis-cli -n 4 HGETALL 'PORTCHANNEL_MEMBER|PortChannel01|EthernetX'"
+    },
+    {
+      "step": 6,
+      "actor": "teammgrd",
+      "action": "TeamMgr::doLagMemberTask() fires on CONFIG_DB PORTCHANNEL_MEMBER set-event. Waits for port state and LAG state to be ok (isPortStateOk/isLagStateOk), then calls addLagMember() which runs: (1) 'ip link set dev EthernetX down', (2) 'teamdctl PortChannel01 port config update EthernetX {lacp_key:N,link_watch:{name:ethtool}}', (3) 'teamdctl PortChannel01 port add EthernetX'. The port is now enslaved into the team device and LACP PDU exchange begins.",
+      "source_file": "sonic-swss:cfgmgr/teammgr.cpp",
+      "source_function": "TeamMgr::addLagMember()",
+      "output": "EthernetX enslaved into PortChannel01 team device; LACP negotiation started",
+      "verify": "docker exec teamd teamdctl PortChannel01 state view | grep EthernetX"
+    },
+    {
+      "step": 7,
+      "actor": "teamsyncd",
+      "action": "TeamSync::TeamPortSync::onChange() fires via libteam port-change callback (registered via team_change_handler_register). Iterates over team ports using team_for_each_port, maps ifindex to ifname, reads enabled status from team_get_port_enabled(). Writes APPL_DB LAG_MEMBER_TABLE entry 'PortChannel01:EthernetX' with status=enabled (after LACP negotiation succeeds) or status=disabled (while negotiating).",
+      "source_file": "sonic-swss:teamsyncd/teamsync.cpp",
+      "source_function": "TeamSync::TeamPortSync::onChange()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "LAG_MEMBER_TABLE",
+        "key_pattern": "LAG_MEMBER_TABLE:PortChannel01:EthernetX",
+        "fields": ["status"]
+      },
+      "verify": "redis-cli -n 0 HGETALL 'LAG_MEMBER_TABLE:PortChannel01:EthernetX'"
+    },
+    {
+      "step": 8,
+      "actor": "orchagent (PortsOrch)",
+      "action": "PortsOrch::doLagTask() is notified of APPL_DB LAG_TABLE change via ConsumerStateTable. Calls PortsOrch::addLag() which invokes sai_lag_api->create_lag() to create a SAI LAG object. The resulting sai_object_id is stored in ASIC_DB under SAI_OBJECT_TYPE_LAG.",
+      "source_file": "sonic-swss:orchagent/portsorch.cpp",
+      "source_function": "PortsOrch::addLag()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_LAG",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_LAG:oid:0x...",
+        "fields": ["NULL"]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_LAG:*'"
+    },
+    {
+      "step": 9,
+      "actor": "orchagent (PortsOrch)",
+      "action": "PortsOrch::doLagMemberTask() is notified of APPL_DB LAG_MEMBER_TABLE change. After confirming the LAG and port objects exist, calls PortsOrch::addLagMember() which sets SAI_LAG_MEMBER_ATTR_LAG_ID and SAI_LAG_MEMBER_ATTR_PORT_ID, and optionally SAI_LAG_MEMBER_ATTR_INGRESS_DISABLE/EGRESS_DISABLE (for disabled members) then invokes sai_lag_api->create_lag_member(). The resulting sai_object_id is stored in ASIC_DB under SAI_OBJECT_TYPE_LAG_MEMBER.",
+      "source_file": "sonic-swss:orchagent/portsorch.cpp",
+      "source_function": "PortsOrch::addLagMember()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_LAG_MEMBER",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_LAG_MEMBER:oid:0x...",
+        "fields": ["SAI_LAG_MEMBER_ATTR_LAG_ID", "SAI_LAG_MEMBER_ATTR_PORT_ID", "SAI_LAG_MEMBER_ATTR_EGRESS_DISABLE", "SAI_LAG_MEMBER_ATTR_INGRESS_DISABLE"]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_LAG_MEMBER:*'"
+    },
+    {
+      "step": 10,
+      "actor": "syncd",
+      "action": "Syncd::processSingleEvent() reads CREATE commands from ASIC_DB for SAI_OBJECT_TYPE_LAG and SAI_OBJECT_TYPE_LAG_MEMBER. Routes through processQuadEvent() with SAI_COMMON_API_CREATE. Translates virtual-to-real OIDs via the translator, then calls the vendor SAI library to program the LAG and LAG member in ASIC hardware.",
+      "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+      "source_function": "Syncd::processSingleEvent()",
+      "sai_call": "VendorSai::create(SAI_OBJECT_TYPE_LAG, ...); VendorSai::create(SAI_OBJECT_TYPE_LAG_MEMBER, ...)",
+      "output": "LAG and LAG member programmed in hardware; traffic hashing across member ports begins after LACP converges",
+      "verify": "show interfaces portchannel (should show PortChannel01 with member EthernetX)"
+    }
+  ],
+
+  "failure_injection_points": [
+    {
+      "between_steps": [1, 2],
+      "failure": "teammgrd not processing CONFIG_DB PORTCHANNEL event",
+      "symptom": "CONFIG_DB has PORTCHANNEL entry but no teamd process running and no LAG_TABLE in APPL_DB",
+      "diagnosis": "docker exec teamd supervisorctl status teammgrd; check /var/log/swss/teammgrd.log; verify CONFIG_DB subscription: redis-cli -n 4 SUBSCRIBE '__keyevent@4__:hset'"
+    },
+    {
+      "between_steps": [2, 3],
+      "failure": "teamd spawn fails",
+      "symptom": "teammgrd retries addLag; no 'teamd' process visible for PortChannel01; LAG_TABLE not in APPL_DB",
+      "diagnosis": "docker exec teamd ps aux | grep teamd; check /var/log/swss/teammgrd.log for 'Failed to start port channel'; verify teamd binary: docker exec teamd which teamd"
+    },
+    {
+      "between_steps": [3, 4],
+      "failure": "teamsyncd not receiving RTM_NEWLINK for team device",
+      "symptom": "LAG_TABLE in APPL_DB has only mtu (from teammgrd) but missing admin_status/oper_status fields; STATE_DB LAG_TABLE has no entry",
+      "diagnosis": "docker exec teamd supervisorctl status teamsyncd; check /var/log/swss/teamsyncd.log; verify netlink: ip link show type team"
+    },
+    {
+      "between_steps": [5, 6],
+      "failure": "teammgrd waiting for port or LAG state before enslaving member",
+      "symptom": "CONFIG_DB PORTCHANNEL_MEMBER exists but EthernetX is not enslaved; no LAG_MEMBER_TABLE entry in APPL_DB",
+      "diagnosis": "redis-cli -n 6 HGETALL 'PORT_TABLE|EthernetX' (check state=ok); redis-cli -n 6 HGETALL 'LAG_TABLE|PortChannel01' (check state=ok); check /var/log/swss/teammgrd.log for retry messages"
+    },
+    {
+      "between_steps": [6, 7],
+      "failure": "LACP not converging; teamsyncd writes status=disabled",
+      "symptom": "LAG_MEMBER_TABLE:PortChannel01:EthernetX status=disabled; portchannel not forwarding traffic; peer side may show LACP timeout",
+      "diagnosis": "docker exec teamd teamdctl PortChannel01 state view; check LACP PDU exchange: tcpdump -i EthernetX ether proto 0x8809; verify LACP timers and system priority match on both sides"
+    },
+    {
+      "between_steps": [7, 8],
+      "failure": "orchagent not processing APPL_DB LAG_TABLE",
+      "symptom": "LAG_TABLE in APPL_DB but no SAI_OBJECT_TYPE_LAG entry in ASIC_DB",
+      "diagnosis": "docker exec swss supervisorctl status orchagent; check /var/log/swss/orchagent.log for SAI errors; redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_LAG:*'"
+    },
+    {
+      "between_steps": [8, 9],
+      "failure": "orchagent addLagMember fails because LAG SAI object not yet created when member event arrives",
+      "symptom": "LAG_MEMBER_TABLE in APPL_DB but no SAI_OBJECT_TYPE_LAG_MEMBER in ASIC_DB; orchagent log shows 'Failed to locate LAG'",
+      "diagnosis": "This is a transient ordering issue; orchagent will retry. check /var/log/swss/orchagent.log for 'Failed to locate LAG PortChannel01'; verify: redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_LAG:*'"
+    },
+    {
+      "between_steps": [9, 10],
+      "failure": "syncd SAI call fails for LAG or LAG_MEMBER creation",
+      "symptom": "ASIC_DB has SAI_OBJECT_TYPE_LAG or SAI_OBJECT_TYPE_LAG_MEMBER entry but syncd reports SAI_STATUS_FAILURE; portchannel not operational in hardware",
+      "diagnosis": "docker exec syncd supervisorctl status syncd; check /var/log/syncd.log for SAI error codes; check if LAG resource limits exceeded: show system resources"
+    }
+  ],
+
+  "related_paths": ["vlan-create", "port-config", "vxlan-vtep-create"]
+}

@@ -1,0 +1,97 @@
+{
+  "path_id": "route-withdraw",
+  "display_name": "BGP route withdrawal from ASIC",
+  "trigger": "BGP UPDATE withdraws a prefix or the BGP session goes down",
+  "version": "202511",
+  "def_refs": ["daemon:bgpd", "daemon:zebra", "daemon:fpmsyncd", "daemon:orchagent", "daemon:syncd", "db:appl_db", "db:asic_db"],
+
+  "steps": [
+    {
+      "step": 1,
+      "actor": "bgpd (FRR)",
+      "action": "Receives BGP UPDATE message containing a withdrawn prefix (or detects session drop), removes the path_info from the adj-RIB-in, and calls bgp_process() to trigger a new best-path selection. With no remaining path, bgpd sends a ZAPI ROUTE_DELETE message to zebra via the internal ZAPI socket.",
+      "source_file": "sonic-frr:bgpd/bgp_route.c",
+      "source_function": "bgp_withdraw()",
+      "output": "BGP path entry removed from FRR BGP RIB; ZAPI delete message queued to zebra",
+      "verify": "docker exec bgp vtysh -c 'show bgp ipv4 unicast <prefix>' (prefix should disappear or show no best path)"
+    },
+    {
+      "step": 2,
+      "actor": "zebra (FRR)",
+      "action": "Receives ZAPI ROUTE_DELETE from bgpd. rib_process() selects a new FIB entry (none in this case). rib_process_del_fib() calls rib_uninstall_kernel() which enqueues a DPLANE_OP_ROUTE_DELETE context to the dataplane. The dplane_fpm_nl module encodes an RTM_DELROUTE netlink message and writes it to the FPM TCP socket (port 2620) via fpm_nl_enqueue().",
+      "source_file": "sonic-frr:zebra/zebra_rib.c",
+      "source_function": "rib_process_del_fib()",
+      "output": "Route removed from zebra RIB and Linux kernel routing table; RTM_DELROUTE FPM message sent to fpmsyncd",
+      "verify": "ip route show <prefix> (route should be absent)"
+    },
+    {
+      "step": 3,
+      "actor": "fpmsyncd",
+      "action": "Receives the RTM_DELROUTE netlink message from zebra over the FPM TCP socket. onMsg() dispatches to onRouteMsg(), which detects nlmsg_type == RTM_DELROUTE and calls delWithWarmRestart() → ProducerStateTable::del() to remove the key from APPL_DB ROUTE_TABLE.",
+      "source_file": "sonic-swss:fpmsyncd/routesync.cpp",
+      "source_function": "RouteSync::onRouteMsg()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "ROUTE_TABLE",
+        "key_pattern": "ROUTE_TABLE:<prefix>",
+        "operation": "DEL",
+        "fields": []
+      },
+      "verify": "redis-cli -n 0 EXISTS 'ROUTE_TABLE:<prefix>' (should return 0)"
+    },
+    {
+      "step": 4,
+      "actor": "orchagent (RouteOrch)",
+      "action": "ConsumerStateTable notifies orchagent of the DEL event on APPL_DB ROUTE_TABLE. RouteOrch::doTask() reads the DEL_COMMAND and calls removeRoute() to stage a bulk remove of the SAI route entry via gRouteBulker.remove_entry(). After gRouteBulker.flush(), removeRoutePost() confirms SAI_STATUS_SUCCESS, removes the entry from m_syncdRoutes, and decrements next-hop-group reference counts.",
+      "source_file": "sonic-swss:orchagent/routeorch.cpp",
+      "source_function": "RouteOrch::removeRoute()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:{vr_id,prefix}",
+        "operation": "DEL",
+        "fields": []
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep '<prefix>' (should return empty)"
+    },
+    {
+      "step": 5,
+      "actor": "syncd",
+      "action": "Reads the BULK_REMOVE (or REMOVE) notification for SAI_OBJECT_TYPE_ROUTE_ENTRY from ASIC_DB. processSingleEvent() dispatches to processBulkQuadEvent(SAI_COMMON_API_BULK_REMOVE) → processBulkRemoveEntry(), which calls m_vendorSai->bulkRemove() to invoke the vendor SAI remove_route_entries() API, deleting the route from the ASIC FIB/TCAM.",
+      "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+      "source_function": "Syncd::processBulkRemoveEntry()",
+      "sai_call": "VendorSai::bulkRemove(SAI_OBJECT_TYPE_ROUTE_ENTRY, ...)",
+      "output": "Route entry removed from hardware forwarding table; packets to this prefix are no longer forwarded",
+      "verify": "show ip route <prefix> (should not appear; traffic to prefix should be dropped)"
+    }
+  ],
+
+  "failure_injection_points": [
+    {
+      "between_steps": [1, 2],
+      "failure": "zebra does not receive or process the ZAPI ROUTE_DELETE from bgpd",
+      "symptom": "Prefix absent in 'show bgp ipv4 unicast' but still present in 'show ip route' and Linux kernel routing table — stale kernel route, traffic still forwarded to (now-invalid) next-hop",
+      "diagnosis": "docker exec bgp supervisorctl status zebra; check /var/log/frr/zebra.log for ZAPI errors; restart frr container if zebra is crashed"
+    },
+    {
+      "between_steps": [2, 3],
+      "failure": "FPM socket disconnected or fpmsyncd crash — RTM_DELROUTE never reaches fpmsyncd",
+      "symptom": "Route absent in 'ip route show' (kernel) but APPL_DB ROUTE_TABLE key still present — stale APPL_DB entry; orchagent does not remove ASIC entry; traffic blackholed via hardware FIB pointing to removed next-hop",
+      "diagnosis": "docker exec bgp supervisorctl status fpmsyncd; ss -tnp | grep 2620 (FPM TCP port should show ESTABLISHED); check /var/log/swss/fpmsyncd.log; restart fpmsyncd to re-drain zebra FPM buffer"
+    },
+    {
+      "between_steps": [3, 4],
+      "failure": "orchagent is stuck or restarting — DEL event in APPL_DB not consumed",
+      "symptom": "APPL_DB ROUTE_TABLE key deleted but ASIC_DB route entry still present — hardware continues to forward traffic to withdrawn prefix (stale FIB entry, potential routing loop or traffic to dead next-hop)",
+      "diagnosis": "docker exec swss supervisorctl status orchagent; check /var/log/swss/orchagent.log for SAI or consumer errors; redis-cli -n 0 XLEN APPL_DB_ROUTE_TABLE_KEY_SET to check pending entries"
+    },
+    {
+      "between_steps": [4, 5],
+      "failure": "syncd not processing ASIC_DB DEL — syncd crash, SAI error, or ASIC API failure",
+      "symptom": "ASIC_DB route entry deleted but hardware FIB still programmed — traffic forwarded to withdrawn prefix until next ASIC reset; syncd log shows SAI_STATUS_FAILURE on remove",
+      "diagnosis": "docker exec syncd supervisorctl status syncd; check /var/log/syncd.log for SAI error codes; check ASIC vendor support logs; if persistent, warm-reboot or cold-reboot to resync hardware state"
+    }
+  ],
+
+  "related_paths": ["route-install-bgp", "route-install-static", "arp-resolution"]
+}

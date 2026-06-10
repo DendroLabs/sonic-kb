@@ -1,0 +1,119 @@
+{
+  "path_id": "config-flow",
+  "display_name": "Generic SONiC config propagation pipeline (overview)",
+  "trigger": "Any configuration change: SONiC CLI, config reload, or direct CONFIG_DB write",
+  "version": "202511",
+  "def_refs": ["daemon:orchagent", "daemon:syncd", "daemon:portmgrd", "db:config_db", "db:appl_db", "db:asic_db", "db:state_db"],
+
+  "steps": [
+    {
+      "step": 1,
+      "actor": "sonic-utilities (config CLI)",
+      "action": "User intent enters the system as a CONFIG_DB write. 'config ...' subcommands call ConfigDBConnector set_entry/mod_entry on specific tables; 'config reload' replays all of /etc/sonic/config_db.json into CONFIG_DB. CONFIG_DB (Redis DB 4) is the single source of truth — every supported configuration mechanism ends in a CONFIG_DB table write, never in direct daemon or kernel manipulation.",
+      "source_file": "sonic-utilities:config/main.py",
+      "source_function": "reload()",
+      "db_write": {
+        "db": "db:config_db",
+        "table": "<TABLE>",
+        "key_pattern": "<TABLE>|<key>",
+        "fields": ["table-specific"]
+      },
+      "verify": "redis-cli -n 4 HGETALL '<TABLE>|<key>'  (or sonic-db-cli CONFIG_DB ...)"
+    },
+    {
+      "step": 2,
+      "actor": "cfgmgr daemon (*mgrd)",
+      "action": "A manager daemon subscribed to the CONFIG_DB table (portmgrd, vlanmgrd, intfmgrd, teammgrd, vxlanmgrd, ...) wakes on the change. It validates the entry, applies any Linux-kernel-side configuration (ip link, bridge, ip address via swss::exec), and republishes the validated intent to the corresponding APPL_DB table through a ProducerStateTable. PortMgr::doTask() is the representative pattern; every *mgrd follows the same Consumer/doTask structure. FRR-managed config (BGP, static routes) takes a parallel branch: bgpcfgd renders FRR config via vtysh instead, and routes re-enter the pipeline through fpmsyncd into APPL_DB.",
+      "source_file": "sonic-swss:cfgmgr/portmgr.cpp",
+      "source_function": "PortMgr::doTask()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "<TABLE>_TABLE",
+        "key_pattern": "<TABLE>_TABLE:<key>",
+        "fields": ["validated subset of CONFIG_DB fields"]
+      },
+      "verify": "redis-cli -n 0 HGETALL '<TABLE>_TABLE:<key>'"
+    },
+    {
+      "step": 3,
+      "actor": "orchagent (Orch dispatch)",
+      "action": "OrchDaemon's main event loop multiplexes all APPL_DB (and some CONFIG_DB, e.g. ACL) consumers across its Orch objects (PortsOrch, RouteOrch, NeighOrch, AclOrch, VxlanTunnelOrch, ...). The owning Orch's doTask() translates the table entry into SAI API calls. SAI calls from orchagent do not touch hardware directly — sairedis serializes each call into an ASIC_DB ASIC_STATE entry and publishes it to syncd.",
+      "source_file": "sonic-swss:orchagent/orchdaemon.cpp",
+      "source_function": "OrchDaemon::start()",
+      "verify": "grep '<key>' /var/log/swss/orchagent.log"
+    },
+    {
+      "step": 4,
+      "actor": "sairedis client library (in orchagent process)",
+      "action": "RedisRemoteSaiInterface::create/set/remove serializes the SAI object type, virtual object ID (VID), and attribute list into ASIC_DB and notifies syncd over the Redis channel. ASIC_DB is the wire protocol between orchagent and syncd: every ASIC_STATE:SAI_OBJECT_TYPE_* key is one pending or programmed SAI object.",
+      "source_file": "sonic-sairedis:lib/RedisRemoteSaiInterface.cpp",
+      "source_function": "RedisRemoteSaiInterface::create()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_<TYPE>",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_<TYPE>:oid:0x... or serialized entry struct",
+        "fields": ["SAI_<TYPE>_ATTR_*"]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_<TYPE>*'"
+    },
+    {
+      "step": 5,
+      "actor": "syncd",
+      "action": "syncd consumes the ASIC_DB event, translates virtual IDs (VIDs) to real hardware IDs (RIDs), and invokes the vendor SAI library, which programs the ASIC via the vendor SDK/driver. SAI status is returned to orchagent; on failure orchagent logs the error and may retry or abort (a SAI failure here is the most common reason config exists in ASIC_DB but not in hardware).",
+      "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+      "source_function": "Syncd::processSingleEvent()",
+      "output": "Object programmed in ASIC hardware tables",
+      "verify": "grep -E 'SAI_STATUS_(?!SUCCESS)' /var/log/syncd/syncd.log"
+    },
+    {
+      "step": 6,
+      "actor": "feedback path (syncd notifications + *syncd daemons)",
+      "action": "State flows back up two ways: (a) vendor SAI events (port state change, FDB learn) are published by syncd's NotificationProcessor on the ASIC_DB NOTIFICATIONS channel and consumed by orchagent, which updates APPL_DB/STATE_DB; (b) kernel events (netlink link, neighbor, route, team changes) are picked up by *syncd daemons (portsyncd, neighsyncd, teamsyncd) and written to APPL_DB/STATE_DB. STATE_DB is what 'show' commands and healthchecks read — it reflects observed state, not intent.",
+      "source_file": "sonic-sairedis:syncd/NotificationProcessor.cpp",
+      "source_function": "NotificationProcessor::process_on_port_state_change()",
+      "db_write": {
+        "db": "db:state_db",
+        "table": "<TABLE>_TABLE",
+        "key_pattern": "<TABLE>_TABLE|<key>",
+        "fields": ["oper/observed state"]
+      },
+      "verify": "redis-cli -n 6 HGETALL '<TABLE>_TABLE|<key>'"
+    }
+  ],
+
+  "notes": [
+    "This is the architectural overview; entity-specific traces (route-install-bgp, vlan-create, port-config, ...) instantiate this pipeline with concrete tables and functions.",
+    "Diagnostic rule of thumb: find the LAST database layer where the object is correct. Intent missing in CONFIG_DB = config/CLI problem; in CONFIG_DB but not APPL_DB = cfgmgr daemon problem; in APPL_DB but not ASIC_DB = orchagent problem; in ASIC_DB but not hardware = syncd/vendor SAI problem.",
+    "Bypassing any stage (vtysh writes, manual ip link, direct redis writes to APPL_DB/ASIC_DB) creates state the upstream layer will not know about and may overwrite — see the human-errors catalog.",
+    "FRR-managed config is the main exception to the *mgrd pattern: bgpcfgd renders CONFIG_DB into FRR config via vtysh, and the resulting routes re-enter the standard pipeline at APPL_DB via zebra -> FPM -> fpmsyncd."
+  ],
+
+  "failure_injection_points": [
+    {
+      "between_steps": [1, 2],
+      "failure": "cfgmgr daemon not consuming CONFIG_DB change",
+      "symptom": "Entry correct in CONFIG_DB (redis-cli -n 4) but corresponding APPL_DB table never updates",
+      "diagnosis": "Check the owning *mgrd: docker exec swss supervisorctl status; check /var/log/swss/<mgrd>.log for validation errors; confirm the daemon subscribes to that table (see _daemon_index.json subscribes_to)"
+    },
+    {
+      "between_steps": [2, 3],
+      "failure": "orchagent not processing APPL_DB entry",
+      "symptom": "Entry in APPL_DB but no ASIC_DB object and no orchagent log activity for the key",
+      "diagnosis": "Check orchagent health: docker exec swss supervisorctl status orchagent; grep the key in /var/log/swss/orchagent.log; look for a stuck retry loop on an unrelated object blocking the consumer queue"
+    },
+    {
+      "between_steps": [4, 5],
+      "failure": "syncd SAI call failing",
+      "symptom": "Object in ASIC_DB but syncd logs SAI_STATUS_FAILURE / NOT_SUPPORTED / TABLE_FULL; behavior not reflected in hardware",
+      "diagnosis": "grep 'SAI_STATUS' /var/log/syncd/syncd.log; check for resource exhaustion (TCAM/FIB full) or unsupported attribute on this platform; vendor SAI escalation may be required"
+    },
+    {
+      "between_steps": [5, 6],
+      "failure": "stale STATE_DB / show-command output",
+      "symptom": "Hardware behaves correctly but 'show' commands report stale or missing state",
+      "diagnosis": "Feedback daemon problem: check portsyncd/neighsyncd/teamsyncd and syncd notification thread; STATE_DB staleness does not affect forwarding, only observability"
+    }
+  ],
+
+  "related_paths": ["route-install-bgp", "route-install-static", "port-config", "vlan-create", "lag-create", "arp-resolution", "fdb-learn", "vxlan-vtep-create", "acl-program"]
+}

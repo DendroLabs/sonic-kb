@@ -1,0 +1,158 @@
+{
+  "path_id": "port-config",
+  "display_name": "Port configuration change to ASIC (speed/MTU/admin state)",
+  "trigger": "Operator runs 'config interface speed|mtu|startup|shutdown <ifname> ...'",
+  "version": "202511",
+  "def_refs": [
+    "daemon:portmgrd",
+    "daemon:orchagent",
+    "daemon:syncd",
+    "daemon:portsyncd",
+    "db:config_db",
+    "db:appl_db",
+    "db:asic_db",
+    "db:state_db"
+  ],
+
+  "steps": [
+    {
+      "step": 1,
+      "actor": "sonic-utilities (config CLI / portconfig)",
+      "action": "For speed and MTU: 'config interface speed/mtu' delegates to the portconfig script which calls ConfigDBConnector.mod_entry() on the PORT table. For admin state: 'config interface startup/shutdown' calls config_db.mod_entry() directly in config/main.py. All paths write the changed field (speed, mtu, or admin_status) to CONFIG_DB PORT table.",
+      "source_file": "sonic-utilities:scripts/portconfig",
+      "source_function": "portconfig.set_speed()",
+      "db_write": {
+        "db": "db:config_db",
+        "table": "PORT",
+        "key_pattern": "PORT|<ifname>",
+        "fields": ["speed", "mtu", "admin_status"]
+      },
+      "verify": "redis-cli -n 4 HGETALL 'PORT|Ethernet0'"
+    },
+    {
+      "step": 2,
+      "actor": "portmgrd (PortMgr)",
+      "action": "PortMgr::doTask() receives CONFIG_DB PORT table SET event via ConsumerStateTable. For already-created ports (portOk=true), it applies kernel-side settings immediately: setPortMtu() runs 'ip link set dev <ifname> mtu <mtu>' and setPortAdminStatus() runs 'ip link set dev <ifname> up|down'. After the kernel call succeeds, writeConfigToAppDb() publishes the updated field to APPL_DB PORT_TABLE. Speed changes are NOT handled by portmgrd — speed is passed through to APPL_DB directly without a kernel ip-link call (kernel netdev speed is opaque; ASIC speed is set by orchagent).",
+      "source_file": "sonic-swss:cfgmgr/portmgr.cpp",
+      "source_function": "PortMgr::doTask()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "PORT_TABLE",
+        "key_pattern": "PORT_TABLE:<ifname>",
+        "fields": ["speed", "mtu", "admin_status"]
+      },
+      "verify": "redis-cli -n 0 HGETALL 'PORT_TABLE:Ethernet0'"
+    },
+    {
+      "step": 3,
+      "actor": "orchagent (PortsOrch)",
+      "action": "PortsOrch::doPortTask() receives APPL_DB PORT_TABLE SET event via ConsumerStateTable. For an existing port (portExists=true) it parses the updated fields via parsePortConfig(). For speed changes it calls setPortSpeed() which invokes sai_port_api->set_port_attribute(SAI_PORT_ATTR_SPEED). For MTU it calls setPortMtu() which adds Ethernet/VLAN overhead (22 bytes) and calls sai_port_api->set_port_attribute(SAI_PORT_ATTR_MTU). For admin state it calls setPortAdminStatus() which calls sai_port_api->set_port_attribute(SAI_PORT_ATTR_ADMIN_STATE). The sairedis client stub serializes each SAI call and writes it to ASIC_DB as a SET command on ASIC_STATE:SAI_OBJECT_TYPE_PORT.",
+      "source_file": "sonic-swss:orchagent/portsorch.cpp",
+      "source_function": "PortsOrch::doPortTask()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_PORT",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_PORT:<oid>",
+        "fields": [
+          "SAI_PORT_ATTR_SPEED",
+          "SAI_PORT_ATTR_MTU",
+          "SAI_PORT_ATTR_ADMIN_STATE"
+        ]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_PORT:*'"
+    },
+    {
+      "step": 4,
+      "actor": "syncd",
+      "action": "Syncd::processSingleEvent() reads the SET command from ASIC_DB ASIC_STATE channel. It dispatches to processQuadEvent(SAI_COMMON_API_SET, ...) which calls processOidSet(). processOidSet() translates the virtual object ID (VID) to a real hardware RID and calls m_vendorSai->set(SAI_OBJECT_TYPE_PORT, rid, attr) — the vendor SAI library. The vendor SAI programs the speed, MTU, or admin state directly into the ASIC forwarding hardware.",
+      "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+      "source_function": "Syncd::processOidSet()",
+      "sai_call": "m_vendorSai->set(SAI_OBJECT_TYPE_PORT, rid, attr)",
+      "output": "Port speed, MTU, or admin state programmed in ASIC hardware",
+      "verify": "show interfaces status Ethernet0"
+    },
+    {
+      "step": 5,
+      "actor": "syncd (NotificationProcessor) — oper status feedback, SAI path",
+      "action": "When the ASIC detects a link state change (e.g. admin down causes link down, or speed renegotiation completes), the vendor SAI fires the on_port_state_change callback. NotificationProcessor::process_on_port_state_change() translates the hardware RID to a VID and calls sendNotification(SAI_SWITCH_NOTIFICATION_NAME_PORT_STATE_CHANGE, ...) which publishes the notification to ASIC_DB NOTIFICATIONS channel.",
+      "source_file": "sonic-sairedis:syncd/NotificationProcessor.cpp",
+      "source_function": "NotificationProcessor::process_on_port_state_change()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "NOTIFICATIONS",
+        "key_pattern": "NOTIFICATIONS:port_state_change",
+        "fields": ["port_id", "port_state"]
+      },
+      "verify": "redis-cli -n 1 SUBSCRIBE NOTIFICATIONS"
+    },
+    {
+      "step": 6,
+      "actor": "orchagent (PortsOrch) — oper status feedback, SAI path",
+      "action": "PortsOrch::handleNotification() receives the port_state_change notification from ASIC_DB NOTIFICATIONS channel via m_portStatusNotificationConsumer. It deserializes the payload with sai_deserialize_port_oper_status_ntf(), looks up the port object, and calls updatePortOperStatus(). updatePortOperStatus() calls updateDbPortOperStatus() which writes the new oper_status ('up' or 'down') back to APPL_DB PORT_TABLE so that all consumers (intfsyncd, neighsyncd, etc.) can react.",
+      "source_file": "sonic-swss:orchagent/portsorch.cpp",
+      "source_function": "PortsOrch::handleNotification()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "PORT_TABLE",
+        "key_pattern": "PORT_TABLE:<ifname>",
+        "fields": ["oper_status"]
+      },
+      "verify": "redis-cli -n 0 HGET 'PORT_TABLE:Ethernet0' oper_status"
+    },
+    {
+      "step": 7,
+      "actor": "portsyncd (LinkSync) — oper status feedback, netlink path",
+      "action": "In parallel with the SAI notification path, the kernel raises RTM_NEWLINK when the host interface changes state (IFF_RUNNING flips). portsyncd's LinkSync::onMsg() receives the netlink message, reads the admin and oper flags plus the current MTU from the link object, and writes state='ok', netdev_oper_status='up|down', admin_status, and mtu to STATE_DB PORT_TABLE. This is the authoritative source for the kernel-visible interface state that portmgrd and other daemons use to gate config application.",
+      "source_file": "sonic-swss:portsyncd/linksync.cpp",
+      "source_function": "LinkSync::onMsg()",
+      "db_write": {
+        "db": "db:state_db",
+        "table": "PORT_TABLE",
+        "key_pattern": "PORT_TABLE|<ifname>",
+        "fields": ["state", "netdev_oper_status", "admin_status", "mtu"]
+      },
+      "verify": "redis-cli -n 6 HGETALL 'PORT_TABLE|Ethernet0'"
+    }
+  ],
+
+  "failure_injection_points": [
+    {
+      "between_steps": [1, 2],
+      "failure": "portmgrd not running or not subscribed to CONFIG_DB PORT table",
+      "symptom": "CONFIG_DB PORT shows updated speed/mtu/admin_status but APPL_DB PORT_TABLE is not updated; 'ip link show Ethernet0' still shows old MTU or admin state",
+      "diagnosis": "docker exec swss supervisorctl status portmgrd; check /var/log/swss/portmgrd.log; verify portmgrd is consuming CONFIG_DB: redis-cli -n 4 MONITOR | grep PORT"
+    },
+    {
+      "between_steps": [2, 3],
+      "failure": "orchagent not processing APPL_DB PORT_TABLE update",
+      "symptom": "APPL_DB PORT_TABLE shows updated fields but ASIC_DB ASIC_STATE:SAI_OBJECT_TYPE_PORT does not reflect new speed/MTU/admin state; port hardware state unchanged",
+      "diagnosis": "docker exec swss supervisorctl status orchagent; check /var/log/swss/orchagent.log for 'setPortSpeed' or 'setPortMtu' errors; redis-cli -n 0 HGETALL 'PORT_TABLE:Ethernet0' to confirm APPL_DB write"
+    },
+    {
+      "between_steps": [3, 4],
+      "failure": "syncd SAI call failing for port attribute set",
+      "symptom": "ASIC_DB ASIC_STATE:SAI_OBJECT_TYPE_PORT shows updated attribute but port hardware not programmed; orchagent log shows SAI_STATUS_NOT_SUPPORTED or SAI_STATUS_FAILURE",
+      "diagnosis": "docker exec syncd supervisorctl status syncd; check /var/log/syncd.log for SAI error codes on SAI_OBJECT_TYPE_PORT; verify speed is in supported_speeds: redis-cli -n 6 HGET 'PORT_TABLE|Ethernet0' supported_speeds"
+    },
+    {
+      "between_steps": [4, 5],
+      "failure": "No oper status notification from vendor SAI after admin-up or speed change",
+      "symptom": "Port programmed in ASIC (syncd no errors) but APPL_DB oper_status stays 'down'; 'show interfaces status' shows port down even though cable is connected",
+      "diagnosis": "Check if SAI notification callback is registered: grep 'on_port_state_change' /var/log/syncd.log; check physical layer — transceiver present? show interfaces transceiver presence; verify ASIC_DB NOTIFICATIONS: redis-cli -n 1 SUBSCRIBE NOTIFICATIONS"
+    },
+    {
+      "between_steps": [5, 6],
+      "failure": "orchagent not receiving or processing port_state_change notification",
+      "symptom": "ASIC_DB NOTIFICATIONS shows port_state_change events but APPL_DB PORT_TABLE oper_status is stale; protocols using oper status (BGP, etc.) see wrong state",
+      "diagnosis": "Check orchagent NotificationConsumer: docker exec swss supervisorctl status orchagent; look for 'port_state_change' in /var/log/swss/orchagent.log; redis-cli -n 0 HGET 'PORT_TABLE:Ethernet0' oper_status"
+    },
+    {
+      "between_steps": [2, 7],
+      "failure": "portsyncd not receiving RTM_NEWLINK netlink events",
+      "symptom": "STATE_DB PORT_TABLE|Ethernet0 missing state='ok' or shows stale netdev_oper_status; portmgrd cannot apply further config changes because isPortStateOk() returns false",
+      "diagnosis": "docker exec swss supervisorctl status portsyncd; check /var/log/swss/portsyncd.log; ip link show Ethernet0 to verify kernel interface state; portmgrd will queue config changes until STATE_DB state='ok' is set"
+    }
+  ],
+
+  "related_paths": ["vlan-create", "lag-create", "arp-resolution", "fdb-learn"]
+}

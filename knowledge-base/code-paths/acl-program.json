@@ -1,0 +1,131 @@
+{
+  "path_id": "acl-program",
+  "display_name": "ACL table/rule programming to ASIC",
+  "trigger": "Operator runs 'config acl add table ...' or 'acl-loader update full rules.json'",
+  "version": "202511",
+  "def_refs": ["daemon:orchagent", "daemon:syncd", "db:config_db", "db:appl_db", "db:asic_db"],
+
+  "steps": [
+    {
+      "step": 1,
+      "actor": "config CLI (sonic-utilities)",
+      "action": "Operator runs 'config acl add table <name> <type>' — config/main.py calls ConfigDBConnector.set_entry('ACL_TABLE', table_name, table_info) writing the new ACL table definition directly to CONFIG_DB. For rule updates, operator runs 'acl-loader update full rules.json' which calls AclLoader.full_update() that writes ACL_RULE entries via ConfigDBConnector.mod_config().",
+      "source_file": "sonic-utilities:config/main.py",
+      "source_function": "table()",
+      "db_write": {
+        "db": "db:config_db",
+        "table": "ACL_TABLE",
+        "key_pattern": "ACL_TABLE|<table_name>",
+        "fields": ["type", "policy_desc", "ports", "stage"]
+      },
+      "verify": "redis-cli -n 4 HGETALL 'ACL_TABLE|<table_name>'"
+    },
+    {
+      "step": 2,
+      "actor": "acl-loader (sonic-utilities)",
+      "action": "For rule updates: acl-loader update full reads rules from JSON file via load_rules_from_file(), then full_update() deletes all existing ACL_RULE entries and writes new rules to CONFIG_DB ACL_RULE table via ConfigDBConnector.mod_config(). Each rule key is '<table_name>|<rule_name>'.",
+      "source_file": "sonic-utilities:acl_loader/main.py",
+      "source_function": "AclLoader.full_update()",
+      "db_write": {
+        "db": "db:config_db",
+        "table": "ACL_RULE",
+        "key_pattern": "ACL_RULE|<table_name>|<rule_name>",
+        "fields": ["PRIORITY", "PACKET_ACTION", "SRC_IP", "DST_IP", "L4_SRC_PORT", "L4_DST_PORT", "IP_PROTOCOL", "ETHER_TYPE"]
+      },
+      "verify": "redis-cli -n 4 KEYS 'ACL_RULE|<table_name>|*'"
+    },
+    {
+      "step": 3,
+      "actor": "orchagent (AclOrch)",
+      "action": "AclOrch is initialized with TableConnectors for both CONFIG_DB (CFG_ACL_TABLE_TABLE_NAME, CFG_ACL_RULE_TABLE_NAME) and APPL_DB (APP_ACL_TABLE_TABLE_NAME, APP_ACL_RULE_TABLE_NAME) as declared in orchdaemon.cpp. doTask() dispatches CONFIG_DB ACL_TABLE notifications to doAclTableTask(), which parses table type/ports/stage and calls addAclTable(). addAclTable() calls createBindAclTable() which calls AclTable::create() — this invokes sai_acl_api->create_acl_table() and writes the resulting SAI OID to ASIC_DB.",
+      "source_file": "sonic-swss:orchagent/aclorch.cpp",
+      "source_function": "AclOrch::doTask()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_ACL_TABLE",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_ACL_TABLE:<oid>",
+        "fields": ["SAI_ACL_TABLE_ATTR_ACL_STAGE", "SAI_ACL_TABLE_ATTR_ACL_BIND_POINT_TYPE_LIST", "SAI_ACL_TABLE_ATTR_ACL_ACTION_TYPE_LIST", "SAI_ACL_TABLE_ATTR_FIELD_*"]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ACL_TABLE*'"
+    },
+    {
+      "step": 4,
+      "actor": "orchagent (AclOrch)",
+      "action": "doTask() dispatches CONFIG_DB ACL_RULE notifications to doAclRuleTask(). For each SET entry, AclRule::makeShared() constructs the rule object, then addAclRule() calls AclRule::create() which first calls createCounter() (sai_acl_api->create_acl_counter()) and then createRule() (sai_acl_api->create_acl_entry()). Both SAI OIDs are written to ASIC_DB.",
+      "source_file": "sonic-swss:orchagent/aclorch.cpp",
+      "source_function": "AclOrch::doAclRuleTask()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_ACL_ENTRY",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_ACL_ENTRY:<oid>",
+        "fields": ["SAI_ACL_ENTRY_ATTR_TABLE_ID", "SAI_ACL_ENTRY_ATTR_PRIORITY", "SAI_ACL_ENTRY_ATTR_ADMIN_STATE", "SAI_ACL_ENTRY_ATTR_ACTION_PACKET_ACTION", "SAI_ACL_ENTRY_ATTR_ACTION_COUNTER", "SAI_ACL_ENTRY_ATTR_FIELD_*"]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ACL_ENTRY*'"
+    },
+    {
+      "step": 5,
+      "actor": "orchagent (AclOrch)",
+      "action": "AclRule::create() calls createCounter() which invokes sai_acl_api->create_acl_counter() and writes the counter OID to ASIC_DB. The counter tracks packet and byte hit counts per rule and is linked to the ACL entry via SAI_ACL_ENTRY_ATTR_ACTION_COUNTER.",
+      "source_file": "sonic-swss:orchagent/aclorch.cpp",
+      "source_function": "AclRule::create()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_ACL_COUNTER",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_ACL_COUNTER:<oid>",
+        "fields": ["SAI_ACL_COUNTER_ATTR_TABLE_ID", "SAI_ACL_COUNTER_ATTR_ENABLE_PACKET_COUNT", "SAI_ACL_COUNTER_ATTR_ENABLE_BYTE_COUNT"]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ACL_COUNTER*'"
+    },
+    {
+      "step": 6,
+      "actor": "syncd",
+      "action": "syncd reads ASIC_DB notifications. processSingleEvent() dispatches CREATE ops to processQuadEvent(SAI_COMMON_API_CREATE). For OID-based objects (ACL_TABLE, ACL_ENTRY, ACL_COUNTER), processQuadEvent() calls processOid() which calls processOidCreate(). processOidCreate() translates VID to RID, then calls m_vendorSai->create(objectType, &objectRid, switchRid, attr_count, attr_list) which invokes the vendor SAI library to program the TCAM/CAM hardware.",
+      "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+      "source_function": "Syncd::processSingleEvent()",
+      "sai_call": "VendorSai::create(SAI_OBJECT_TYPE_ACL_TABLE / ACL_ENTRY / ACL_COUNTER, ...)",
+      "output": "ACL table, entry, and counter programmed in hardware TCAM/CAM",
+      "verify": "aclshow -a && show acl table && show acl rule"
+    }
+  ],
+
+  "failure_injection_points": [
+    {
+      "between_steps": [1, 2],
+      "failure": "Invalid ACL table type or unsupported port binding",
+      "symptom": "config acl add table fails with error; ACL_TABLE key absent from CONFIG_DB",
+      "diagnosis": "Check config acl output for ValueError; verify port names exist: show interfaces status; verify ACL type is supported: L2, L3, L3V6, MIRROR, CTRLPLANE"
+    },
+    {
+      "between_steps": [2, 3],
+      "failure": "acl-loader fails to write rules — JSON parse error or invalid action value",
+      "symptom": "ACL_RULE entries missing from CONFIG_DB after acl-loader run; acl-loader exits with non-zero status",
+      "diagnosis": "Run acl-loader with --verbose; check /var/log/syslog for acl-loader errors; validate rules JSON schema manually; check redis-cli -n 4 KEYS 'ACL_RULE|*'"
+    },
+    {
+      "between_steps": [3, 4],
+      "failure": "orchagent not processing ACL_TABLE — ports not yet ready or table type unsupported",
+      "symptom": "ACL_TABLE present in CONFIG_DB but no ASIC_STATE:SAI_OBJECT_TYPE_ACL_TABLE entry in ASIC_DB; orchagent log shows 'wait for ports ready'",
+      "diagnosis": "Check orchagent status: docker exec swss supervisorctl status orchagent; check /var/log/swss/orchagent.log for 'AclOrch' errors; verify all bound ports are operationally up: show interfaces status; check CRM ACL table capacity: crm show resources acl-table"
+    },
+    {
+      "between_steps": [4, 5],
+      "failure": "ACL rule creation deferred — ACL table OID not yet resolved or next-hop missing for redirect action",
+      "symptom": "ASIC_STATE:SAI_OBJECT_TYPE_ACL_TABLE exists but no ACL_ENTRY; orchagent log shows 'Wait for ACL table ... to be created'",
+      "diagnosis": "Check if ACL table OID is present: redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ACL_TABLE*'; for redirect rules, verify next-hop is resolved in NEIGH_TABLE; check /var/log/swss/orchagent.log for rule-level errors"
+    },
+    {
+      "between_steps": [5, 6],
+      "failure": "TCAM exhaustion — hardware ACL table is full",
+      "symptom": "sai_acl_api->create_acl_entry returns SAI_STATUS_INSUFFICIENT_RESOURCES; syncd log shows SAI_STATUS_TABLE_FULL; ACL entries stop programming after hitting hardware limit",
+      "diagnosis": "Check CRM counters: crm show resources acl-entry; check crm show resources acl-counter; check /var/log/syncd.log for SAI_STATUS_INSUFFICIENT_RESOURCES; consider splitting ACL tables across pipeline stages or reducing rule count"
+    },
+    {
+      "between_steps": [5, 6],
+      "failure": "syncd SAI call failing — vendor SAI returns unexpected error",
+      "symptom": "ACL entries in ASIC_DB but syncd throws SAI_STATUS_FAILURE; traffic not matching expected ACL rules",
+      "diagnosis": "Check /var/log/syncd.log for SAI error codes; verify ACL match fields are supported by this platform: crm show resources; check syncd status: docker exec syncd supervisorctl status syncd; inspect ASIC vendor logs if available"
+    }
+  ],
+
+  "related_paths": ["vlan-create", "port-config", "route-install-static", "vxlan-vtep-create"]
+}

@@ -1,0 +1,130 @@
+{
+  "path_id": "route-install-static",
+  "display_name": "Static route installation to ASIC",
+  "trigger": "Operator runs 'config route add prefix <A.B.C.D/M> nexthop <A.B.C.D>' on SONiC CLI",
+  "version": "202511",
+  "def_refs": ["daemon:bgpcfgd", "daemon:staticd", "daemon:zebra", "daemon:fpmsyncd", "daemon:orchagent", "daemon:syncd", "db:config_db", "db:appl_db", "db:asic_db"],
+
+  "steps": [
+    {
+      "step": 1,
+      "actor": "sonic-utilities (config CLI)",
+      "action": "Parses 'config route add' command via click, calls cli_sroute_to_config() to convert CLI args to CONFIG_DB key/fields, then calls config_db.set_entry('STATIC_ROUTE', key, route) to write the static route into CONFIG_DB",
+      "source_file": "sonic-utilities:config/main.py",
+      "source_function": "add_route()",
+      "db_write": {
+        "db": "db:config_db",
+        "table": "STATIC_ROUTE",
+        "key_pattern": "STATIC_ROUTE|<prefix> or STATIC_ROUTE|<vrf>|<prefix>",
+        "fields": ["nexthop", "ifname", "distance", "nexthop-vrf", "blackhole"]
+      },
+      "verify": "redis-cli -n 4 HGETALL 'STATIC_ROUTE|<prefix>'"
+    },
+    {
+      "step": 2,
+      "actor": "bgpcfgd (StaticRouteMgr)",
+      "action": "Subscribes to CONFIG_DB STATIC_ROUTE table changes via Manager framework. On set_handler() callback, parses nexthop fields, calls static_route_commands() to generate 'ip route <prefix> <nexthop>' FRR config lines, then pushes them via cfg_mgr.push_list(). On commit(), FRR.write() writes the commands to a temp file and applies them via 'vtysh -f <tmpfile>'",
+      "source_file": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/managers_static_rt.py",
+      "source_function": "StaticRouteMgr::set_handler()",
+      "output": "FRR staticd configuration updated with 'ip route <prefix> <nexthop> tag <tag>' via vtysh",
+      "verify": "docker exec bgp vtysh -c 'show running-config' | grep 'ip route'"
+    },
+    {
+      "step": 3,
+      "actor": "staticd (FRR)",
+      "action": "Receives 'ip route' configuration from vtysh via northbound API (YANG/NB callback). static_nexthop_create() processes the new nexthop, then static_zebra_route_add() sends a ZAPI ZEBRA_ROUTE_ADD message to zebra via zclient_route_send()",
+      "source_file": "sonic-frr:staticd/static_zebra.c",
+      "source_function": "static_zebra_route_add()",
+      "output": "ZAPI route-add message queued for zebra",
+      "verify": "docker exec bgp vtysh -c 'show ip static-route'"
+    },
+    {
+      "step": 4,
+      "actor": "zebra (FRR)",
+      "action": "Receives ZAPI route-add from staticd, installs route into zebra RIB via rib_add(). rib_process() selects best path, rib_install_kernel() programs the Linux kernel routing table via netlink and fires hook_call(rib_update) which triggers zfpm_trigger_update() to queue an FPM netlink message for fpmsyncd",
+      "source_file": "sonic-frr:zebra/zebra_rib.c",
+      "source_function": "rib_install_kernel()",
+      "output": "Route installed in Linux kernel routing table; FPM message queued on TCP port 2620",
+      "verify": "ip route show <prefix>"
+    },
+    {
+      "step": 5,
+      "actor": "fpmsyncd",
+      "action": "Receives RTM_NEWROUTE FPM netlink message from zebra on TCP socket (port 2620). onMsgRaw() dispatches to onMsg() then onRouteMsg(), which parses destination prefix, nexthop gateway(s) and interface name(s), and writes the route to APPL_DB ROUTE_TABLE via ProducerStateTable",
+      "source_file": "sonic-swss:fpmsyncd/routesync.cpp",
+      "source_function": "RouteSync::onRouteMsg()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "ROUTE_TABLE",
+        "key_pattern": "ROUTE_TABLE:<prefix>",
+        "fields": ["nexthop", "ifname", "weight", "protocol"]
+      },
+      "verify": "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix>'"
+    },
+    {
+      "step": 6,
+      "actor": "orchagent (RouteOrch)",
+      "action": "Notified of APPL_DB ROUTE_TABLE entry via ConsumerStateTable in doTask(). Resolves next-hop IP to a SAI neighbor or next-hop-group object already present in NEIGH_TABLE, then calls addRoute() which invokes sai_route_api->create_route_entry() and writes the resulting SAI objects to ASIC_DB",
+      "source_file": "sonic-swss:orchagent/routeorch.cpp",
+      "source_function": "RouteOrch::addRoute()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:{\"dest\":\"<prefix>\",\"switch_id\":\"...\",\"vr\":\"...\"}",
+        "fields": ["SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID", "SAI_ROUTE_ENTRY_ATTR_PACKET_ACTION"]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep '<prefix>'"
+    },
+    {
+      "step": 7,
+      "actor": "syncd",
+      "action": "Receives SAI create notification from ASIC_DB via processSingleEvent(). Translates the Redis SAI object into a vendor SAI call: sai_route_api->create_route_entry(), which programs the hardware TCAM/FIB forwarding table",
+      "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+      "source_function": "Syncd::processSingleEvent()",
+      "sai_call": "VendorSai::create(SAI_OBJECT_TYPE_ROUTE_ENTRY, ...)",
+      "output": "Static route programmed in hardware forwarding table; traffic to <prefix> forwarded",
+      "verify": "show ip route <prefix>"
+    }
+  ],
+
+  "failure_injection_points": [
+    {
+      "between_steps": [1, 2],
+      "failure": "bgpcfgd not detecting CONFIG_DB change",
+      "symptom": "Route visible in 'redis-cli -n 4 HGETALL STATIC_ROUTE|<prefix>' but no 'ip route' appears in FRR running-config",
+      "diagnosis": "Check bgpcfgd status: docker exec bgp supervisorctl status bgpcfgd; check /var/log/frr/bgpcfgd.log for errors in StaticRouteMgr set_handler; verify bgpcfgd is subscribed to CONFIG_DB"
+    },
+    {
+      "between_steps": [2, 3],
+      "failure": "vtysh config push failing",
+      "symptom": "bgpcfgd log shows 'can’t push configuration from file' error; 'ip route' not in vtysh 'show running-config'",
+      "diagnosis": "Check vtysh connectivity: docker exec bgp vtysh -c 'show daemons'; verify staticd is running: docker exec bgp supervisorctl status staticd; check /var/log/frr/frr.log for daemon startup errors"
+    },
+    {
+      "between_steps": [3, 4],
+      "failure": "staticd not sending ZAPI message to zebra",
+      "symptom": "Route in FRR 'show ip static-route' but absent from 'show ip route' and Linux kernel 'ip route show'",
+      "diagnosis": "Check zebra is running: docker exec bgp supervisorctl status zebra; check FPM/ZAPI socket: docker exec bgp vtysh -c 'show zebra client summary'; review /var/log/frr/zebra.log for ZAPI errors"
+    },
+    {
+      "between_steps": [4, 5],
+      "failure": "fpmsyncd not receiving FPM message",
+      "symptom": "Route present in Linux kernel 'ip route show' but absent from APPL_DB (redis-cli -n 0 KEYS 'ROUTE_TABLE:*')",
+      "diagnosis": "Check fpmsyncd: docker exec bgp supervisorctl status fpmsyncd; verify FPM TCP socket: ss -tnp | grep 2620; check /var/log/swss/fpmsyncd.log for connection or parse errors"
+    },
+    {
+      "between_steps": [5, 6],
+      "failure": "orchagent not processing APPL_DB route or next-hop not resolved",
+      "symptom": "Route in APPL_DB ROUTE_TABLE but absent from ASIC_DB; traffic blackholed despite route being visible",
+      "diagnosis": "Check orchagent: docker exec swss supervisorctl status orchagent; verify next-hop is in NEIGH_TABLE: redis-cli -n 0 KEYS 'NEIGH_TABLE:*'; check /var/log/swss/orchagent.log for 'cannot find nexthop' or SAI errors"
+    },
+    {
+      "between_steps": [6, 7],
+      "failure": "syncd SAI call failing",
+      "symptom": "Route entry in ASIC_DB but syncd logs SAI_STATUS_FAILURE or SAI_STATUS_INSUFFICIENT_RESOURCES; traffic not forwarded",
+      "diagnosis": "Check syncd: docker exec syncd supervisorctl status syncd; check /var/log/syncd.log for SAI error codes; verify TCAM/FIB table utilization: show platform resources"
+    }
+  ],
+
+  "related_paths": ["route-install-bgp", "route-withdraw", "arp-resolution"]
+}

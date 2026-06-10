@@ -1,0 +1,155 @@
+{
+  "path_id": "vlan-create",
+  "display_name": "VLAN creation and member assignment to ASIC",
+  "trigger": "User runs 'config vlan add <vid>' and 'config vlan member add <vid> <port>'",
+  "version": "202511",
+  "def_refs": ["daemon:vlanmgrd", "daemon:orchagent", "daemon:syncd", "db:config_db", "db:appl_db", "db:asic_db", "db:state_db"],
+
+  "steps": [
+    {
+      "step": 1,
+      "actor": "sonic-utilities (config CLI)",
+      "action": "User runs 'config vlan add 100'. CLI validates the VID range (2-4094), checks for duplicates, then calls config_db.set_entry('VLAN', 'Vlan100', {'vlanid': '100'}) via ValidatedConfigDBConnector, writing the VLAN entry to CONFIG_DB.",
+      "source_file": "sonic-utilities:config/vlan.py",
+      "source_function": "add_vlan()",
+      "db_write": {
+        "db": "db:config_db",
+        "table": "VLAN",
+        "key_pattern": "VLAN|Vlan<vid>",
+        "fields": ["vlanid"]
+      },
+      "verify": "redis-cli -n 4 HGETALL 'VLAN|Vlan100'"
+    },
+    {
+      "step": 2,
+      "actor": "vlanmgrd",
+      "action": "vlanmgrd main loop receives CONFIG_DB VLAN table notification via ConsumerStateTable. Dispatches to doVlanTask(), which calls addHostVlan() to create a Linux VLAN sub-interface ('ip link add link Bridge up name Vlan100 type vlan id 100' and 'bridge vlan add vid 100 dev Bridge self'), then publishes to APPL_DB VLAN_TABLE and sets STATE_DB VLAN_TABLE state=ok.",
+      "source_file": "sonic-swss:cfgmgr/vlanmgr.cpp",
+      "source_function": "VlanMgr::doVlanTask()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "VLAN_TABLE",
+        "key_pattern": "VLAN_TABLE:Vlan<vid>",
+        "fields": ["admin_status", "mtu", "mac", "host_ifname"]
+      },
+      "verify": "redis-cli -n 0 HGETALL 'VLAN_TABLE:Vlan100' && ip link show Vlan100"
+    },
+    {
+      "step": 3,
+      "actor": "orchagent (PortsOrch)",
+      "action": "orchagent is notified of APPL_DB VLAN_TABLE SET event via ConsumerStateTable. doTask() dispatches to doVlanTask(), which calls addVlan() — this calls sai_vlan_api->create_vlan() with SAI_VLAN_ATTR_VLAN_ID=100. The sairedis RedisRemoteSaiInterface serializes the create request and writes it to ASIC_DB as a CREATE command, then blocks waiting for syncd acknowledgment.",
+      "source_file": "sonic-swss:orchagent/portsorch.cpp",
+      "source_function": "PortsOrch::addVlan()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_VLAN",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_VLAN:<oid>",
+        "fields": ["SAI_VLAN_ATTR_VLAN_ID"]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_VLAN:*'"
+    },
+    {
+      "step": 4,
+      "actor": "syncd",
+      "action": "syncd reads the CREATE entry from ASIC_DB channel. processSingleEvent() dispatches to processQuadEvent(SAI_COMMON_API_CREATE), which calls processOid(), which calls processOidCreate(). This calls m_vendorSai->create(SAI_OBJECT_TYPE_VLAN, ...) which invokes the vendor SAI library via sai_metadata_generic_create() to program the hardware VLAN table. syncd sends the SAI response OID back and updates the VID-to-RID mapping in ASIC_DB.",
+      "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+      "source_function": "Syncd::processOidCreate()",
+      "sai_call": "VendorSai::create(SAI_OBJECT_TYPE_VLAN, ...)",
+      "output": "VLAN 100 created in hardware; VID-to-RID mapping stored in ASIC_DB VIDTORID",
+      "verify": "redis-cli -n 1 HGETALL 'ASIC_STATE:SAI_OBJECT_TYPE_VLAN:<oid>'"
+    },
+    {
+      "step": 5,
+      "actor": "sonic-utilities (config CLI)",
+      "action": "User runs 'config vlan member add 100 Ethernet0'. CLI validates the port and VLAN exist, checks tagging mode, and writes VLAN_MEMBER entry to CONFIG_DB via config_db.set_entry('VLAN_MEMBER', ('Vlan100', 'Ethernet0'), {'tagging_mode': 'tagged'}).",
+      "source_file": "sonic-utilities:config/vlan.py",
+      "source_function": "add_vlan_member()",
+      "db_write": {
+        "db": "db:config_db",
+        "table": "VLAN_MEMBER",
+        "key_pattern": "VLAN_MEMBER|Vlan<vid>|<port>",
+        "fields": ["tagging_mode"]
+      },
+      "verify": "redis-cli -n 4 HGETALL 'VLAN_MEMBER|Vlan100|Ethernet0'"
+    },
+    {
+      "step": 6,
+      "actor": "vlanmgrd",
+      "action": "vlanmgrd receives CONFIG_DB VLAN_MEMBER table notification. doVlanMemberTask() checks that the member port is in STATE_DB (port is ready) and the VLAN state is ok. Calls addHostVlanMember() to run 'ip link set Ethernet0 master Bridge && bridge vlan add vid 100 dev Ethernet0'. Then publishes VLAN_MEMBER to APPL_DB VLAN_MEMBER_TABLE and sets STATE_DB VLAN_MEMBER_TABLE state=ok.",
+      "source_file": "sonic-swss:cfgmgr/vlanmgr.cpp",
+      "source_function": "VlanMgr::doVlanMemberTask()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "VLAN_MEMBER_TABLE",
+        "key_pattern": "VLAN_MEMBER_TABLE:Vlan<vid>:<port>",
+        "fields": ["tagging_mode"]
+      },
+      "verify": "redis-cli -n 0 HGETALL 'VLAN_MEMBER_TABLE:Vlan100:Ethernet0' && bridge vlan show dev Ethernet0"
+    },
+    {
+      "step": 7,
+      "actor": "orchagent (PortsOrch)",
+      "action": "orchagent is notified of APPL_DB VLAN_MEMBER_TABLE SET event. doVlanMemberTask() resolves the port object, calls addBridgePort() to create a SAI bridge port (SAI_OBJECT_TYPE_BRIDGE_PORT) if not already created, then calls addVlanMember() which calls sai_vlan_api->create_vlan_member() with SAI_VLAN_MEMBER_ATTR_VLAN_ID, SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID, and SAI_VLAN_MEMBER_ATTR_VLAN_TAGGING_MODE. sairedis writes to ASIC_DB.",
+      "source_file": "sonic-swss:orchagent/portsorch.cpp",
+      "source_function": "PortsOrch::addVlanMember()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_VLAN_MEMBER",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_VLAN_MEMBER:<oid>",
+        "fields": ["SAI_VLAN_MEMBER_ATTR_VLAN_ID", "SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID", "SAI_VLAN_MEMBER_ATTR_VLAN_TAGGING_MODE"]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_VLAN_MEMBER:*'"
+    },
+    {
+      "step": 8,
+      "actor": "syncd",
+      "action": "syncd reads the VLAN_MEMBER CREATE from ASIC_DB channel. processSingleEvent() -> processQuadEvent(SAI_COMMON_API_CREATE) -> processOid() -> processOidCreate() calls m_vendorSai->create(SAI_OBJECT_TYPE_VLAN_MEMBER, ...) which invokes the vendor SAI library to associate the port with the VLAN in hardware. VID-to-RID mapping for the vlan_member object is stored in ASIC_DB.",
+      "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+      "source_function": "Syncd::processOidCreate()",
+      "sai_call": "VendorSai::create(SAI_OBJECT_TYPE_VLAN_MEMBER, ...)",
+      "output": "Port Ethernet0 associated with VLAN 100 in hardware; tagged/untagged mode set",
+      "verify": "show vlan brief"
+    }
+  ],
+
+  "failure_injection_points": [
+    {
+      "between_steps": [1, 2],
+      "failure": "vlanmgrd not running or crashing on startup",
+      "symptom": "CONFIG_DB has VLAN entry but APPL_DB VLAN_TABLE is empty; 'ip link show Vlan100' shows no interface",
+      "diagnosis": "docker exec swss supervisorctl status vlanmgrd; check /var/log/swss/vlanmgrd.log; verify device MAC is present: redis-cli -n 4 HGET 'DEVICE_METADATA|localhost' mac"
+    },
+    {
+      "between_steps": [2, 3],
+      "failure": "orchagent not consuming APPL_DB VLAN_TABLE",
+      "symptom": "APPL_DB VLAN_TABLE:Vlan100 exists but ASIC_DB has no SAI_OBJECT_TYPE_VLAN entry; Linux Vlan100 interface exists",
+      "diagnosis": "docker exec swss supervisorctl status orchagent; check /var/log/swss/orchagent.log for errors; verify APPL_DB consumer is active: redis-cli -n 0 KEYS '_VLAN_TABLE*'"
+    },
+    {
+      "between_steps": [3, 4],
+      "failure": "syncd SAI create_vlan failing",
+      "symptom": "ASIC_DB shows SAI_OBJECT_TYPE_VLAN entry but 'show vlan brief' shows no VLAN or VLAN missing in hardware",
+      "diagnosis": "docker exec syncd supervisorctl status syncd; check /var/log/syncd.log for SAI error codes; verify ASIC_DB response: redis-cli -n 1 HGETALL 'ASIC_STATE:SAI_OBJECT_TYPE_VLAN:<oid>'"
+    },
+    {
+      "between_steps": [5, 6],
+      "failure": "vlanmgrd member task blocked waiting for port to be ready",
+      "symptom": "CONFIG_DB has VLAN_MEMBER entry but APPL_DB VLAN_MEMBER_TABLE is empty; bridge vlan show does not list the port",
+      "diagnosis": "Check if port is in STATE_DB: redis-cli -n 6 HGETALL 'PORT_TABLE|Ethernet0'; if port is down or not initialized, vlanmgrd defers; check /var/log/swss/vlanmgrd.log for 'not ready, delaying'"
+    },
+    {
+      "between_steps": [6, 7],
+      "failure": "orchagent cannot find VLAN object when processing VLAN_MEMBER",
+      "symptom": "APPL_DB VLAN_MEMBER_TABLE entry exists but no ASIC_STATE:SAI_OBJECT_TYPE_VLAN_MEMBER created; orchagent logs 'Failed to locate VLAN'",
+      "diagnosis": "Verify VLAN itself was created: redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_VLAN:*'; check orchagent portList for the VLAN; may indicate out-of-order event processing"
+    },
+    {
+      "between_steps": [7, 8],
+      "failure": "syncd SAI create_vlan_member failing",
+      "symptom": "ASIC_DB has VLAN_MEMBER entry but port does not pass traffic on the VLAN; SAI returns error",
+      "diagnosis": "Check /var/log/syncd.log for SAI_STATUS errors on VLAN_MEMBER create; verify bridge_port OID is valid: redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_BRIDGE_PORT:*'; hardware VLAN table may be full"
+    }
+  ],
+
+  "related_paths": ["port-config", "lag-create", "fdb-learn", "vxlan-vtep-create", "acl-program"]
+}

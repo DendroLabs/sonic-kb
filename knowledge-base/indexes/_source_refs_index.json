@@ -1,4 +1,417 @@
 {
+  "sonic-utilities (config CLI)::reload()": {
+    "source_file": "sonic-utilities:config/main.py",
+    "source_function": "reload()",
+    "actor": "sonic-utilities (config CLI)",
+    "action": "User intent enters the system as a CONFIG_DB write. 'config ...' subcommands call ConfigDBConnector set_entry/mod_entry on specific tables; 'config reload' replays all of /etc/sonic/config_db.json into CONFIG_DB. CONFIG_DB (Redis DB 4) is the single source of truth \u2014 every supported configuration mechanism ends in a CONFIG_DB table write, never in direct daemon or kernel manipulation.",
+    "code_path": "config-flow"
+  },
+  "cfgmgr daemon (*mgrd)::PortMgr::doTask()": {
+    "source_file": "sonic-swss:cfgmgr/portmgr.cpp",
+    "source_function": "PortMgr::doTask()",
+    "actor": "cfgmgr daemon (*mgrd)",
+    "action": "A manager daemon subscribed to the CONFIG_DB table (portmgrd, vlanmgrd, intfmgrd, teammgrd, vxlanmgrd, ...) wakes on the change. It validates the entry, applies any Linux-kernel-side configuration (ip link, bridge, ip address via swss::exec), and republishes the validated intent to the corresponding APPL_DB table through a ProducerStateTable. PortMgr::doTask() is the representative pattern; every *mgrd follows the same Consumer/doTask structure. FRR-managed config (BGP, static routes) takes a parallel branch: bgpcfgd renders FRR config via vtysh instead, and routes re-enter the pipeline through fpmsyncd into APPL_DB.",
+    "code_path": "config-flow"
+  },
+  "orchagent (Orch dispatch)::OrchDaemon::start()": {
+    "source_file": "sonic-swss:orchagent/orchdaemon.cpp",
+    "source_function": "OrchDaemon::start()",
+    "actor": "orchagent (Orch dispatch)",
+    "action": "OrchDaemon's main event loop multiplexes all APPL_DB (and some CONFIG_DB, e.g. ACL) consumers across its Orch objects (PortsOrch, RouteOrch, NeighOrch, AclOrch, VxlanTunnelOrch, ...). The owning Orch's doTask() translates the table entry into SAI API calls. SAI calls from orchagent do not touch hardware directly \u2014 sairedis serializes each call into an ASIC_DB ASIC_STATE entry and publishes it to syncd.",
+    "code_path": "config-flow"
+  },
+  "sairedis client library (in orchagent process)::RedisRemoteSaiInterface::create()": {
+    "source_file": "sonic-sairedis:lib/RedisRemoteSaiInterface.cpp",
+    "source_function": "RedisRemoteSaiInterface::create()",
+    "actor": "sairedis client library (in orchagent process)",
+    "action": "RedisRemoteSaiInterface::create/set/remove serializes the SAI object type, virtual object ID (VID), and attribute list into ASIC_DB and notifies syncd over the Redis channel. ASIC_DB is the wire protocol between orchagent and syncd: every ASIC_STATE:SAI_OBJECT_TYPE_* key is one pending or programmed SAI object.",
+    "code_path": "config-flow"
+  },
+  "syncd::Syncd::processSingleEvent()": {
+    "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+    "source_function": "Syncd::processSingleEvent()",
+    "actor": "syncd",
+    "action": "Receives SAI Redis notification from ASIC_DB, calls vendor SAI library sai_route_api->create_route_entry() which programs the ASIC TCAM/FIB",
+    "code_path": "route-install-bgp"
+  },
+  "feedback path (syncd notifications + *syncd daemons)::NotificationProcessor::process_on_port_state_change()": {
+    "source_file": "sonic-sairedis:syncd/NotificationProcessor.cpp",
+    "source_function": "NotificationProcessor::process_on_port_state_change()",
+    "actor": "feedback path (syncd notifications + *syncd daemons)",
+    "action": "State flows back up two ways: (a) vendor SAI events (port state change, FDB learn) are published by syncd's NotificationProcessor on the ASIC_DB NOTIFICATIONS channel and consumed by orchagent, which updates APPL_DB/STATE_DB; (b) kernel events (netlink link, neighbor, route, team changes) are picked up by *syncd daemons (portsyncd, neighsyncd, teamsyncd) and written to APPL_DB/STATE_DB. STATE_DB is what 'show' commands and healthchecks read \u2014 it reflects observed state, not intent.",
+    "code_path": "config-flow"
+  },
+  "sonic-utilities (config CLI)::add_vlan()": {
+    "source_file": "sonic-utilities:config/vlan.py",
+    "source_function": "add_vlan()",
+    "actor": "sonic-utilities (config CLI)",
+    "action": "User runs 'config vlan add 100'. CLI validates the VID range (2-4094), checks for duplicates, then calls config_db.set_entry('VLAN', 'Vlan100', {'vlanid': '100'}) via ValidatedConfigDBConnector, writing the VLAN entry to CONFIG_DB.",
+    "code_path": "vlan-create"
+  },
+  "vlanmgrd::VlanMgr::doVlanTask()": {
+    "source_file": "sonic-swss:cfgmgr/vlanmgr.cpp",
+    "source_function": "VlanMgr::doVlanTask()",
+    "actor": "vlanmgrd",
+    "action": "vlanmgrd main loop receives CONFIG_DB VLAN table notification via ConsumerStateTable. Dispatches to doVlanTask(), which calls addHostVlan() to create a Linux VLAN sub-interface ('ip link add link Bridge up name Vlan100 type vlan id 100' and 'bridge vlan add vid 100 dev Bridge self'), then publishes to APPL_DB VLAN_TABLE and sets STATE_DB VLAN_TABLE state=ok.",
+    "code_path": "vlan-create"
+  },
+  "orchagent (PortsOrch)::PortsOrch::addVlan()": {
+    "source_file": "sonic-swss:orchagent/portsorch.cpp",
+    "source_function": "PortsOrch::addVlan()",
+    "actor": "orchagent (PortsOrch)",
+    "action": "orchagent is notified of APPL_DB VLAN_TABLE SET event via ConsumerStateTable. doTask() dispatches to doVlanTask(), which calls addVlan() \u2014 this calls sai_vlan_api->create_vlan() with SAI_VLAN_ATTR_VLAN_ID=100. The sairedis RedisRemoteSaiInterface serializes the create request and writes it to ASIC_DB as a CREATE command, then blocks waiting for syncd acknowledgment.",
+    "code_path": "vlan-create"
+  },
+  "syncd::Syncd::processOidCreate()": {
+    "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+    "source_function": "Syncd::processOidCreate()",
+    "actor": "syncd",
+    "action": "syncd reads the VLAN_MEMBER CREATE from ASIC_DB channel. processSingleEvent() -> processQuadEvent(SAI_COMMON_API_CREATE) -> processOid() -> processOidCreate() calls m_vendorSai->create(SAI_OBJECT_TYPE_VLAN_MEMBER, ...) which invokes the vendor SAI library to associate the port with the VLAN in hardware. VID-to-RID mapping for the vlan_member object is stored in ASIC_DB.",
+    "code_path": "vlan-create"
+  },
+  "sonic-utilities (config CLI)::add_vlan_member()": {
+    "source_file": "sonic-utilities:config/vlan.py",
+    "source_function": "add_vlan_member()",
+    "actor": "sonic-utilities (config CLI)",
+    "action": "User runs 'config vlan member add 100 Ethernet0'. CLI validates the port and VLAN exist, checks tagging mode, and writes VLAN_MEMBER entry to CONFIG_DB via config_db.set_entry('VLAN_MEMBER', ('Vlan100', 'Ethernet0'), {'tagging_mode': 'tagged'}).",
+    "code_path": "vlan-create"
+  },
+  "vlanmgrd::VlanMgr::doVlanMemberTask()": {
+    "source_file": "sonic-swss:cfgmgr/vlanmgr.cpp",
+    "source_function": "VlanMgr::doVlanMemberTask()",
+    "actor": "vlanmgrd",
+    "action": "vlanmgrd receives CONFIG_DB VLAN_MEMBER table notification. doVlanMemberTask() checks that the member port is in STATE_DB (port is ready) and the VLAN state is ok. Calls addHostVlanMember() to run 'ip link set Ethernet0 master Bridge && bridge vlan add vid 100 dev Ethernet0'. Then publishes VLAN_MEMBER to APPL_DB VLAN_MEMBER_TABLE and sets STATE_DB VLAN_MEMBER_TABLE state=ok.",
+    "code_path": "vlan-create"
+  },
+  "orchagent (PortsOrch)::PortsOrch::addVlanMember()": {
+    "source_file": "sonic-swss:orchagent/portsorch.cpp",
+    "source_function": "PortsOrch::addVlanMember()",
+    "actor": "orchagent (PortsOrch)",
+    "action": "orchagent is notified of APPL_DB VLAN_MEMBER_TABLE SET event. doVlanMemberTask() resolves the port object, calls addBridgePort() to create a SAI bridge port (SAI_OBJECT_TYPE_BRIDGE_PORT) if not already created, then calls addVlanMember() which calls sai_vlan_api->create_vlan_member() with SAI_VLAN_MEMBER_ATTR_VLAN_ID, SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID, and SAI_VLAN_MEMBER_ATTR_VLAN_TAGGING_MODE. sairedis writes to ASIC_DB.",
+    "code_path": "vlan-create"
+  },
+  "neighsyncd::NeighSync::onMsg()": {
+    "source_file": "sonic-swss:neighsyncd/neighsync.cpp",
+    "source_function": "NeighSync::onMsg()",
+    "actor": "neighsyncd",
+    "action": "Receives RTM_NEWNEIGH netlink event from the kernel via libnl. NeighSync::onMsg() filters out NUD_INCOMPLETE/NUD_FAILED states (delete_key=true path) and, for valid NUD_REACHABLE entries, writes the neighbor (MAC + address family) to APPL_DB NEIGH_TABLE via m_neighTable.set().",
+    "code_path": "arp-resolution"
+  },
+  "orchagent (NeighOrch)::NeighOrch::doTask()": {
+    "source_file": "sonic-swss:orchagent/neighorch.cpp",
+    "source_function": "NeighOrch::doTask()",
+    "actor": "orchagent (NeighOrch)",
+    "action": "ConsumerStateTable notifies NeighOrch of APPL_DB NEIGH_TABLE SET. NeighOrch::doTask() parses the interface and IP key, extracts the MAC from the 'neigh' field, then calls NeighOrch::addNeighbor() which invokes sai_neighbor_api->create_neighbor_entry() to create a SAI neighbor object. The entry is written to ASIC_DB.",
+    "code_path": "arp-resolution"
+  },
+  "orchagent (NeighOrch)::NeighOrch::addNextHop()": {
+    "source_file": "sonic-swss:orchagent/neighorch.cpp",
+    "source_function": "NeighOrch::addNextHop()",
+    "actor": "orchagent (NeighOrch)",
+    "action": "Immediately after creating the SAI neighbor, NeighOrch::addNeighbor() calls NeighOrch::addNextHop() which invokes sai_next_hop_api->create_next_hop() with SAI_NEXT_HOP_TYPE_IP to create a SAI next-hop object referencing the resolved neighbor. The next-hop OID is stored in ASIC_DB and in the in-memory m_syncdNextHops map.",
+    "code_path": "arp-resolution"
+  },
+  "orchagent (NeighOrch)::NeighOrch::addNeighbor()": {
+    "source_file": "sonic-swss:orchagent/neighorch.cpp",
+    "source_function": "NeighOrch::addNeighbor()",
+    "actor": "orchagent (NeighOrch)",
+    "action": "After neighbor and next-hop are created, NeighOrch::addNeighbor() calls notify(SUBJECT_TYPE_NEIGH_CHANGE, ...) to inform observers. RouteOrch (which has routes pending with this unresolved next-hop left in m_toSync) re-processes those routes on the next doTask() cycle: it now finds the next-hop OID in NeighOrch::hasNextHop() and successfully calls sai_route_api->create_route_entry(), writing the pending route to ASIC_DB.",
+    "code_path": "arp-resolution"
+  },
+  "bgpd (FRR)::bgp_withdraw()": {
+    "source_file": "sonic-frr:bgpd/bgp_route.c",
+    "source_function": "bgp_withdraw()",
+    "actor": "bgpd (FRR)",
+    "action": "Receives BGP UPDATE message containing a withdrawn prefix (or detects session drop), removes the path_info from the adj-RIB-in, and calls bgp_process() to trigger a new best-path selection. With no remaining path, bgpd sends a ZAPI ROUTE_DELETE message to zebra via the internal ZAPI socket.",
+    "code_path": "route-withdraw"
+  },
+  "zebra (FRR)::rib_process_del_fib()": {
+    "source_file": "sonic-frr:zebra/zebra_rib.c",
+    "source_function": "rib_process_del_fib()",
+    "actor": "zebra (FRR)",
+    "action": "Receives ZAPI ROUTE_DELETE from bgpd. rib_process() selects a new FIB entry (none in this case). rib_process_del_fib() calls rib_uninstall_kernel() which enqueues a DPLANE_OP_ROUTE_DELETE context to the dataplane. The dplane_fpm_nl module encodes an RTM_DELROUTE netlink message and writes it to the FPM TCP socket (port 2620) via fpm_nl_enqueue().",
+    "code_path": "route-withdraw"
+  },
+  "fpmsyncd::RouteSync::onRouteMsg()": {
+    "source_file": "sonic-swss:fpmsyncd/routesync.cpp",
+    "source_function": "RouteSync::onRouteMsg()",
+    "actor": "fpmsyncd",
+    "action": "Receives FPM netlink message from zebra via TCP socket (port 2620), parses RTM_NEWROUTE, writes route to APPL_DB ROUTE_TABLE",
+    "code_path": "route-install-bgp"
+  },
+  "orchagent (RouteOrch)::RouteOrch::removeRoute()": {
+    "source_file": "sonic-swss:orchagent/routeorch.cpp",
+    "source_function": "RouteOrch::removeRoute()",
+    "actor": "orchagent (RouteOrch)",
+    "action": "ConsumerStateTable notifies orchagent of the DEL event on APPL_DB ROUTE_TABLE. RouteOrch::doTask() reads the DEL_COMMAND and calls removeRoute() to stage a bulk remove of the SAI route entry via gRouteBulker.remove_entry(). After gRouteBulker.flush(), removeRoutePost() confirms SAI_STATUS_SUCCESS, removes the entry from m_syncdRoutes, and decrements next-hop-group reference counts.",
+    "code_path": "route-withdraw"
+  },
+  "syncd::Syncd::processBulkRemoveEntry()": {
+    "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+    "source_function": "Syncd::processBulkRemoveEntry()",
+    "actor": "syncd",
+    "action": "Reads the BULK_REMOVE (or REMOVE) notification for SAI_OBJECT_TYPE_ROUTE_ENTRY from ASIC_DB. processSingleEvent() dispatches to processBulkQuadEvent(SAI_COMMON_API_BULK_REMOVE) \u2192 processBulkRemoveEntry(), which calls m_vendorSai->bulkRemove() to invoke the vendor SAI remove_route_entries() API, deleting the route from the ASIC FIB/TCAM.",
+    "code_path": "route-withdraw"
+  },
+  "config CLI (sonic-utilities)::table()": {
+    "source_file": "sonic-utilities:config/main.py",
+    "source_function": "table()",
+    "actor": "config CLI (sonic-utilities)",
+    "action": "Operator runs 'config acl add table <name> <type>' \u2014 config/main.py calls ConfigDBConnector.set_entry('ACL_TABLE', table_name, table_info) writing the new ACL table definition directly to CONFIG_DB. For rule updates, operator runs 'acl-loader update full rules.json' which calls AclLoader.full_update() that writes ACL_RULE entries via ConfigDBConnector.mod_config().",
+    "code_path": "acl-program"
+  },
+  "acl-loader (sonic-utilities)::AclLoader.full_update()": {
+    "source_file": "sonic-utilities:acl_loader/main.py",
+    "source_function": "AclLoader.full_update()",
+    "actor": "acl-loader (sonic-utilities)",
+    "action": "For rule updates: acl-loader update full reads rules from JSON file via load_rules_from_file(), then full_update() deletes all existing ACL_RULE entries and writes new rules to CONFIG_DB ACL_RULE table via ConfigDBConnector.mod_config(). Each rule key is '<table_name>|<rule_name>'.",
+    "code_path": "acl-program"
+  },
+  "orchagent (AclOrch)::AclOrch::doTask()": {
+    "source_file": "sonic-swss:orchagent/aclorch.cpp",
+    "source_function": "AclOrch::doTask()",
+    "actor": "orchagent (AclOrch)",
+    "action": "AclOrch is initialized with TableConnectors for both CONFIG_DB (CFG_ACL_TABLE_TABLE_NAME, CFG_ACL_RULE_TABLE_NAME) and APPL_DB (APP_ACL_TABLE_TABLE_NAME, APP_ACL_RULE_TABLE_NAME) as declared in orchdaemon.cpp. doTask() dispatches CONFIG_DB ACL_TABLE notifications to doAclTableTask(), which parses table type/ports/stage and calls addAclTable(). addAclTable() calls createBindAclTable() which calls AclTable::create() \u2014 this invokes sai_acl_api->create_acl_table() and writes the resulting SAI OID to ASIC_DB.",
+    "code_path": "acl-program"
+  },
+  "orchagent (AclOrch)::AclOrch::doAclRuleTask()": {
+    "source_file": "sonic-swss:orchagent/aclorch.cpp",
+    "source_function": "AclOrch::doAclRuleTask()",
+    "actor": "orchagent (AclOrch)",
+    "action": "doTask() dispatches CONFIG_DB ACL_RULE notifications to doAclRuleTask(). For each SET entry, AclRule::makeShared() constructs the rule object, then addAclRule() calls AclRule::create() which first calls createCounter() (sai_acl_api->create_acl_counter()) and then createRule() (sai_acl_api->create_acl_entry()). Both SAI OIDs are written to ASIC_DB.",
+    "code_path": "acl-program"
+  },
+  "orchagent (AclOrch)::AclRule::create()": {
+    "source_file": "sonic-swss:orchagent/aclorch.cpp",
+    "source_function": "AclRule::create()",
+    "actor": "orchagent (AclOrch)",
+    "action": "AclRule::create() calls createCounter() which invokes sai_acl_api->create_acl_counter() and writes the counter OID to ASIC_DB. The counter tracks packet and byte hit counts per rule and is linked to the ACL entry via SAI_ACL_ENTRY_ATTR_ACTION_COUNTER.",
+    "code_path": "acl-program"
+  },
+  "sonic-utilities (config CLI)::add_route()": {
+    "source_file": "sonic-utilities:config/main.py",
+    "source_function": "add_route()",
+    "actor": "sonic-utilities (config CLI)",
+    "action": "Parses 'config route add' command via click, calls cli_sroute_to_config() to convert CLI args to CONFIG_DB key/fields, then calls config_db.set_entry('STATIC_ROUTE', key, route) to write the static route into CONFIG_DB",
+    "code_path": "route-install-static"
+  },
+  "bgpcfgd (StaticRouteMgr)::StaticRouteMgr::set_handler()": {
+    "source_file": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/managers_static_rt.py",
+    "source_function": "StaticRouteMgr::set_handler()",
+    "actor": "bgpcfgd (StaticRouteMgr)",
+    "action": "Subscribes to CONFIG_DB STATIC_ROUTE table changes via Manager framework. On set_handler() callback, parses nexthop fields, calls static_route_commands() to generate 'ip route <prefix> <nexthop>' FRR config lines, then pushes them via cfg_mgr.push_list(). On commit(), FRR.write() writes the commands to a temp file and applies them via 'vtysh -f <tmpfile>'",
+    "code_path": "route-install-static"
+  },
+  "staticd (FRR)::static_zebra_route_add()": {
+    "source_file": "sonic-frr:staticd/static_zebra.c",
+    "source_function": "static_zebra_route_add()",
+    "actor": "staticd (FRR)",
+    "action": "Receives 'ip route' configuration from vtysh via northbound API (YANG/NB callback). static_nexthop_create() processes the new nexthop, then static_zebra_route_add() sends a ZAPI ZEBRA_ROUTE_ADD message to zebra via zclient_route_send()",
+    "code_path": "route-install-static"
+  },
+  "zebra (FRR)::rib_install_kernel()": {
+    "source_file": "sonic-frr:zebra/zebra_rib.c",
+    "source_function": "rib_install_kernel()",
+    "actor": "zebra (FRR)",
+    "action": "Receives ZAPI route-add from staticd, installs route into zebra RIB via rib_add(). rib_process() selects best path, rib_install_kernel() programs the Linux kernel routing table via netlink and fires hook_call(rib_update) which triggers zfpm_trigger_update() to queue an FPM netlink message for fpmsyncd",
+    "code_path": "route-install-static"
+  },
+  "orchagent (RouteOrch)::RouteOrch::addRoute()": {
+    "source_file": "sonic-swss:orchagent/routeorch.cpp",
+    "source_function": "RouteOrch::addRoute()",
+    "actor": "orchagent (RouteOrch)",
+    "action": "Notified of APPL_DB ROUTE_TABLE change via ConsumerStateTable, resolves next-hop to SAI neighbor/next-hop-group objects, calls sai_route_api->create_route_entry()",
+    "code_path": "route-install-bgp"
+  },
+  "vendor SAI (ASIC driver)::SwitchNotifications::Slot::onFdbEvent()": {
+    "source_file": "sonic-sairedis:syncd/SwitchNotifications.h",
+    "source_function": "SwitchNotifications::Slot::onFdbEvent()",
+    "actor": "vendor SAI (ASIC driver)",
+    "action": "ASIC hardware-learns source MAC on ingress bridge port. Vendor SAI fires the registered on_fdb_event callback with SAI_FDB_EVENT_LEARNED event type, MAC address, bv_id (bridge/VLAN OID), and bridge_port_id attribute.",
+    "code_path": "fdb-learn"
+  },
+  "syncd (NotificationHandler)::NotificationHandler::onFdbEvent()": {
+    "source_file": "sonic-sairedis:syncd/NotificationHandler.cpp",
+    "source_function": "NotificationHandler::onFdbEvent()",
+    "actor": "syncd (NotificationHandler)",
+    "action": "SAI callback lands in syncd's registered handler. NotificationHandler::onFdbEvent() serializes the fdb_event_notification_data array using sai_serialize_fdb_event_ntf() and calls enqueueNotification(), placing the item on the internal NotificationQueue. The notification processor thread is signaled.",
+    "code_path": "fdb-learn"
+  },
+  "syncd (NotificationProcessor)::NotificationProcessor::process_on_fdb_event()": {
+    "source_file": "sonic-sairedis:syncd/NotificationProcessor.cpp",
+    "source_function": "NotificationProcessor::process_on_fdb_event()",
+    "actor": "syncd (NotificationProcessor)",
+    "action": "Notification processor thread dequeues item, dispatches to syncProcessNotification() which routes SAI_SWITCH_NOTIFICATION_NAME_FDB_EVENT to handle_fdb_event(). That function deserializes, calls process_on_fdb_event() which: (a) validates OIDs, (b) translates hardware RIDs to virtual IDs (VIDs), (c) calls redisPutFdbEntryToAsicView() to write the learned FDB entry into ASIC_DB as ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY with type SAI_FDB_ENTRY_TYPE_DYNAMIC, then (d) serializes the VID-translated event and calls sendNotification() to publish it on the ASIC_DB NOTIFICATIONS channel so orchagent subscribers receive it.",
+    "code_path": "fdb-learn"
+  },
+  "orchagent (FdbOrch)::FdbOrch::doTask()": {
+    "source_file": "sonic-swss:orchagent/fdborch.cpp",
+    "source_function": "FdbOrch::doTask()",
+    "actor": "orchagent (FdbOrch)",
+    "action": "FdbOrch subscribes to ASIC_DB NOTIFICATIONS channel via NotificationConsumer (initialized at startup with 'NOTIFICATIONS' channel name). doTask(NotificationConsumer&) pops the event, matches op == 'fdb_event', deserializes with sai_deserialize_fdb_event_ntf(), then calls FdbOrch::update() for each FDB entry in the batch.",
+    "code_path": "fdb-learn"
+  },
+  "orchagent (FdbOrch)::FdbOrch::storeFdbEntryState()": {
+    "source_file": "sonic-swss:orchagent/fdborch.cpp",
+    "source_function": "FdbOrch::storeFdbEntryState()",
+    "actor": "orchagent (FdbOrch)",
+    "action": "FdbOrch::update() resolves bridge_port_id to a Port object via PortsOrch, resolves bv_id to a VLAN Port object, then for SAI_FDB_EVENT_LEARNED calls storeFdbEntryState(). storeFdbEntryState() upserts the FDB entry into m_entries (in-memory FDB table), constructs key 'Vlan<id>:<mac>', and writes fields {port, type} to STATE_DB FDB_TABLE.",
+    "code_path": "fdb-learn"
+  },
+  "fdbshow (sonic-utilities)::FdbShow.fetch_fdb_data()": {
+    "source_file": "sonic-utilities:scripts/fdbshow",
+    "source_function": "FdbShow.fetch_fdb_data()",
+    "actor": "fdbshow (sonic-utilities)",
+    "action": "'show mac' / fdbshow reads learned MAC addresses from ASIC_DB (not STATE_DB). FdbShow.fetch_fdb_data() connects to ASIC_DB, queries ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY:* keys, resolves bridge_port_id OIDs to interface names using the COUNTERS_DB port OID map, and resolves bv_id to VLAN ID. Results are tabulated as Vlan/MacAddress/Port/Type.",
+    "code_path": "fdb-learn"
+  },
+  "config CLI (sonic-utilities)::add_portchannel()": {
+    "source_file": "sonic-utilities:config/main.py",
+    "source_function": "add_portchannel()",
+    "actor": "config CLI (sonic-utilities)",
+    "action": "User runs 'config portchannel add PortChannel01'. add_portchannel() validates the name and writes an entry to CONFIG_DB PORTCHANNEL table with fields admin_status=up, mtu=9100, lacp_key=auto, fast_rate.",
+    "code_path": "lag-create"
+  },
+  "teammgrd::TeamMgr::addLag()": {
+    "source_file": "sonic-swss:cfgmgr/teammgr.cpp",
+    "source_function": "TeamMgr::addLag()",
+    "actor": "teammgrd",
+    "action": "TeamMgr::doTask() dispatches CONFIG_DB PORTCHANNEL set-event to doLagTask(). doLagTask() calls addLag() which spawns 'teamd -r -t PortChannel01 -c <json-config> -d' with a generated LACP JSON config containing device name, MAC, runner=lacp. The kernel creates a team netdevice for PortChannel01.",
+    "code_path": "lag-create"
+  },
+  "teammgrd::TeamMgr::setLagMtu()": {
+    "source_file": "sonic-swss:cfgmgr/teammgr.cpp",
+    "source_function": "TeamMgr::setLagMtu()",
+    "actor": "teammgrd",
+    "action": "After addLag() returns task_success, doLagTask() calls setLagMtu() which issues 'ip link set dev PortChannel01 mtu 9100' and writes mtu field to APPL_DB LAG_TABLE via m_appLagTable.set(). Also calls setLagAdminStatus() to bring the interface up.",
+    "code_path": "lag-create"
+  },
+  "teamsyncd::TeamSync::addLag()": {
+    "source_file": "sonic-swss:teamsyncd/teamsync.cpp",
+    "source_function": "TeamSync::addLag()",
+    "actor": "teamsyncd",
+    "action": "TeamSync::onMsg() receives RTM_NEWLINK netlink event for PortChannel01 (type=team). Calls TeamSync::addLag() which writes admin_status, oper_status, mtu fields to APPL_DB LAG_TABLE and initialises a TeamPortSync instance that connects to teamd via libteam to listen for port-change events. STATE_DB LAG_TABLE is also updated with state=ok.",
+    "code_path": "lag-create"
+  },
+  "config CLI (sonic-utilities)::add_portchannel_member()": {
+    "source_file": "sonic-utilities:config/main.py",
+    "source_function": "add_portchannel_member()",
+    "actor": "config CLI (sonic-utilities)",
+    "action": "User runs 'config portchannel member add PortChannel01 EthernetX'. add_portchannel_member() validates that the port exists, is not already in a portchannel, has matching speed/MTU, and writes CONFIG_DB PORTCHANNEL_MEMBER entry.",
+    "code_path": "lag-create"
+  },
+  "teammgrd::TeamMgr::addLagMember()": {
+    "source_file": "sonic-swss:cfgmgr/teammgr.cpp",
+    "source_function": "TeamMgr::addLagMember()",
+    "actor": "teammgrd",
+    "action": "TeamMgr::doLagMemberTask() fires on CONFIG_DB PORTCHANNEL_MEMBER set-event. Waits for port state and LAG state to be ok (isPortStateOk/isLagStateOk), then calls addLagMember() which runs: (1) 'ip link set dev EthernetX down', (2) 'teamdctl PortChannel01 port config update EthernetX {lacp_key:N,link_watch:{name:ethtool}}', (3) 'teamdctl PortChannel01 port add EthernetX'. The port is now enslaved into the team device and LACP PDU exchange begins.",
+    "code_path": "lag-create"
+  },
+  "teamsyncd::TeamSync::TeamPortSync::onChange()": {
+    "source_file": "sonic-swss:teamsyncd/teamsync.cpp",
+    "source_function": "TeamSync::TeamPortSync::onChange()",
+    "actor": "teamsyncd",
+    "action": "TeamSync::TeamPortSync::onChange() fires via libteam port-change callback (registered via team_change_handler_register). Iterates over team ports using team_for_each_port, maps ifindex to ifname, reads enabled status from team_get_port_enabled(). Writes APPL_DB LAG_MEMBER_TABLE entry 'PortChannel01:EthernetX' with status=enabled (after LACP negotiation succeeds) or status=disabled (while negotiating).",
+    "code_path": "lag-create"
+  },
+  "orchagent (PortsOrch)::PortsOrch::addLag()": {
+    "source_file": "sonic-swss:orchagent/portsorch.cpp",
+    "source_function": "PortsOrch::addLag()",
+    "actor": "orchagent (PortsOrch)",
+    "action": "PortsOrch::doLagTask() is notified of APPL_DB LAG_TABLE change via ConsumerStateTable. Calls PortsOrch::addLag() which invokes sai_lag_api->create_lag() to create a SAI LAG object. The resulting sai_object_id is stored in ASIC_DB under SAI_OBJECT_TYPE_LAG.",
+    "code_path": "lag-create"
+  },
+  "orchagent (PortsOrch)::PortsOrch::addLagMember()": {
+    "source_file": "sonic-swss:orchagent/portsorch.cpp",
+    "source_function": "PortsOrch::addLagMember()",
+    "actor": "orchagent (PortsOrch)",
+    "action": "PortsOrch::doLagMemberTask() is notified of APPL_DB LAG_MEMBER_TABLE change. After confirming the LAG and port objects exist, calls PortsOrch::addLagMember() which sets SAI_LAG_MEMBER_ATTR_LAG_ID and SAI_LAG_MEMBER_ATTR_PORT_ID, and optionally SAI_LAG_MEMBER_ATTR_INGRESS_DISABLE/EGRESS_DISABLE (for disabled members) then invokes sai_lag_api->create_lag_member(). The resulting sai_object_id is stored in ASIC_DB under SAI_OBJECT_TYPE_LAG_MEMBER.",
+    "code_path": "lag-create"
+  },
+  "config CLI (sonic-utilities)::add_vxlan()": {
+    "source_file": "sonic-utilities:config/vxlan.py",
+    "source_function": "add_vxlan()",
+    "actor": "config CLI (sonic-utilities)",
+    "action": "User runs 'config vxlan add <vtep_name> <src_ip>'. The add_vxlan() click command validates the source IP and interface name, enforces single-VTEP policy, then writes VXLAN_TUNNEL entry to CONFIG_DB with field src_ip=<src_ip>.",
+    "code_path": "vxlan-vtep-create"
+  },
+  "vxlanmgrd (swss container)::VxlanMgr::doVxlanTunnelCreateTask()": {
+    "source_file": "sonic-swss:cfgmgr/vxlanmgr.cpp",
+    "source_function": "VxlanMgr::doVxlanTunnelCreateTask()",
+    "actor": "vxlanmgrd (swss container)",
+    "action": "Subscribed to CONFIG_DB CFG_VXLAN_TUNNEL_TABLE_NAME via Consumer. doTask() dispatches to doVxlanTunnelCreateTask(), which caches the tunnel's src_ip and writes the entry to APPL_DB VXLAN_TUNNEL_TABLE using ProducerStateTable m_appVxlanTunnelTable.",
+    "code_path": "vxlan-vtep-create"
+  },
+  "vxlanmgrd (swss container) \u2014 optional VLAN-VNI map::VxlanMgr::doVxlanTunnelMapCreateTask()": {
+    "source_file": "sonic-swss:cfgmgr/vxlanmgr.cpp",
+    "source_function": "VxlanMgr::doVxlanTunnelMapCreateTask()",
+    "actor": "vxlanmgrd (swss container) \u2014 optional VLAN-VNI map",
+    "action": "When user subsequently runs 'config vxlan map add <vtep> <vlan> <vni>', doVxlanTunnelMapCreateTask() creates a per-VNI Linux VXLAN netdevice (<vtep>-<vlan_id>) via ip-link and bridge commands, then writes the map entry to APPL_DB VXLAN_TUNNEL_MAP_TABLE.",
+    "code_path": "vxlan-vtep-create"
+  },
+  "orchagent (VxlanTunnelOrch)::VxlanTunnelOrch::addOperation()": {
+    "source_file": "sonic-swss:orchagent/vxlanorch.cpp",
+    "source_function": "VxlanTunnelOrch::addOperation()",
+    "actor": "orchagent (VxlanTunnelOrch)",
+    "action": "ConsumerStateTable on APPL_DB VXLAN_TUNNEL_TABLE fires addOperation(). A VxlanTunnel object is constructed in-memory (tunnel not yet in hardware at this stage \u2014 hardware creation is deferred until a map entry arrives).",
+    "code_path": "vxlan-vtep-create"
+  },
+  "orchagent (VxlanTunnelMapOrch)::VxlanTunnelMapOrch::addOperation()": {
+    "source_file": "sonic-swss:orchagent/vxlanorch.cpp",
+    "source_function": "VxlanTunnelMapOrch::addOperation()",
+    "actor": "orchagent (VxlanTunnelMapOrch)",
+    "action": "ConsumerStateTable on APPL_DB VXLAN_TUNNEL_MAP_TABLE fires addOperation(). On first map entry for this tunnel, createTunnelHw() is called which: (a) creates SAI tunnel map objects (SAI_OBJECT_TYPE_TUNNEL_MAP) for VNI-to-VLAN and VLAN-to-VNI via create_tunnel_map(); (b) creates the SAI tunnel object (SAI_OBJECT_TYPE_TUNNEL, type VXLAN, encap src IP) via create_tunnel(); (c) creates the tunnel termination entry (SAI_OBJECT_TYPE_TUNNEL_TERM_TABLE_ENTRY, P2MP) via create_tunnel_termination(). Then creates the VNI-to-VLAN map entry (SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY) via create_tunnel_map_entry(). All of these are written to ASIC_DB.",
+    "code_path": "vxlan-vtep-create"
+  },
+  "sonic-utilities (config CLI / portconfig)::portconfig.set_speed()": {
+    "source_file": "sonic-utilities:scripts/portconfig",
+    "source_function": "portconfig.set_speed()",
+    "actor": "sonic-utilities (config CLI / portconfig)",
+    "action": "For speed and MTU: 'config interface speed/mtu' delegates to the portconfig script which calls ConfigDBConnector.mod_entry() on the PORT table. For admin state: 'config interface startup/shutdown' calls config_db.mod_entry() directly in config/main.py. All paths write the changed field (speed, mtu, or admin_status) to CONFIG_DB PORT table.",
+    "code_path": "port-config"
+  },
+  "portmgrd (PortMgr)::PortMgr::doTask()": {
+    "source_file": "sonic-swss:cfgmgr/portmgr.cpp",
+    "source_function": "PortMgr::doTask()",
+    "actor": "portmgrd (PortMgr)",
+    "action": "PortMgr::doTask() receives CONFIG_DB PORT table SET event via ConsumerStateTable. For already-created ports (portOk=true), it applies kernel-side settings immediately: setPortMtu() runs 'ip link set dev <ifname> mtu <mtu>' and setPortAdminStatus() runs 'ip link set dev <ifname> up|down'. After the kernel call succeeds, writeConfigToAppDb() publishes the updated field to APPL_DB PORT_TABLE. Speed changes are NOT handled by portmgrd \u2014 speed is passed through to APPL_DB directly without a kernel ip-link call (kernel netdev speed is opaque; ASIC speed is set by orchagent).",
+    "code_path": "port-config"
+  },
+  "orchagent (PortsOrch)::PortsOrch::doPortTask()": {
+    "source_file": "sonic-swss:orchagent/portsorch.cpp",
+    "source_function": "PortsOrch::doPortTask()",
+    "actor": "orchagent (PortsOrch)",
+    "action": "PortsOrch::doPortTask() receives APPL_DB PORT_TABLE SET event via ConsumerStateTable. For an existing port (portExists=true) it parses the updated fields via parsePortConfig(). For speed changes it calls setPortSpeed() which invokes sai_port_api->set_port_attribute(SAI_PORT_ATTR_SPEED). For MTU it calls setPortMtu() which adds Ethernet/VLAN overhead (22 bytes) and calls sai_port_api->set_port_attribute(SAI_PORT_ATTR_MTU). For admin state it calls setPortAdminStatus() which calls sai_port_api->set_port_attribute(SAI_PORT_ATTR_ADMIN_STATE). The sairedis client stub serializes each SAI call and writes it to ASIC_DB as a SET command on ASIC_STATE:SAI_OBJECT_TYPE_PORT.",
+    "code_path": "port-config"
+  },
+  "syncd::Syncd::processOidSet()": {
+    "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+    "source_function": "Syncd::processOidSet()",
+    "actor": "syncd",
+    "action": "Syncd::processSingleEvent() reads the SET command from ASIC_DB ASIC_STATE channel. It dispatches to processQuadEvent(SAI_COMMON_API_SET, ...) which calls processOidSet(). processOidSet() translates the virtual object ID (VID) to a real hardware RID and calls m_vendorSai->set(SAI_OBJECT_TYPE_PORT, rid, attr) \u2014 the vendor SAI library. The vendor SAI programs the speed, MTU, or admin state directly into the ASIC forwarding hardware.",
+    "code_path": "port-config"
+  },
+  "syncd (NotificationProcessor) \u2014 oper status feedback, SAI path::NotificationProcessor::process_on_port_state_change()": {
+    "source_file": "sonic-sairedis:syncd/NotificationProcessor.cpp",
+    "source_function": "NotificationProcessor::process_on_port_state_change()",
+    "actor": "syncd (NotificationProcessor) \u2014 oper status feedback, SAI path",
+    "action": "When the ASIC detects a link state change (e.g. admin down causes link down, or speed renegotiation completes), the vendor SAI fires the on_port_state_change callback. NotificationProcessor::process_on_port_state_change() translates the hardware RID to a VID and calls sendNotification(SAI_SWITCH_NOTIFICATION_NAME_PORT_STATE_CHANGE, ...) which publishes the notification to ASIC_DB NOTIFICATIONS channel.",
+    "code_path": "port-config"
+  },
+  "orchagent (PortsOrch) \u2014 oper status feedback, SAI path::PortsOrch::handleNotification()": {
+    "source_file": "sonic-swss:orchagent/portsorch.cpp",
+    "source_function": "PortsOrch::handleNotification()",
+    "actor": "orchagent (PortsOrch) \u2014 oper status feedback, SAI path",
+    "action": "PortsOrch::handleNotification() receives the port_state_change notification from ASIC_DB NOTIFICATIONS channel via m_portStatusNotificationConsumer. It deserializes the payload with sai_deserialize_port_oper_status_ntf(), looks up the port object, and calls updatePortOperStatus(). updatePortOperStatus() calls updateDbPortOperStatus() which writes the new oper_status ('up' or 'down') back to APPL_DB PORT_TABLE so that all consumers (intfsyncd, neighsyncd, etc.) can react.",
+    "code_path": "port-config"
+  },
+  "portsyncd (LinkSync) \u2014 oper status feedback, netlink path::LinkSync::onMsg()": {
+    "source_file": "sonic-swss:portsyncd/linksync.cpp",
+    "source_function": "LinkSync::onMsg()",
+    "actor": "portsyncd (LinkSync) \u2014 oper status feedback, netlink path",
+    "action": "In parallel with the SAI notification path, the kernel raises RTM_NEWLINK when the host interface changes state (IFF_RUNNING flips). portsyncd's LinkSync::onMsg() receives the netlink message, reads the admin and oper flags plus the current MTU from the link object, and writes state='ok', netdev_oper_status='up|down', admin_status, and mtu to STATE_DB PORT_TABLE. This is the authoritative source for the kernel-visible interface state that portmgrd and other daemons use to gate config application.",
+    "code_path": "port-config"
+  },
   "bgpd (FRR)::bgp_process_main_one()": {
     "source_file": "sonic-frr:bgpd/bgp_route.c",
     "source_function": "bgp_process_main_one()",
@@ -11,27 +424,6 @@
     "source_function": "rib_process_result()",
     "actor": "zebra (FRR)",
     "action": "Receives route from bgpd via internal ZAPI, installs into zebra RIB, programs Linux kernel via netlink, and sends FPM message to fpmsyncd",
-    "code_path": "route-install-bgp"
-  },
-  "fpmsyncd::RouteSync::onRouteMsg()": {
-    "source_file": "sonic-swss:fpmsyncd/routesync.cpp",
-    "source_function": "RouteSync::onRouteMsg()",
-    "actor": "fpmsyncd",
-    "action": "Receives FPM netlink message from zebra via TCP socket (port 2620), parses RTM_NEWROUTE, writes route to APPL_DB ROUTE_TABLE",
-    "code_path": "route-install-bgp"
-  },
-  "orchagent (RouteOrch)::RouteOrch::addRoute()": {
-    "source_file": "sonic-swss:orchagent/routeorch.cpp",
-    "source_function": "RouteOrch::addRoute()",
-    "actor": "orchagent (RouteOrch)",
-    "action": "Notified of APPL_DB ROUTE_TABLE change via ConsumerStateTable, resolves next-hop to SAI neighbor/next-hop-group objects, calls sai_route_api->create_route_entry()",
-    "code_path": "route-install-bgp"
-  },
-  "syncd::Syncd::processSingleEvent()": {
-    "source_file": "sonic-sairedis:syncd/Syncd.cpp",
-    "source_function": "Syncd::processSingleEvent()",
-    "actor": "syncd",
-    "action": "Receives SAI Redis notification from ASIC_DB, calls vendor SAI library sai_route_api->create_route_entry() which programs the ASIC TCAM/FIB",
     "code_path": "route-install-bgp"
   }
 }

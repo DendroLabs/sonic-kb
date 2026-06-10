@@ -91,5 +91,5 @@
     }
   ],
 
-  "related_paths": ["route-install-static", "route-withdraw-bgp", "arp-resolution"]
+  "related_paths": ["route-install-static", "route-withdraw", "arp-resolution"]
 }

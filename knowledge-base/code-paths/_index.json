@@ -23,5 +23,35 @@
     "display_name": "LAG/PortChannel creation",
     "trigger": "User creates a PortChannel and adds member ports",
     "entity_type": "lag"
+  },
+  "route-withdraw": {
+    "display_name": "BGP route withdrawal from ASIC",
+    "trigger": "BGP UPDATE withdraws a prefix or the session goes down",
+    "entity_type": "route"
+  },
+  "arp-resolution": {
+    "display_name": "ARP/neighbor resolution to ASIC",
+    "trigger": "Traffic to an unresolved next-hop triggers kernel ARP resolution",
+    "entity_type": "neighbor"
+  },
+  "fdb-learn": {
+    "display_name": "MAC/FDB learning propagation",
+    "trigger": "ASIC hardware learns a source MAC on a port",
+    "entity_type": "fdb"
+  },
+  "vxlan-vtep-create": {
+    "display_name": "VXLAN VTEP creation",
+    "trigger": "User configures a VXLAN tunnel (VTEP source IP)",
+    "entity_type": "tunnel"
+  },
+  "acl-program": {
+    "display_name": "ACL table and rule programming",
+    "trigger": "User configures an ACL table and rules",
+    "entity_type": "acl"
+  },
+  "config-flow": {
+    "display_name": "Generic SONiC config propagation pipeline (overview)",
+    "trigger": "Any configuration change: SONiC CLI, config reload, or direct CONFIG_DB write",
+    "entity_type": "overview"
   }
 }

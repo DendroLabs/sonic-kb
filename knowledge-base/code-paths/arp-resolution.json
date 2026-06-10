@@ -1,0 +1,135 @@
+{
+  "path_id": "arp-resolution",
+  "display_name": "ARP/neighbor resolution to ASIC programming",
+  "trigger": "Traffic destined to an unresolved next-hop IP address causes the kernel to send an ARP request; kernel installs the resulting neighbor entry after receiving the ARP reply",
+  "version": "202511",
+  "def_refs": [
+    "daemon:neighsyncd",
+    "daemon:orchagent",
+    "daemon:syncd",
+    "daemon:nbrmgrd",
+    "db:appl_db",
+    "db:asic_db"
+  ],
+
+  "steps": [
+    {
+      "step": 1,
+      "actor": "Linux kernel (ARP subsystem)",
+      "action": "A packet arrives for an IP with no ARP entry; kernel sends ARP broadcast request on the egress interface and marks the neighbor as NUD_INCOMPLETE. On ARP reply receipt the neighbor transitions to NUD_REACHABLE and is installed in the kernel neighbor table.",
+      "source_file": null,
+      "source_function": null,
+      "output": "Kernel neighbor entry for the IP with resolved MAC address in state NUD_REACHABLE",
+      "verify": "ip neigh show <ip>"
+    },
+    {
+      "step": 2,
+      "actor": "neighsyncd",
+      "action": "Receives RTM_NEWNEIGH netlink event from the kernel via libnl. NeighSync::onMsg() filters out NUD_INCOMPLETE/NUD_FAILED states (delete_key=true path) and, for valid NUD_REACHABLE entries, writes the neighbor (MAC + address family) to APPL_DB NEIGH_TABLE via m_neighTable.set().",
+      "source_file": "sonic-swss:neighsyncd/neighsync.cpp",
+      "source_function": "NeighSync::onMsg()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "NEIGH_TABLE",
+        "key_pattern": "NEIGH_TABLE:<interface>:<ip>",
+        "fields": ["neigh", "family"]
+      },
+      "verify": "redis-cli -n 0 HGETALL 'NEIGH_TABLE:<interface>:<ip>'"
+    },
+    {
+      "step": 3,
+      "actor": "orchagent (NeighOrch)",
+      "action": "ConsumerStateTable notifies NeighOrch of APPL_DB NEIGH_TABLE SET. NeighOrch::doTask() parses the interface and IP key, extracts the MAC from the 'neigh' field, then calls NeighOrch::addNeighbor() which invokes sai_neighbor_api->create_neighbor_entry() to create a SAI neighbor object. The entry is written to ASIC_DB.",
+      "source_file": "sonic-swss:orchagent/neighorch.cpp",
+      "source_function": "NeighOrch::doTask()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_NEIGHBOR_ENTRY",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_NEIGHBOR_ENTRY:{\"ip\":<ip>,\"rif\":<rif_oid>,\"switch_id\":<switch_oid>}",
+        "fields": ["SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS"]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_NEIGHBOR_ENTRY*' | grep '<ip>'"
+    },
+    {
+      "step": 4,
+      "actor": "orchagent (NeighOrch)",
+      "action": "Immediately after creating the SAI neighbor, NeighOrch::addNeighbor() calls NeighOrch::addNextHop() which invokes sai_next_hop_api->create_next_hop() with SAI_NEXT_HOP_TYPE_IP to create a SAI next-hop object referencing the resolved neighbor. The next-hop OID is stored in ASIC_DB and in the in-memory m_syncdNextHops map.",
+      "source_file": "sonic-swss:orchagent/neighorch.cpp",
+      "source_function": "NeighOrch::addNextHop()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_NEXT_HOP",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_NEXT_HOP:oid:<oid>",
+        "fields": [
+          "SAI_NEXT_HOP_ATTR_TYPE",
+          "SAI_NEXT_HOP_ATTR_IP",
+          "SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID"
+        ]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_NEXT_HOP*'"
+    },
+    {
+      "step": 5,
+      "actor": "orchagent (NeighOrch)",
+      "action": "After neighbor and next-hop are created, NeighOrch::addNeighbor() calls notify(SUBJECT_TYPE_NEIGH_CHANGE, ...) to inform observers. RouteOrch (which has routes pending with this unresolved next-hop left in m_toSync) re-processes those routes on the next doTask() cycle: it now finds the next-hop OID in NeighOrch::hasNextHop() and successfully calls sai_route_api->create_route_entry(), writing the pending route to ASIC_DB.",
+      "source_file": "sonic-swss:orchagent/neighorch.cpp",
+      "source_function": "NeighOrch::addNeighbor()",
+      "output": "Routes that were blocked on this next-hop are now programmed; ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY entries reference the new next-hop OID",
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | xargs -I{} redis-cli -n 1 HGET {} SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID"
+    },
+    {
+      "step": 6,
+      "actor": "syncd",
+      "action": "Receives SAI Redis notifications from ASIC_DB for the neighbor entry, next-hop, and any route updates via Syncd::processEvent() -> processSingleEvent(). For each CREATE command, dispatches to processQuadEvent(SAI_COMMON_API_CREATE, ...) which calls the vendor SAI library to program the MAC/IP binding, next-hop, and forwarding entries in the ASIC.",
+      "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+      "source_function": "Syncd::processSingleEvent()",
+      "sai_calls": [
+        "sai_neighbor_api->create_neighbor_entry()",
+        "sai_next_hop_api->create_next_hop()"
+      ],
+      "output": "Neighbor MAC binding and IP next-hop programmed in ASIC forwarding tables; traffic to the resolved IP now forwards at hardware speed",
+      "verify": "show arp | grep <ip>"
+    }
+  ],
+
+  "failure_injection_points": [
+    {
+      "between_steps": [1, 2],
+      "failure": "neighsyncd not receiving kernel neighbor events",
+      "symptom": "ip neigh show shows NUD_REACHABLE entry but redis-cli -n 0 KEYS 'NEIGH_TABLE:*' is empty for that IP",
+      "diagnosis": "Check neighsyncd: docker exec swss supervisorctl status neighsyncd; check /var/log/swss/neighsyncd.log for netlink subscription errors; verify swss container is healthy"
+    },
+    {
+      "between_steps": [2, 3],
+      "failure": "orchagent not processing NEIGH_TABLE entry",
+      "symptom": "NEIGH_TABLE entry present in APPL_DB but no ASIC_STATE:SAI_OBJECT_TYPE_NEIGHBOR_ENTRY in ASIC_DB",
+      "diagnosis": "Check orchagent: docker exec swss supervisorctl status orchagent; grep 'NeighOrch' /var/log/swss/orchagent.log; confirm the interface has a router interface (rif_id) — orchagent skips neighbors on interfaces with no RIF"
+    },
+    {
+      "between_steps": [3, 4],
+      "failure": "SAI neighbor created but next-hop creation fails",
+      "symptom": "ASIC_STATE:SAI_OBJECT_TYPE_NEIGHBOR_ENTRY exists but no corresponding SAI_OBJECT_TYPE_NEXT_HOP; routes pointing to this IP remain in APPL_DB ROUTE_TABLE uninstalled",
+      "diagnosis": "Check orchagent.log for 'Failed to create next hop'; look for SAI_STATUS_NO_MEMORY or resource exhaustion; check 'show system resources' for next-hop table utilization"
+    },
+    {
+      "between_steps": [4, 5],
+      "failure": "Route in hardware but next-hop unresolved (race or missed notification)",
+      "symptom": "show ip route shows a route present, traffic blackholed; ASIC_DB has ROUTE_ENTRY but SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID is SAI_NULL_OBJECT_ID or points to a trap/drop action",
+      "diagnosis": "This occurs when RouteOrch programs a route before NeighOrch resolves the next-hop: RouteOrch::addRoute() calls m_neighOrch->resolveNeighbor() which writes to APPL_DB NEIGH_RESOLVE_TABLE; nbrmgrd picks this up via doResolveNeighTask() and sends RTM_NEWNEIGH to kernel to trigger ARP. Check 'redis-cli -n 0 KEYS NEIGH_RESOLVE_TABLE:*'; check /var/log/swss/orchagent.log for 'resolving neighbor'; verify kernel re-issues ARP with 'ip neigh flush <ip>' and retry"
+    },
+    {
+      "between_steps": [5, 6],
+      "failure": "syncd SAI call failing for neighbor or next-hop",
+      "symptom": "ASIC_DB entries present but syncd log shows SAI_STATUS_FAILURE; traffic not forwarding despite orchagent success",
+      "diagnosis": "Check syncd: docker exec syncd supervisorctl status syncd; grep 'SAI_STATUS' /var/log/syncd.log; look for vendor-specific SAI errors; check if neighbor table (ARP/NDP cache) in ASIC is full"
+    }
+  ],
+
+  "related_paths": [
+    "route-install-bgp",
+    "route-install-static",
+    "route-withdraw",
+    "fdb-learn",
+    "vxlan-vtep-create"
+  ]
+}
