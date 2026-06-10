@@ -1,0 +1,66 @@
+{
+  "error_id": "manual-config-db-json-edit",
+  "display_name": "Manual edit of config_db.json bypassing ConfigDB",
+  "severity": "HIGH",
+  "category": "config-integrity",
+  "sonic_version": "202511",
+  "pattern": "User edited /etc/sonic/config_db.json directly with a text editor (vi, nano, vim, sed, etc.) instead of using the config CLI, sonic-cfggen, or the REST/gNMI API. The file was not reloaded via 'config reload' after editing, so the live CONFIG_DB Redis instance is out of sync with the file, OR the file was edited with JSON syntax errors that silently corrupt the next reload.",
+  "what_goes_wrong": "config_db.json is a serialization of the live Redis CONFIG_DB (DB 4). It is not the authoritative source at runtime -- Redis is. Editing the file does NOT change the live daemon behavior. If the user then runs 'config reload', sonic-cfggen parses the JSON and loads it into Redis, but any malformed entries (trailing commas, wrong value types, missing required keys) will silently fail to load specific table entries while the rest loads fine, leaving a partial and inconsistent config. Daemons such as portmgrd and intfmgrd that subscribe to CONFIG_DB via swsscommon's SubscriberStateTable will either receive no notification (if the key was not written) or receive a malformed value and enter a retry/error loop.",
+  "symptoms": [
+    "Config change has no effect after editing the file -- live Redis still has old values",
+    "After 'config reload', a specific interface, VLAN, or BGP neighbor is missing from 'show' output even though it appears to be in the file",
+    "portmgrd or intfmgrd logging repeated 'doTask' errors or 'Failed to set' messages in syslog",
+    "bgpcfgd logs 'KeyError' or 'ValueError' when processing a CONFIG_DB entry after reload",
+    "JSON parse error on 'config reload': 'json.decoder.JSONDecodeError: Expecting ...'",
+    "'config save' after the edit overwrites the hand-edited file with the live (unmodified) Redis state, discarding the intended changes",
+    "Mismatch between 'show running-config' (reflects Redis) and the contents of /etc/sonic/config_db.json"
+  ],
+  "detection_commands": [
+    {
+      "command": "stat -c '%Y %n' /etc/sonic/config_db.json && journalctl -u config-setup --since '1 hour ago' | grep -E 'save|reload|load' | tail -5",
+      "purpose": "Compare the file mtime against recent config save/reload events. If the file mtime is newer than the last 'config save' or 'config reload' entry in the journal, the file was edited outside of SONiC config management."
+    },
+    {
+      "command": "python3 -c \"import json, sys; json.load(open('/etc/sonic/config_db.json'))\" && echo 'JSON valid' || echo 'JSON INVALID - parse error above'",
+      "purpose": "Validate JSON syntax. A hand-edit is the most common source of syntax errors. This catches trailing commas, unquoted keys, and truncated files before attempting a reload."
+    },
+    {
+      "command": "sonic-cfggen -j /etc/sonic/config_db.json --print-data 2>&1 | python3 -c \"import sys,json; d=json.load(sys.stdin); print(json.dumps(d, indent=2))\" | wc -l",
+      "purpose": "Dry-run sonic-cfggen parsing of the file without touching Redis. Any table that fails to parse will be silently dropped; compare line count against a known-good baseline to detect truncated output."
+    },
+    {
+      "command": "redis-cli -n 4 HGETALL 'PORT|Ethernet0' 2>/dev/null | head -20",
+      "purpose": "Read a representative CONFIG_DB key directly from Redis (the live truth). Compare the output to the same key in config_db.json to confirm whether Redis and the file are in sync."
+    },
+    {
+      "command": "diff <(redis-cli -n 4 --csv KEYS '*' | tr ',' '\\n' | sort) <(python3 -c \"import json; d=json.load(open('/etc/sonic/config_db.json')); [print(t+'|'+k) for t,tbl in d.items() for k in (tbl.keys() if isinstance(tbl,dict) else [])]\" | sort) 2>/dev/null | head -40",
+      "purpose": "Surface keys present in Redis but absent from the file (unsaved CLI changes) or present in the file but absent from Redis (file was edited but not reloaded). Either direction indicates a file/Redis divergence."
+    },
+    {
+      "command": "python3 -c \"\nimport json\nwith open('/etc/sonic/config_db.json') as f:\n    raw = f.read()\n# Check for common hand-edit mistakes\nimport re\ntrailing_comma = re.findall(r',\\s*[}\\]]', raw)\nif trailing_comma:\n    print('WARN: possible trailing comma(s) found:', len(trailing_comma))\nsingle_quotes = re.findall(r\\\"'[^']{1,60}'\\\", raw)\nif single_quotes:\n    print('WARN: single-quoted strings found (JSON requires double quotes):', len(single_quotes))\nprint('Total bytes:', len(raw))\n\"",
+      "purpose": "Heuristic scan for the two most common hand-edit mistakes: trailing commas (invalid in JSON) and single-quoted strings (Python/YAML habit). Neither is caught by a basic json.load unless they cause a parse failure."
+    },
+    {
+      "command": "journalctl -u swss --since '30 minutes ago' | grep -E '(portmgrd|intfmgrd|vlanmgrd|bgpcfgd).*[Ee]rror|Failed to set|doTask' | tail -20",
+      "purpose": "Check for mgrd daemon errors that follow a config reload. Repeated 'doTask' failures or 'Failed to set' log lines after a reload indicate that a malformed CONFIG_DB entry was written and the daemon is failing to apply it."
+    },
+    {
+      "command": "ls -la /etc/sonic/config_db.json.bak* /etc/sonic/config_db.json.orig* 2>/dev/null",
+      "purpose": "Look for editor backup files (vim creates .bak, nano creates .orig). Their presence confirms a text editor was used on the file."
+    }
+  ],
+  "correct_procedure": "Use the SONiC config CLI for all configuration changes: 'config interface ip add', 'config vlan add', 'config bgp neighbor add', etc. These commands write directly to Redis CONFIG_DB and immediately notify subscribing daemons. After making changes via CLI, run 'config save' to persist the live Redis state back to /etc/sonic/config_db.json. If a bulk config must be loaded from a file, use 'config load /path/to/file.json' (which merges the file into Redis without a full reload) or 'config reload /path/to/file.json' (which performs a full replace). Never edit /etc/sonic/config_db.json directly.",
+  "why_it_breaks": [
+    "The live config authority at runtime is Redis DB 4, not the JSON file. Editing the file changes nothing until a reload is triggered.",
+    "sonic-cfggen parses the JSON at load time and drops malformed table entries silently. There is no error for a key with the wrong value type -- the entry is simply not written to Redis.",
+    "mgrd daemons (portmgrd, intfmgrd, vlanmgrd, bgpcfgd) subscribe to CONFIG_DB via swsscommon's SubscriberStateTable. They are only notified of changes that actually land in Redis. A file edit that is never reloaded produces no notification.",
+    "If the user runs 'config save' after the edit (without a reload), the live Redis state -- which still has the old values -- overwrites the hand-edited file, silently discarding the changes.",
+    "JSON does not allow trailing commas, single-quoted strings, or comments. All three are common when engineers hand-edit config files from other systems and can corrupt the entire reload."
+  ],
+  "prevention": "Set file permissions on /etc/sonic/config_db.json to 0640 root:root to discourage direct edits. Use 'config save && git diff /etc/sonic/config_db.json' in a pre-change workflow to ensure the file is in sync before any reload. Add a cron or script that alerts when the file mtime is newer than the last 'config save' journal entry.",
+  "related_errors": ["direct-redis-write", "wrong-reload-order"],
+  "ref_daemons": ["daemon:portmgrd", "daemon:intfmgrd", "daemon:bgpcfgd"],
+  "ref_dbs": ["db:config_db"],
+  "keywords": ["config_db.json", "edit", "manual", "json", "vi", "nano", "vim", "sed", "text editor", "hand edit", "hand-edit"],
+  "context_keywords": ["config", "file", "edit", "change", "reload", "json", "save"]
+}

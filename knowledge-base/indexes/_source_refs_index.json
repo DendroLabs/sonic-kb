@@ -1,0 +1,37 @@
+{
+  "bgpd (FRR)::bgp_process_main_one()": {
+    "source_file": "sonic-frr:bgpd/bgp_route.c",
+    "source_function": "bgp_process_main_one()",
+    "actor": "bgpd (FRR)",
+    "action": "Receives BGP UPDATE message, runs best-path selection algorithm, installs winning route into FRR RIB",
+    "code_path": "route-install-bgp"
+  },
+  "zebra (FRR)::rib_process_result()": {
+    "source_file": "sonic-frr:zebra/zebra_rib.c",
+    "source_function": "rib_process_result()",
+    "actor": "zebra (FRR)",
+    "action": "Receives route from bgpd via internal ZAPI, installs into zebra RIB, programs Linux kernel via netlink, and sends FPM message to fpmsyncd",
+    "code_path": "route-install-bgp"
+  },
+  "fpmsyncd::RouteSync::onRouteMsg()": {
+    "source_file": "sonic-swss:fpmsyncd/routesync.cpp",
+    "source_function": "RouteSync::onRouteMsg()",
+    "actor": "fpmsyncd",
+    "action": "Receives FPM netlink message from zebra via TCP socket (port 2620), parses RTM_NEWROUTE, writes route to APPL_DB ROUTE_TABLE",
+    "code_path": "route-install-bgp"
+  },
+  "orchagent (RouteOrch)::RouteOrch::addRoute()": {
+    "source_file": "sonic-swss:orchagent/routeorch.cpp",
+    "source_function": "RouteOrch::addRoute()",
+    "actor": "orchagent (RouteOrch)",
+    "action": "Notified of APPL_DB ROUTE_TABLE change via ConsumerStateTable, resolves next-hop to SAI neighbor/next-hop-group objects, calls sai_route_api->create_route_entry()",
+    "code_path": "route-install-bgp"
+  },
+  "syncd::Syncd::processSingleEvent()": {
+    "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+    "source_function": "Syncd::processSingleEvent()",
+    "actor": "syncd",
+    "action": "Receives SAI Redis notification from ASIC_DB, calls vendor SAI library sai_route_api->create_route_entry() which programs the ASIC TCAM/FIB",
+    "code_path": "route-install-bgp"
+  }
+}

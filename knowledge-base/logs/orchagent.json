@@ -1,0 +1,114 @@
+{
+  "daemon": "orchagent",
+  "log_file": "/var/log/swss/orchagent.log",
+  "container": "swss",
+  "messages": [
+    {
+      "log_id": "log:orch:sai-create-route-fail",
+      "pattern": "SAI_STATUS.*create_route_entry",
+      "meaning": "orchagent failed to program a route into the ASIC via SAI",
+      "severity": "ERROR",
+      "likely_causes": [
+        "ASIC FIB/TCAM table full -- check scale limits",
+        "SAI library bug or platform-specific constraint",
+        "syncd crashed or not running",
+        "Invalid next-hop object ID (neighbor not resolved)"
+      ],
+      "next_steps": [
+        "Check syncd status: docker exec syncd supervisorctl status syncd",
+        "Check ASIC utilization: show system-resources or crm show resources all",
+        "Review syncd log: docker exec syncd cat /var/log/syncd.log | tail -50",
+        "Check if next-hop neighbor exists: redis-cli -n 0 HGETALL 'NEIGH_TABLE:<interface>:<nexthop_ip>'"
+      ],
+      "related_code_path": "route-install-bgp",
+      "source_ref": "sonic-swss:orchagent/routeorch.cpp"
+    },
+    {
+      "log_id": "log:orch:sai-create-neighbor-fail",
+      "pattern": "SAI_STATUS.*create_neighbor_entry",
+      "meaning": "orchagent failed to program a neighbor (ARP/ND) entry into the ASIC",
+      "severity": "ERROR",
+      "likely_causes": [
+        "Neighbor table full in ASIC",
+        "Invalid interface/router interface object",
+        "syncd not responding"
+      ],
+      "next_steps": [
+        "Check neighbor table capacity: crm show resources all | grep neighbor",
+        "Verify ARP entry exists in kernel: ip neigh show <ip>",
+        "Check APPL_DB: redis-cli -n 0 HGETALL 'NEIGH_TABLE:<intf>:<ip>'"
+      ],
+      "related_code_path": "arp-resolution",
+      "source_ref": "sonic-swss:orchagent/neighorch.cpp"
+    },
+    {
+      "log_id": "log:orch:consumer-timeout",
+      "pattern": "ConsumerStateTable.*timeout|slow consumer",
+      "meaning": "orchagent is falling behind processing APPL_DB notifications",
+      "severity": "WARN",
+      "likely_causes": [
+        "CPU congestion -- too many routes being programmed simultaneously",
+        "syncd slow to respond (ASIC programming delay)",
+        "Memory pressure causing swap"
+      ],
+      "next_steps": [
+        "Check CPU: show processes cpu",
+        "Check memory: show system-memory",
+        "Check if bulk route update in progress (e.g., BGP convergence)"
+      ],
+      "related_code_path": "route-install-bgp",
+      "source_ref": "sonic-swss:orchagent/orchdaemon.cpp"
+    },
+    {
+      "log_id": "log:orch:port-oper-status",
+      "pattern": "Port.*oper.*status.*(up|down)",
+      "meaning": "Port operational status changed -- link up or down event",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "Physical link change (cable, transceiver, peer port)",
+        "Admin shutdown/no-shutdown",
+        "Auto-negotiation failure"
+      ],
+      "next_steps": [
+        "Check interface status: show interfaces status",
+        "Check transceiver: show interfaces transceiver eeprom <interface>",
+        "Check for link flapping: show logging | grep <interface>"
+      ],
+      "related_code_path": "port-config",
+      "source_ref": "sonic-swss:orchagent/portsorch.cpp"
+    },
+    {
+      "log_id": "log:orch:warm-restart",
+      "pattern": "warm.*restart|WarmStart",
+      "meaning": "orchagent warm restart state change -- reconciliation in progress or complete",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "Warm restart was initiated via config warm_restart enable",
+        "swss container restarted with warm_restart enabled"
+      ],
+      "next_steps": [
+        "Check warm restart state: show warm_restart state",
+        "Wait for reconciliation to complete before making config changes"
+      ],
+      "related_code_path": "",
+      "source_ref": "sonic-swss:orchagent/orchdaemon.cpp"
+    },
+    {
+      "log_id": "log:orch:crm-threshold",
+      "pattern": "CRM.*exceeded|CRM.*threshold",
+      "meaning": "Critical Resource Monitoring detected resource usage above threshold",
+      "severity": "WARN",
+      "likely_causes": [
+        "ASIC table approaching capacity (routes, neighbors, ACLs, next-hops)",
+        "Resource leak in orchagent"
+      ],
+      "next_steps": [
+        "Check all CRM resources: crm show resources all",
+        "Identify which resource is near capacity",
+        "Review if routes/neighbors can be reduced or TCAM profile adjusted"
+      ],
+      "related_code_path": "",
+      "source_ref": "sonic-swss:orchagent/crmorch.cpp"
+    }
+  ]
+}

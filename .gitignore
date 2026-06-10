@@ -1,0 +1,16 @@
+build/repos/
+build/artifacts/
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+*.egg-info/
+dist/
+
+# Local / personal
+.claude/
+.mcp.json
+.DS_Store
+tasks/
+continue.txt
+CLAUDE.md

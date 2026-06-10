@@ -1,0 +1,353 @@
+{
+  "subsystem_id": "bgp-container",
+  "display_name": "BGP / FRR Container",
+  "container_name": "bgp",
+  "purpose": "FRR (Free Range Routing) stack plus SONiC integration daemons. Runs the full BGP, OSPF, IS-IS, and static routing control plane. The critical boundary between FRR and SONiC: bgpcfgd (or frrcfgd) translates CONFIG_DB into FRR running config; zebra computes the RIB; fpmsyncd pumps route updates from the Linux kernel FIB into APPL_DB for orchagent to program into the ASIC.",
+  "startup_order": 4,
+  "depends_on_containers": ["database", "swss"],
+  "def_refs": [
+    "daemon:bgpd",
+    "daemon:zebra",
+    "daemon:staticd",
+    "daemon:fpmsyncd",
+    "daemon:bgpcfgd",
+    "daemon:frrcfgd",
+    "daemon:ospfd",
+    "daemon:ospf6d",
+    "daemon:isisd",
+    "daemon:bfdd",
+    "db:appl_db",
+    "db:config_db",
+    "db:state_db"
+  ],
+  "daemons": [
+    {
+      "name": "bgpd",
+      "role": "FRR BGP daemon. Manages all BGP sessions (iBGP, eBGP), processes BGP UPDATE messages, runs best-path selection, and installs selected routes into zebra's RIB. Reads FRR running config from /etc/frr/frr.conf (or VTYSH). Exports EVPN Type-2/3/5 routes for VXLAN overlays.",
+      "critical": true,
+      "config_source": "/etc/frr/frr.conf (rendered by bgpcfgd/frrcfgd from CONFIG_DB)",
+      "key_interfaces": [
+        "zebra (via Zserv/ZAPI) -- installs routes, receives interface/nexthop updates",
+        "BFD daemon (bfdd) -- BGP fast-failure detection",
+        "VTYSH -- operator CLI and bgpcfgd programmatic config injection"
+      ],
+      "log_file": "/var/log/bgp/bgpd.log"
+    },
+    {
+      "name": "zebra",
+      "role": "FRR RIB manager and kernel interface. Receives route installs from all FRR protocol daemons (bgpd, ospfd, staticd) via ZAPI, runs route redistribution and administrative-distance selection, and installs winning routes into the Linux kernel routing table via netlink. The kernel route install is what triggers fpmsyncd -> APPL_DB -> orchagent -> ASIC programming.",
+      "critical": true,
+      "key_interfaces": [
+        "Linux kernel (netlink) -- route and interface synchronization",
+        "bgpd, ospfd, ospf6d, isisd, staticd (ZAPI) -- receives route install/withdraw requests",
+        "FPM socket (TCP port 2620 or Unix socket) -- streams route updates to fpmsyncd"
+      ],
+      "notes": "zebra is the single most critical daemon in the bgp container. If zebra dies, all FRR protocol daemons lose their connection to the kernel and to fpmsyncd, halting all route programming.",
+      "log_file": "/var/log/bgp/zebra.log"
+    },
+    {
+      "name": "staticd",
+      "role": "FRR static route daemon. Manages static routes defined in FRR config (/etc/frr/frr.conf). Installs static routes into zebra via ZAPI. Handles BFD-tracked static routes (withdraws route when BFD session goes down).",
+      "critical": false,
+      "config_source": "/etc/frr/frr.conf (ip route / ipv6 route stanzas)",
+      "log_file": "/var/log/bgp/staticd.log"
+    },
+    {
+      "name": "fpmsyncd",
+      "role": "SONiC-FRR integration daemon. Connects to zebra's FPM (Forwarding Plane Manager) socket and listens for netlink-encoded route add/delete messages. Translates these into APPL_DB ROUTE_TABLE writes that orchagent's RouteOrch consumes to program the ASIC FIB. This is the critical handoff between the FRR routing domain and the SONiC hardware programming domain.",
+      "critical": true,
+      "db_interactions": {
+        "reads": ["zebra FPM socket (TCP 2620 or Unix /var/run/frr/zfpm.sock) -- netlink RTM_NEWROUTE/RTM_DELROUTE messages"],
+        "writes": ["APPL_DB: ROUTE_TABLE (prefix -> nexthop, ifname, protocol)", "APPL_DB: LABEL_ROUTE_TABLE (MPLS)"]
+      },
+      "common_failure_modes": [
+        "FPM socket not connected (zebra not ready, or fpmsyncd started before zebra)",
+        "fpmsyncd crashed silently -- routes stop updating in APPL_DB while FRR table grows",
+        "APPL_DB connection failure -- RedisException in log, writes silently dropped",
+        "Desync: fpmsyncd misses a route delete, stale entry persists in APPL_DB and ASIC"
+      ],
+      "log_file": "/var/log/bgp/fpmsyncd.log"
+    },
+    {
+      "name": "bgpcfgd",
+      "role": "SONiC BGP config manager. Watches CONFIG_DB BGP_NEIGHBOR_TABLE, BGP_PEER_GROUP_TABLE, BGP_GLOBALS_TABLE, DEVICE_METADATA, and related tables. Renders Jinja2 templates from /usr/share/sonic/templates/ into FRR BGP configuration fragments and applies them via VTYSH (vtysh -c). This is how 'config bgp' CLI changes reach the FRR bgpd without requiring a full frr.conf rewrite.",
+      "critical": true,
+      "db_interactions": {
+        "reads": [
+          "CONFIG_DB: BGP_NEIGHBOR_TABLE, BGP_PEER_GROUP_TABLE, BGP_GLOBALS_TABLE",
+          "CONFIG_DB: DEVICE_METADATA (bgp_asn, router_id)",
+          "CONFIG_DB: BGP_COMMUNITY_TABLE, BGP_ROUTE_MAP_TABLE, PREFIX_SET_TABLE"
+        ],
+        "writes": [
+          "FRR running config via VTYSH",
+          "STATE_DB: BGP_NEIGHBOR_TABLE (operational state)"
+        ]
+      },
+      "template_directory": "/usr/share/sonic/templates/bgpcfgd/",
+      "notes": "bgpcfgd is the canonical config path for SONiC BGP. Editing /etc/frr/frr.conf directly is not persistent -- bgpcfgd will overwrite on restart or config change. Always use 'config bgp ...' or APPL_DB writes.",
+      "log_file": "/var/log/bgp/bgpcfgd.log"
+    },
+    {
+      "name": "frrcfgd",
+      "role": "Alternative/extended FRR config manager present on some SONiC builds (replaces or supplements bgpcfgd). Handles broader FRR protocol configuration beyond BGP -- OSPF, IS-IS, PIM, BFD config from CONFIG_DB. Same pattern: watches CONFIG_DB, renders Jinja2 templates, applies via VTYSH.",
+      "critical": false,
+      "notes": "Not present on all SONiC distributions. On platforms with both bgpcfgd and frrcfgd, bgpcfgd handles BGP-specific tables and frrcfgd handles everything else.",
+      "log_file": "/var/log/bgp/frrcfgd.log"
+    },
+    {
+      "name": "ospfd",
+      "role": "FRR OSPFv2 daemon. Manages OSPF neighbor adjacency, LSA flooding, SPF computation for IPv4. Installs computed routes into zebra via ZAPI. Present if OSPF is configured; process may not run if OSPF is unconfigured.",
+      "critical": false,
+      "log_file": "/var/log/bgp/ospfd.log"
+    },
+    {
+      "name": "ospf6d",
+      "role": "FRR OSPFv3 daemon. Same as ospfd but for IPv6. Handles OSPFv3 neighbor adjacency and SPF for IPv6 prefixes.",
+      "critical": false,
+      "log_file": "/var/log/bgp/ospf6d.log"
+    },
+    {
+      "name": "isisd",
+      "role": "FRR IS-IS daemon. Manages IS-IS neighbor adjacency, LSP flooding, and SPF for both IPv4 and IPv6 (MT-ISIS). Used in SP/DC deployments where IS-IS is the IGP underlay.",
+      "critical": false,
+      "log_file": "/var/log/bgp/isisd.log"
+    },
+    {
+      "name": "bfdd",
+      "role": "FRR BFD daemon. Manages BFD sessions for fast failure detection. Integrated with bgpd (BGP fast-reroute), staticd (BFD-tracked statics), ospfd, and isisd. On some platforms, hardware-offloaded BFD is handled separately via syncd/SAI; bfdd handles software BFD.",
+      "critical": false,
+      "log_file": "/var/log/bgp/bfdd.log"
+    }
+  ],
+  "key_data_flows": [
+    {
+      "flow": "BGP route -> ASIC (the full path)",
+      "path": "BGP peer sends UPDATE -> bgpd best-path selection -> zebra ZAPI route install -> Linux kernel routing table (ip route) -> fpmsyncd (FPM socket, netlink message) -> APPL_DB:ROUTE_TABLE -> orchagent:RouteOrch -> ASIC_DB -> syncd -> SAI -> ASIC FIB",
+      "notes": "Break this chain at each stage to isolate. 'show bgp ipv4 unicast' shows bgpd view; 'show ip route' shows zebra/kernel view; redis-cli -n 0 ROUTE_TABLE shows APPL_DB; ASIC_DB shows SAI state."
+    },
+    {
+      "flow": "Config change -> FRR BGP running config",
+      "path": "Operator: 'config bgp ...' or APPL_DB write -> CONFIG_DB:BGP_NEIGHBOR_TABLE (or related) -> bgpcfgd watches CONFIG_DB -> renders Jinja2 template -> 'vtysh -c \"neighbor x.x.x.x remote-as Y\"' -> bgpd running config updated",
+      "notes": "bgpcfgd is stateful -- it tracks what it has applied and only diffs changes. If bgpcfgd crashes, CONFIG_DB changes will not reach FRR until bgpcfgd restarts."
+    },
+    {
+      "flow": "BGP neighbor state -> STATE_DB",
+      "path": "bgpd session state change -> bgpcfgd subscribes to FRR notification -> writes to STATE_DB:BGP_NEIGHBOR_TABLE -> 'show bgp summary' reads STATE_DB for SONiC CLI display",
+      "notes": "STATE_DB BGP neighbor entries are informational. The authoritative state is always in FRR. If STATE_DB shows stale state, restart bgpcfgd."
+    },
+    {
+      "flow": "EVPN Type-2/3/5 route -> VXLAN ASIC programming",
+      "path": "bgpd receives EVPN UPDATE -> installs EVPN route into zebra RIB -> fpmsyncd writes to APPL_DB ROUTE_TABLE (or VXLAN_FDB_TABLE for Type-2) -> orchagent VxlanOrch/RouteOrch -> ASIC_DB -> syncd -> SAI tunnel/FDB/route objects",
+      "notes": "EVPN Type-2 (MAC/IP) goes to VXLAN_FDB_TABLE. Type-3 (IMET/BUM) configures multicast or head-end replication. Type-5 (IP prefix) goes to ROUTE_TABLE."
+    }
+  ],
+  "config_files": {
+    "frr_conf": "/etc/frr/frr.conf",
+    "frr_daemons": "/etc/frr/daemons (controls which FRR daemons start)",
+    "frr_vtysh_conf": "/etc/frr/vtysh.conf",
+    "template_dir": "/usr/share/sonic/templates/bgpcfgd/",
+    "notes": "Do NOT edit /etc/frr/frr.conf manually for persistent config on SONiC. bgpcfgd owns frr.conf and will overwrite manual changes. Use 'config bgp' CLI or CONFIG_DB writes. For troubleshooting, 'vtysh' interactive session works and is safe (changes are runtime only unless bgpcfgd writes them back)."
+  },
+  "restart_impact": "All BGP sessions are torn down and re-established. TCP sessions to BGP peers are reset (RST sent). Route convergence time depends on BGP hold-timer expiry on peers unless Graceful Restart (GR) is configured. With BGP GR, peers preserve forwarding state for the duration of the restart timer. fpmsyncd reconnects to zebra's FPM socket and re-syncs the full RIB to APPL_DB on reconnect.",
+  "restart_commands": {
+    "full_restart": "sudo systemctl restart bgp",
+    "single_daemon": "docker exec bgp supervisorctl restart <daemon_name>",
+    "check_status": "docker exec bgp supervisorctl status",
+    "bgpd_only": "docker exec bgp supervisorctl restart bgpd",
+    "fpmsyncd_only": "docker exec bgp supervisorctl restart fpmsyncd",
+    "frr_reload": "docker exec bgp vtysh -c 'write memory' && docker exec bgp supervisorctl restart bgpd",
+    "bgpcfgd_only": "docker exec bgp supervisorctl restart bgpcfgd"
+  },
+  "health_check_commands": [
+    "sudo systemctl status bgp",
+    "docker exec bgp supervisorctl status",
+    "docker exec bgp vtysh -c 'show bgp summary'",
+    "docker exec bgp vtysh -c 'show ip route summary'",
+    "show bgp summary (SONiC CLI -- reads STATE_DB)",
+    "show ip bgp summary (alternative SONiC CLI)"
+  ],
+  "state_verification_commands": [
+    "docker exec bgp vtysh -c 'show bgp ipv4 unicast summary' -- BGP peer states",
+    "docker exec bgp vtysh -c 'show ip route' -- FRR/zebra RIB",
+    "docker exec bgp vtysh -c 'show bgp ipv4 unicast' -- BGP RIB (pre-best-path)",
+    "docker exec bgp vtysh -c 'show interface' -- FRR interface states",
+    "redis-cli -n 0 keys 'ROUTE_TABLE*' | wc -l -- APPL_DB route count",
+    "ip route show table main | wc -l -- Linux kernel route count",
+    "docker exec bgp vtysh -c 'show bfd peers' -- BFD session states",
+    "docker exec bgp vtysh -c 'show evpn vni' -- EVPN VNI state (if VXLAN)"
+  ],
+  "log_locations": {
+    "bgpd": "/var/log/bgp/bgpd.log",
+    "zebra": "/var/log/bgp/zebra.log",
+    "fpmsyncd": "/var/log/bgp/fpmsyncd.log",
+    "bgpcfgd": "/var/log/bgp/bgpcfgd.log",
+    "frrcfgd": "/var/log/bgp/frrcfgd.log",
+    "staticd": "/var/log/bgp/staticd.log",
+    "ospfd": "/var/log/bgp/ospfd.log",
+    "bfdd": "/var/log/bgp/bfdd.log",
+    "syslog": "/var/log/syslog (tagged bgp#<daemon>)",
+    "frr_log_dir": "/var/log/frr/ (on some distributions, FRR logs here instead)",
+    "crash_dumps": "/var/core/ (bgpd.*.core, zebra.*.core)"
+  },
+  "common_issues": [
+    {
+      "issue": "fpmsyncd not writing routes to APPL_DB",
+      "id": "fpmsyncd-not-writing-routes",
+      "symptoms": [
+        "FRR 'show ip route' shows routes, Linux 'ip route' shows routes",
+        "redis-cli -n 0 keys 'ROUTE_TABLE*' count does not match Linux route count",
+        "Routes present in kernel but absent from ASIC hardware",
+        "fpmsyncd log silent or shows 'FPM connection failed' / 'Retrying'"
+      ],
+      "causes": [
+        "FPM socket connection between zebra and fpmsyncd broken (zebra not listening, or socket file missing)",
+        "fpmsyncd process crashed but supervisorctl shows it running (zombie state)",
+        "fpmsyncd unable to reach APPL_DB -- Redis connection error, database container issue",
+        "fpmsyncd started before zebra was ready and failed to connect; did not retry successfully",
+        "zebra FPM plugin not loaded (/etc/frr/daemons missing 'fpm' option)"
+      ],
+      "diagnosis": [
+        "docker exec bgp supervisorctl status fpmsyncd -- confirm process state",
+        "docker exec bgp tail -30 /var/log/bgp/fpmsyncd.log -- look for 'Connection refused', 'FPM socket', 'RedisException'",
+        "docker exec bgp ss -tnp | grep 2620 -- check if zebra FPM socket is listening",
+        "docker exec bgp vtysh -c 'show zebra fpm stats' -- check FPM message counters (if supported)",
+        "redis-cli -n 0 PING -- verify APPL_DB is reachable from bgp container",
+        "diff <(docker exec bgp vtysh -c 'show ip route' | grep '^[KCSOBi]' | wc -l) <(redis-cli -n 0 keys 'ROUTE_TABLE*' | wc -l)"
+      ],
+      "resolution": [
+        "docker exec bgp supervisorctl restart fpmsyncd -- most common fix, forces FPM socket reconnect",
+        "If zebra FPM socket not up: docker exec bgp supervisorctl restart zebra (then fpmsyncd will reconnect)",
+        "If APPL_DB unreachable: check database container health (sudo systemctl status database)",
+        "After fix: verify APPL_DB route count increases and matches kernel route count"
+      ]
+    },
+    {
+      "issue": "bgpcfgd template rendering error -- config not applied to FRR",
+      "symptoms": [
+        "'config bgp neighbor add ...' runs without error but neighbor does not appear in 'show bgp summary'",
+        "CONFIG_DB has neighbor entry but FRR running config does not",
+        "bgpcfgd log shows 'TemplateError', 'jinja2.exceptions', or 'vtysh returned non-zero'",
+        "BGP config changes require a full container restart to take effect"
+      ],
+      "causes": [
+        "Jinja2 template syntax error in /usr/share/sonic/templates/bgpcfgd/ after image upgrade",
+        "vtysh not responding or locked (another process holding VTYSH mutex)",
+        "CONFIG_DB entry has unexpected null or missing field that template does not handle",
+        "bgpcfgd state desync: it believes config was applied but vtysh call failed silently"
+      ],
+      "diagnosis": [
+        "docker exec bgp tail -50 /var/log/bgp/bgpcfgd.log -- look for template errors or vtysh failures",
+        "docker exec bgp vtysh -c 'show run' | grep neighbor -- compare FRR running config against CONFIG_DB",
+        "redis-cli -n 4 hgetall 'BGP_NEIGHBOR_TABLE|<neighbor_ip>' -- inspect raw CONFIG_DB entry for missing fields",
+        "docker exec bgp python3 -c \"import jinja2; jinja2.Environment().parse(open('/usr/share/sonic/templates/bgpcfgd/bgpd.j2').read())\" -- syntax check template"
+      ],
+      "resolution": [
+        "docker exec bgp supervisorctl restart bgpcfgd -- forces full config re-render and re-apply",
+        "If template error: check if image upgrade changed template; may need manual vtysh config as workaround",
+        "If vtysh locked: identify process holding lock with 'docker exec bgp fuser /var/run/frr/frr.lock', kill it",
+        "Verify fix: docker exec bgp vtysh -c 'show run' and confirm neighbor config is present"
+      ]
+    },
+    {
+      "issue": "BGP sessions established but routes not installed in hardware",
+      "symptoms": [
+        "show bgp summary shows peers in Established state",
+        "show bgp ipv4 unicast shows received prefixes with valid best-path",
+        "show ip route shows BGP routes in FRR RIB",
+        "Traffic still not forwarding; ASIC route table unchanged"
+      ],
+      "causes": [
+        "fpmsyncd desync (see fpmsyncd-not-writing-routes above)",
+        "orchagent RouteOrch not processing APPL_DB entries (swss issue, not bgp)",
+        "Route policy filtering routes before FIB install (route-map with 'deny' or 'set metric' causing rejection in zebra)",
+        "BGP maximum-prefix limit hit -- routes accepted to bgpd but not installed to zebra",
+        "ECMP next-hop group limit exceeded in orchagent"
+      ],
+      "diagnosis": [
+        "Work through the data flow: BGP RIB -> zebra RIB -> kernel -> APPL_DB -> ASIC_DB",
+        "docker exec bgp vtysh -c 'show bgp ipv4 unicast <prefix>' -- confirm route is best-path and has valid NH",
+        "docker exec bgp vtysh -c 'show ip route <prefix>' -- confirm zebra installed it",
+        "ip route show <prefix> -- confirm in kernel",
+        "redis-cli -n 0 hgetall 'ROUTE_TABLE:<prefix>' -- confirm in APPL_DB",
+        "If APPL_DB missing: fpmsyncd issue. If APPL_DB present but not in ASIC: swss/orchagent issue."
+      ],
+      "resolution": [
+        "For fpmsyncd: docker exec bgp supervisorctl restart fpmsyncd",
+        "For orchagent: check /var/log/swss/orchagent.log for errors on that prefix",
+        "For route policy: docker exec bgp vtysh -c 'show bgp ipv4 unicast <prefix>' and check 'bestpath' flags and route-map applied"
+      ]
+    },
+    {
+      "issue": "FRR daemon crash (bgpd or zebra)",
+      "symptoms": [
+        "BGP sessions drop for all peers simultaneously",
+        "supervisorctl shows bgpd or zebra in FATAL state",
+        "Core file in /var/core/bgpd.*.core or /var/core/zebra.*.core",
+        "If zebra crashes: all FRR daemons lose kernel connectivity, full route reprogram on restart"
+      ],
+      "causes": [
+        "Memory corruption or heap overflow in FRR (common with very large BGP tables)",
+        "Signal handler bug triggered by specific BGP UPDATE message (malformed AS_PATH, community)",
+        "OOM kill under memory pressure",
+        "FRR version bug -- check FRR release notes for known crash conditions"
+      ],
+      "diagnosis": [
+        "docker exec bgp supervisorctl status -- identify which daemon crashed",
+        "docker exec bgp tail -50 /var/log/bgp/bgpd.log -- look for 'signal 11', 'assert', 'SIGSEGV'",
+        "ls -lt /var/core/*.core -- check for core files",
+        "dmesg | grep -i 'oom\\|killed\\|bgpd\\|zebra'",
+        "docker exec bgp vtysh -c 'show version' -- identify FRR version for bug cross-reference"
+      ],
+      "resolution": [
+        "Immediate: docker exec bgp supervisorctl start bgpd (or zebra) to restart crashed daemon",
+        "If OOM: check 'docker stats bgp' for container memory limit; may need to increase container memory or reduce BGP table size",
+        "If reproducible crash: capture core file before restarting, engage FRR upstream or vendor support",
+        "Workaround for BGP UPDATE crash: identify peer sending malformed UPDATE via tcpdump on bgp container; apply inbound route filter"
+      ]
+    },
+    {
+      "issue": "BGP neighbor stuck in Active or Connect state",
+      "symptoms": [
+        "show bgp summary shows neighbor in 'Active' or 'Connect' state for extended period",
+        "TCP connection attempts to peer visible in packet capture",
+        "No OPEN message exchange"
+      ],
+      "causes": [
+        "Routing not available to reach peer IP (underlay issue, not BGP)",
+        "ACL or CoPP blocking TCP port 179 to/from peer",
+        "Peer router has incorrect neighbor config (wrong local-AS, wrong peer IP)",
+        "Interface not up (physical or L3 config issue -- see swss-container)",
+        "BGP timer mismatch or MD5 auth password mismatch"
+      ],
+      "diagnosis": [
+        "ping <peer_ip> from SONiC device -- verify basic reachability",
+        "docker exec bgp vtysh -c 'show bgp neighbor <peer_ip>' -- check error notifications and TCP state",
+        "sudo tcpdump -i any tcp port 179 and host <peer_ip> -nn -c 20 -- verify TCP handshake",
+        "show ip bgp neighbors <peer_ip> | grep 'BGP state\\|Hold time\\|Local host' -- check session details",
+        "redis-cli -n 4 hgetall 'BGP_NEIGHBOR_TABLE|<peer_ip>' -- verify CONFIG_DB has correct config"
+      ],
+      "resolution": [
+        "For reachability: fix underlay routing (check 'show ip route <peer_ip>')",
+        "For CoPP: verify BGP trap group rate not exceeded ('show queue counters interface CPU' on some platforms)",
+        "For config mismatch: 'config bgp neighbor <ip> remote-as <asn>' and verify bgpcfgd applied it"
+      ]
+    }
+  ],
+  "graceful_restart": {
+    "bgp_gr": {
+      "description": "BGP Graceful Restart (RFC 4724). When bgp container restarts, peers preserve forwarding state for duration of restart timer (default 120s). bgpd announces GR capability in OPEN message.",
+      "enable_command": "router bgp <asn> -> bgp graceful-restart (via vtysh or bgpcfgd CONFIG_DB)",
+      "verify_command": "docker exec bgp vtysh -c 'show bgp neighbors <peer> | grep -i graceful'"
+    },
+    "sonic_warm_restart": {
+      "description": "SONiC warm restart for bgp container. Coordinates with swss warm restart to preserve ASIC state during bgp container restart.",
+      "enable_command": "config warm_restart enable bgp",
+      "verify_command": "show warm_restart config"
+    }
+  },
+  "related_subsystems": [
+    "database-container",
+    "swss-container",
+    "syncd-container"
+  ]
+}

@@ -1,0 +1,84 @@
+{
+  "practices": [
+    {
+      "topic": "config-management",
+      "title": "Always use the SONiC config CLI or API for configuration changes",
+      "content": "Never edit /etc/sonic/config_db.json directly while SONiC is running. Use 'config' CLI commands for individual changes, 'config load' for bulk changes from a validated file, or 'config replace' (202205+) for full config replacement. For automation, use gNMI or REST API. After making changes, run 'config save' to persist to disk.",
+      "category": "configuration",
+      "source": "SONiC architecture documentation",
+      "tags": ["config", "config_db", "best-practice", "safety"]
+    },
+    {
+      "topic": "config-management",
+      "title": "Always backup config before changes",
+      "content": "Before any config change: 'sudo sonic-cfggen -d --print-data > /tmp/config_backup_$(date +%Y%m%d_%H%M%S).json'. This captures the running CONFIG_DB state. For full system backup, also save FRR config: 'docker exec bgp vtysh -c \"show running-config\" > /tmp/frr_backup.txt'.",
+      "category": "configuration",
+      "source": "SONiC operations best practices",
+      "tags": ["config", "backup", "safety"]
+    },
+    {
+      "topic": "config-management",
+      "title": "Understand config save vs config reload",
+      "content": "'config save' writes running CONFIG_DB (Redis) to /etc/sonic/config_db.json. 'config reload' reads config_db.json from disk and loads it into Redis, restarting affected services. Order matters: if you made changes and want to keep them across reboot, 'config save'. If you want to revert to saved config, 'config reload'. If you do 'config reload' without 'config save' first, unsaved changes are lost.",
+      "category": "configuration",
+      "source": "SONiC operations documentation",
+      "tags": ["config", "save", "reload", "persistence"]
+    },
+    {
+      "topic": "frr-management",
+      "title": "Never configure FRR directly via vtysh in production",
+      "content": "SONiC manages FRR through bgpcfgd (or frrcfgd), which translates CONFIG_DB entries into FRR commands via vtysh. If you configure FRR directly via 'docker exec bgp vtysh', those changes will be overwritten on bgpcfgd restart, config reload, or system reboot. For debugging, vtysh 'show' commands are safe. For config changes, always use SONiC 'config' CLI.",
+      "category": "routing",
+      "source": "SONiC bgpcfgd architecture",
+      "tags": ["frr", "vtysh", "bgp", "bgpcfgd", "routing"]
+    },
+    {
+      "topic": "container-restart",
+      "title": "Understand the impact of container restarts",
+      "content": "Container restart impact hierarchy (most to least disruptive): syncd (full ASIC reprogram, traffic loss) > swss (ASIC_DB reprogramming, brief traffic disruption) > bgp (routing reconvergence, possible traffic shift) > teamd (LAG flap) > lldp/snmp (control plane only, no traffic impact). Always prefer warm_restart when available.",
+      "category": "operations",
+      "source": "SONiC operations documentation",
+      "tags": ["restart", "container", "impact", "warm-restart"]
+    },
+    {
+      "topic": "monitoring",
+      "title": "Key health check commands for daily operations",
+      "content": "Essential monitoring commands: 'show system-health summary' (overall health), 'show interfaces status' (link state), 'show ip bgp summary' (BGP peers), 'show processes cpu' (CPU usage), 'show system-memory' (memory), 'show logging -f' (live syslog). For hardware: 'show platform psustatus', 'show platform temperature', 'show interfaces transceiver eeprom'.",
+      "category": "monitoring",
+      "source": "SONiC CLI reference",
+      "tags": ["monitoring", "health", "show-commands"]
+    },
+    {
+      "topic": "upgrade",
+      "title": "SONiC upgrade checklist",
+      "content": "Pre-upgrade: (1) Backup config: sonic-cfggen -d --print-data > backup.json, (2) Check release notes for breaking changes, (3) Verify disk space: df -h /host, (4) Check current image: sonic-installer list, (5) Plan maintenance window. Upgrade: sonic-installer install <image_url>. Post-upgrade: verify config loaded correctly, check BGP/OSPF reconverged, verify interfaces up, check show system-health.",
+      "category": "operations",
+      "source": "SONiC upgrade documentation",
+      "tags": ["upgrade", "sonic-installer", "maintenance"]
+    },
+    {
+      "topic": "debugging",
+      "title": "Where to find logs for each subsystem",
+      "content": "orchagent: /var/log/swss/orchagent.log. syncd: /var/log/syncd.log. bgpcfgd: journalctl -u bgp. FRR: /var/log/frr/frr.log. fpmsyncd: /var/log/swss/fpmsyncd.log. System: /var/log/syslog. Container supervisor: 'docker exec <container> supervisorctl status'. For real-time: 'show logging -f | grep <keyword>'.",
+      "category": "debugging",
+      "source": "SONiC troubleshooting guide",
+      "tags": ["logs", "debugging", "syslog", "troubleshooting"]
+    },
+    {
+      "topic": "redis-debugging",
+      "title": "Safe Redis debugging commands",
+      "content": "READ-ONLY Redis commands are safe for debugging: 'redis-cli -n 4 KEYS \"BGP_NEIGHBOR|*\"' (list CONFIG_DB BGP entries), 'redis-cli -n 0 HGETALL \"ROUTE_TABLE|10.0.0.0/24\"' (check APPL_DB route), 'redis-cli -n 1 KEYS \"ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*\"' (check ASIC_DB). NEVER use SET/HSET/DEL commands on Redis directly in production.",
+      "category": "debugging",
+      "source": "SONiC Redis architecture",
+      "tags": ["redis", "debugging", "config_db", "appl_db", "asic_db"]
+    },
+    {
+      "topic": "warm-restart",
+      "title": "Use warm restart to minimize traffic disruption",
+      "content": "SONiC warm restart preserves forwarding state in the ASIC while restarting control plane containers. Enable: 'config warm_restart enable <module>'. Modules: system, swss, bgp, teamd. Check status: 'show warm_restart state'. Caveats: not all platforms support warm restart, and it requires sufficient memory for state preservation. Test in lab before production use.",
+      "category": "operations",
+      "source": "SONiC warm restart HLD",
+      "tags": ["warm-restart", "hitless", "upgrade", "operations"]
+    }
+  ]
+}

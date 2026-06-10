@@ -1,0 +1,336 @@
+{
+  "subsystem_id": "swss-container",
+  "display_name": "Switch State Service (swss)",
+  "container_name": "swss",
+  "purpose": "Central orchestration container. Translates application-level config (APPL_DB) into ASIC-level SAI operations (ASIC_DB). Contains orchagent and all *mgrd/*syncd daemons. Acts as the coordination hub between the control plane (FRR, config management) and the forwarding plane (syncd/SAI/ASIC).",
+  "startup_order": 3,
+  "depends_on_containers": ["database", "syncd"],
+  "def_refs": [
+    "daemon:orchagent",
+    "daemon:portmgrd",
+    "daemon:intfmgrd",
+    "daemon:vlanmgrd",
+    "daemon:neighsyncd",
+    "daemon:portsyncd",
+    "daemon:nbrmgrd",
+    "daemon:routesyncd",
+    "daemon:tunnelmgrd",
+    "daemon:buffermgrd",
+    "daemon:coppmgrd",
+    "daemon:sflowmgrd",
+    "daemon:natmgrd",
+    "daemon:macsecmgrd",
+    "db:appl_db",
+    "db:asic_db",
+    "db:config_db",
+    "db:state_db"
+  ],
+  "daemons": [
+    {
+      "name": "orchagent",
+      "role": "Central state machine and orchestration engine. Subscribes to APPL_DB tables (ROUTE_TABLE, NEIGH_TABLE, VLAN_TABLE, ACL_TABLE, etc.), translates entries into SAI API calls, and writes resulting SAI object IDs into ASIC_DB. Manages a comprehensive set of Orch objects (RouteOrch, NeighOrch, PortOrch, AclOrch, etc.) each responsible for a sub-domain.",
+      "critical": true,
+      "db_interactions": {
+        "reads": ["APPL_DB: ROUTE_TABLE, NEIGH_TABLE, VLAN_TABLE, VLAN_MEMBER_TABLE, PORT_TABLE, LAG_TABLE, ACL_TABLE, MIRROR_SESSION_TABLE, TUNNEL_TABLE, BUFFER_PROFILE_TABLE"],
+        "writes": ["ASIC_DB: ASIC_STATE:*, RIDTABLE", "STATE_DB: PORT_TABLE, VLAN_TABLE, NEIGH_TABLE"]
+      }
+    },
+    {
+      "name": "portmgrd",
+      "role": "Watches CONFIG_DB PORT_TABLE for admin-state, MTU, speed, FEC changes. Applies them via Linux netlink (ip link set) and writes results to APPL_DB PORT_TABLE for orchagent to program into SAI.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: PORT_TABLE"],
+        "writes": ["APPL_DB: PORT_TABLE", "STATE_DB: PORT_TABLE"]
+      }
+    },
+    {
+      "name": "intfmgrd",
+      "role": "Manages L3 interface lifecycle. Watches CONFIG_DB INTF_TABLE for IP address assignments. Creates/deletes Linux kernel interfaces, programs IP addresses, writes to APPL_DB INTF_TABLE for orchagent.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: INTF_TABLE, VLAN_INTF_TABLE, PORTCHANNEL_INTF_TABLE, LOOPBACK_INTF_TABLE"],
+        "writes": ["APPL_DB: INTF_TABLE", "STATE_DB: INTERFACE_TABLE"]
+      }
+    },
+    {
+      "name": "vlanmgrd",
+      "role": "Manages VLAN and VLAN membership lifecycle. Watches CONFIG_DB VLAN_TABLE and VLAN_MEMBER_TABLE. Creates Linux bridge devices for VLANs, enslaves member ports, and writes to APPL_DB for orchagent to create SAI VLAN/VLAN_MEMBER objects.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: VLAN_TABLE, VLAN_MEMBER_TABLE"],
+        "writes": ["APPL_DB: VLAN_TABLE, VLAN_MEMBER_TABLE", "STATE_DB: VLAN_TABLE, VLAN_MEMBER_TABLE"]
+      }
+    },
+    {
+      "name": "neighsyncd",
+      "role": "Listens to Linux kernel netlink events for ARP/NDP neighbor state changes (RTM_NEWNEIGH, RTM_DELNEIGH). Writes neighbor entries into APPL_DB NEIGH_TABLE for orchagent to program into hardware via NeighOrch. Critical for L3 forwarding adjacency.",
+      "critical": true,
+      "db_interactions": {
+        "reads": ["Linux kernel netlink socket (AF_NETLINK)"],
+        "writes": ["APPL_DB: NEIGH_TABLE"]
+      }
+    },
+    {
+      "name": "portsyncd",
+      "role": "Monitors Linux kernel netlink for port link-state changes (RTM_NEWLINK). Translates kernel link-up/link-down events into APPL_DB PORT_TABLE oper_status updates that orchagent uses to track hardware port state.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["Linux kernel netlink socket"],
+        "writes": ["APPL_DB: PORT_TABLE (oper_status)", "STATE_DB: PORT_TABLE"]
+      }
+    },
+    {
+      "name": "nbrmgrd",
+      "role": "Neighbor manager. Handles static neighbor (ARP/NDP) entries from CONFIG_DB STATIC_NEIGHBOR_TABLE. Installs them into the Linux kernel via ip neigh replace, from where neighsyncd picks them up for APPL_DB.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: STATIC_NEIGHBOR_TABLE"],
+        "writes": ["Linux kernel ARP/NDP cache"]
+      }
+    },
+    {
+      "name": "routesyncd",
+      "role": "Listens to Linux kernel netlink for route table changes (RTM_NEWROUTE, RTM_DELROUTE) in the main routing table. Writes route entries into APPL_DB ROUTE_TABLE for orchagent/RouteOrch to program into the ASIC FIB. Primary path for FRR (zebra) routes reaching hardware.",
+      "critical": true,
+      "db_interactions": {
+        "reads": ["Linux kernel netlink socket (RTMGRP_IPV4_ROUTE, RTMGRP_IPV6_ROUTE)"],
+        "writes": ["APPL_DB: ROUTE_TABLE, LABEL_ROUTE_TABLE"]
+      }
+    },
+    {
+      "name": "tunnelmgrd",
+      "role": "Manages VXLAN and IP tunnel lifecycle. Watches CONFIG_DB VXLAN_TUNNEL_TABLE, VXLAN_EVPN_NVO_TABLE. Creates Linux VXLAN netdevices, writes tunnel state to APPL_DB for orchagent VxlanOrch.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: VXLAN_TUNNEL_TABLE, VXLAN_EVPN_NVO_TABLE, VXLAN_TUNNEL_MAP"],
+        "writes": ["APPL_DB: VXLAN_TUNNEL_TABLE", "STATE_DB: VXLAN_TUNNEL_TABLE"]
+      }
+    },
+    {
+      "name": "buffermgrd",
+      "role": "Manages dynamic buffer configuration. Computes per-port buffer profiles (headroom, shared buffer) based on cable length and speed. Writes buffer profiles to APPL_DB for orchagent to program into SAI buffer/queue objects.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: PORT_TABLE (cable_length, speed), BUFFER_PROFILE_TABLE, BUFFER_POOL_TABLE"],
+        "writes": ["APPL_DB: BUFFER_PROFILE_TABLE, BUFFER_PG_TABLE, BUFFER_QUEUE_TABLE"]
+      }
+    },
+    {
+      "name": "coppmgrd",
+      "role": "Control Plane Policing manager. Reads trap group and rate-limit config from CONFIG_DB, translates to APPL_DB COPP_TABLE entries that orchagent programs via SAI hostif trap groups.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: COPP_TRAP_TABLE, COPP_GROUP_TABLE"],
+        "writes": ["APPL_DB: COPP_TABLE"]
+      }
+    },
+    {
+      "name": "sflowmgrd",
+      "role": "sFlow manager. Monitors CONFIG_DB SFLOW_TABLE and SFLOW_SESSION_TABLE, programs sFlow sampling rates into APPL_DB for orchagent to configure SAI samplepacket sessions.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: SFLOW_TABLE, SFLOW_SESSION_TABLE"],
+        "writes": ["APPL_DB: SFLOW_TABLE, SFLOW_SESSION_TABLE"]
+      }
+    },
+    {
+      "name": "natmgrd",
+      "role": "NAT manager. Translates CONFIG_DB NAT_TABLE/NAPT_TABLE entries into APPL_DB for orchagent NatOrch to program SAI NAT entries. Manages NAT zone and binding lifecycle.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: NAT_TABLE, NAPT_TABLE, NAT_BINDINGS_TABLE, NAT_ZONES_TABLE"],
+        "writes": ["APPL_DB: NAT_TABLE, NAPT_TABLE"]
+      }
+    },
+    {
+      "name": "macsecmgrd",
+      "role": "MACsec manager. Handles MACsec profile and port configuration from CONFIG_DB. Interfaces with the wpa_supplicant MKA daemon and writes MACsec SA state to STATE_DB. Programs SAI MACsec objects via APPL_DB.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: MACSEC_PROFILE_TABLE, MACSEC_PORT_TABLE"],
+        "writes": ["APPL_DB: MACSEC_PORT_TABLE", "STATE_DB: MACSEC_PORT_TABLE, MACSEC_EGRESS_SA_TABLE"]
+      }
+    }
+  ],
+  "key_data_flows": [
+    {
+      "flow": "Route programming (FRR -> ASIC)",
+      "path": "FRR zebra -> Linux kernel routing table -> routesyncd (netlink) -> APPL_DB:ROUTE_TABLE -> orchagent:RouteOrch -> ASIC_DB:ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY -> syncd -> SAI -> ASIC",
+      "notes": "Any break in this chain stops route programming. Check each hop independently."
+    },
+    {
+      "flow": "Neighbor resolution (ARP -> ASIC)",
+      "path": "Kernel ARP resolution -> neighsyncd (netlink RTM_NEWNEIGH) -> APPL_DB:NEIGH_TABLE -> orchagent:NeighOrch -> ASIC_DB -> syncd -> SAI -> ASIC",
+      "notes": "If neighbors are in APPL_DB but not in hardware, suspect orchagent or syncd. If not in APPL_DB, suspect neighsyncd."
+    },
+    {
+      "flow": "VLAN programming (config -> ASIC)",
+      "path": "config_db.json / config load -> CONFIG_DB:VLAN_TABLE -> vlanmgrd -> Linux bridge -> APPL_DB:VLAN_TABLE -> orchagent:VlanOrch -> ASIC_DB -> syncd -> SAI -> ASIC",
+      "notes": "VLANs must exist in both Linux bridge and ASIC. Linux-only = no SAI programming; ASIC-only impossible via normal path."
+    },
+    {
+      "flow": "Port configuration (config -> ASIC)",
+      "path": "CONFIG_DB:PORT_TABLE -> portmgrd -> ip link set + APPL_DB:PORT_TABLE -> orchagent:PortOrch -> ASIC_DB -> syncd -> SAI -> ASIC",
+      "notes": "MTU, speed, FEC, admin-state changes flow through portmgrd. If port is up in Linux but not in ASIC, check orchagent PortOrch."
+    }
+  ],
+  "warm_restart": {
+    "supported": true,
+    "mechanism": "orchagent saves RID (Router Interface/Object ID) table to ASIC_DB:RIDTABLE before exit. On restart, it reconciles existing ASIC state with APPL_DB entries instead of reprogramming everything, minimizing traffic disruption.",
+    "enable_command": "config warm_restart enable swss",
+    "verify_command": "show warm_restart config",
+    "caveat": "Warm restart does not survive syncd restart. If syncd also restarts, full reprogramming occurs."
+  },
+  "restart_impact": "Brief traffic disruption (seconds to tens of seconds depending on table size). All APPL_DB -> ASIC_DB state is reprogrammed from scratch unless warm_restart is enabled. With warm restart, ASIC state is retained and orchagent reconciles deltas only. Routes, neighbors, VLANs, ACLs are all temporarily absent from hardware during cold restart.",
+  "restart_commands": {
+    "full_restart": "sudo systemctl restart swss",
+    "single_daemon": "docker exec swss supervisorctl restart <daemon_name>",
+    "check_status": "docker exec swss supervisorctl status",
+    "orchagent_only": "docker exec swss supervisorctl restart orchagent",
+    "warm_restart": "sudo warm-reboot (system-level) or docker exec swss supervisorctl restart swss (container warm restart if enabled)"
+  },
+  "health_check_commands": [
+    "sudo systemctl status swss",
+    "docker exec swss supervisorctl status",
+    "show system-health summary",
+    "docker exec swss ps aux",
+    "show processes memory | grep -E 'orchagent|portmgrd|vlanmgrd'"
+  ],
+  "state_verification_commands": [
+    "show ip route (Linux FIB)",
+    "show arp (Linux ARP table)",
+    "redis-cli -n 0 keys 'ROUTE_TABLE*' | wc -l (APPL_DB route count)",
+    "redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | wc -l (ASIC_DB route count)",
+    "sonic-db-cli ASIC_DB keys 'ASIC_STATE:SAI_OBJECT_TYPE_NEIGHBOR_ENTRY*' | wc -l",
+    "show interfaces status (port oper state)"
+  ],
+  "log_locations": {
+    "orchagent": "/var/log/swss/orchagent.log",
+    "portmgrd": "/var/log/swss/portmgrd.log",
+    "intfmgrd": "/var/log/swss/intfmgrd.log",
+    "vlanmgrd": "/var/log/swss/vlanmgrd.log",
+    "neighsyncd": "/var/log/swss/neighsyncd.log",
+    "portsyncd": "/var/log/swss/portsyncd.log",
+    "routesyncd": "/var/log/swss/routesyncd.log",
+    "buffermgrd": "/var/log/swss/buffermgrd.log",
+    "coppmgrd": "/var/log/swss/coppmgrd.log",
+    "other_daemons": "/var/log/swss/<daemon_name>.log",
+    "syslog": "/var/log/syslog (tagged swss#<daemon>)",
+    "crash_dumps": "/var/core/ (orchagent.*.core files)"
+  },
+  "common_issues": [
+    {
+      "issue": "orchagent crash loop",
+      "symptoms": [
+        "All routes disappear from hardware simultaneously",
+        "supervisorctl shows orchagent in FATAL state",
+        "ASIC_DB ROUTE_TABLE entries vanish",
+        "swss container repeatedly restarting (systemctl status shows frequent restart timestamps)"
+      ],
+      "causes": [
+        "SAI library assertion or segfault during SAI API call",
+        "OOM killer terminating orchagent under memory pressure",
+        "Corrupt or unexpected ASIC_DB state on startup (stale entries from prior crash)",
+        "Scale limit hit -- orchagent exceeds max SAI objects and SAI returns error that triggers assert"
+      ],
+      "diagnosis": [
+        "tail -100 /var/log/swss/orchagent.log -- look for 'SIGSEGV', 'assert', 'terminate called'",
+        "dmesg | grep -i 'oom\\|killed\\|orchagent' -- check for OOM kill",
+        "ls -lt /var/core/*.core -- check for recent core files",
+        "redis-cli -n 1 dbsize -- check ASIC_DB size for scale issues",
+        "docker exec syncd tail -50 /var/log/syncd.log -- SAI errors often surface in syncd log first"
+      ],
+      "resolution": [
+        "For SAI crash: may require vendor SAI library update",
+        "For OOM: reduce table scale or add swap, check for memory leak with 'show processes memory'",
+        "For stale ASIC_DB: 'redis-cli -n 1 FLUSHDB' then restart swss (WARNING: causes full reprogramming)",
+        "For scale: reduce FIB/MAC/ACL entries to within supported limits"
+      ]
+    },
+    {
+      "issue": "Routes in APPL_DB but missing from ASIC_DB",
+      "symptoms": [
+        "show ip route shows routes present",
+        "redis-cli -n 0 hgetall 'ROUTE_TABLE:x.x.x.x/y' returns data",
+        "redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*x.x.x.x*' returns empty",
+        "Traffic to destination blackholed"
+      ],
+      "causes": [
+        "orchagent RouteOrch backpressure -- ASIC_DB write queue full",
+        "Next-hop not yet resolved (NeighOrch waiting for ARP reply)",
+        "SAI returned error on route add (scale limit, unsupported prefix length)",
+        "orchagent stuck in retry loop on a different object type blocking route processing"
+      ],
+      "diagnosis": [
+        "grep 'ROUTE_TABLE' /var/log/swss/orchagent.log | tail -50 -- look for 'retry', 'error', 'failed'",
+        "Check next-hop: redis-cli -n 0 hgetall 'NEIGH_TABLE:Ethernet48:x.x.x.x' -- must exist before route programs",
+        "redis-cli -n 1 hgetall 'ASIC_STATE:SAI_OBJECT_TYPE_NEXT_HOP:oid:*' | grep x.x.x.x -- verify NH object exists in ASIC_DB",
+        "Check orchagent memory: show processes memory | grep orchagent"
+      ],
+      "resolution": [
+        "If NH missing: resolve ARP/NDP issue first (ping next-hop, check arp table)",
+        "If SAI error: check syncd log for SAI return code; may need vendor escalation",
+        "If backpressure: reduce route churn rate; check for route flapping in BGP"
+      ]
+    },
+    {
+      "issue": "Port stuck operationally down despite physical link up",
+      "symptoms": [
+        "Transceiver shows Rx/Tx power in range (show interfaces transceiver)",
+        "show interfaces status shows port as 'D' (down)",
+        "Physical LED shows link on some platforms",
+        "portsyncd log shows no RTM_NEWLINK event"
+      ],
+      "causes": [
+        "portmgrd failed to apply speed/FEC config -- kernel interface in wrong state",
+        "orchagent PortOrch did not complete port initialization sequence",
+        "SAI port creation failed during syncd initialization",
+        "Interface held down administratively in CONFIG_DB but config not reflected in kernel"
+      ],
+      "diagnosis": [
+        "ip link show <interface> -- check Linux kernel state vs SAI state",
+        "redis-cli -n 0 hgetall 'PORT_TABLE:<interface>' -- check APPL_DB oper_status and admin_status",
+        "redis-cli -n 4 hgetall 'PORT_TABLE|<interface>' -- check CONFIG_DB admin_status",
+        "grep '<interface>' /var/log/swss/portmgrd.log -- look for apply errors",
+        "grep 'PortOrch' /var/log/swss/orchagent.log | grep <interface>"
+      ],
+      "resolution": [
+        "config interface startup <interface> -- ensure admin up in CONFIG_DB",
+        "If speed/FEC mismatch: config interface speed <interface> <speed> && config interface fec <interface> <fec_mode>",
+        "If persistent: docker exec swss supervisorctl restart portmgrd && portsyncd"
+      ]
+    },
+    {
+      "issue": "fpmsyncd not writing routes to APPL_DB (swss side)",
+      "symptoms": [
+        "FRR 'show ip route' has routes, 'show bgp summary' established",
+        "redis-cli -n 0 keys 'ROUTE_TABLE*' count not growing",
+        "No traffic forwarding despite BGP up",
+        "fpmsyncd log shows connection errors or silent"
+      ],
+      "causes": [
+        "fpmsyncd (runs in bgp container) cannot connect to APPL_DB in database container",
+        "FPM socket between zebra and fpmsyncd broken",
+        "fpmsyncd process crashed in bgp container (check there, not swss)"
+      ],
+      "diagnosis": [
+        "This issue originates in the bgp container -- see bgp-container.json",
+        "docker exec bgp supervisorctl status fpmsyncd",
+        "docker exec bgp tail -20 /var/log/bgp/fpmsyncd.log"
+      ],
+      "resolution": "See bgp-container.json common_issues: fpmsyncd-not-writing-routes"
+    }
+  ],
+  "scale_considerations": {
+    "max_routes": "Platform-dependent. orchagent tracks route count against SAI capacity. Check 'show system resources' or vendor SAI limits.",
+    "max_neighbors": "Platform-dependent. Neighbor table exhaustion causes orchagent to drop new ARP entries.",
+    "max_acl_entries": "Per-ASIC limit. orchagent AclOrch returns error on overflow; check orchagent.log for 'ACL table entry create failed'.",
+    "memory_pressure": "orchagent holds full copies of all programmed tables in memory. On high-scale deployments, RSS can exceed 1GB. Monitor with 'show processes memory | grep orchagent'."
+  },
+  "related_subsystems": [
+    "database-container",
+    "syncd-container",
+    "bgp-container"
+  ]
+}

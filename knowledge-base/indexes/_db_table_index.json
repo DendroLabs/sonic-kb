@@ -1,0 +1,121 @@
+{
+  "CONFIG_DB:BGP_NEIGHBOR": {
+    "table": "BGP_NEIGHBOR",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "bgp-4"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "direct-redis-write",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "BGP_NEIGHBOR|<vrf>|<peer-ip>  or  BGP_NEIGHBOR|<peer-ip>",
+    "relevant_fields": [
+      "asn: remote AS number",
+      "name: human-readable neighbor name/description",
+      "local_addr: update-source IP address",
+      "nhopself: next-hop-self (true/false)",
+      "rrclient: route-reflector-client (true/false)",
+      "holdtime: proposed hold timer in seconds",
+      "keepalive: keepalive interval in seconds",
+      "admin_status: up/down (administrative shutdown)",
+      "auth_password: MD5 TCP authentication password",
+      "ebgp_multihop: eBGP multihop TTL value"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'BGP_NEIGHBOR|<ip>'",
+    "redis_command": "redis-cli -n 4 KEYS 'BGP_NEIGHBOR*'"
+  },
+  "CONFIG_DB:BGP_GLOBALS": {
+    "table": "BGP_GLOBALS",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "bgp-4"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "direct-redis-write",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "BGP_GLOBALS|default  (or VRF name)",
+    "relevant_fields": [
+      "local_asn: local AS number",
+      "router_id: BGP router ID (must be unique)",
+      "load_balance_mp_relax: enable multipath-relax for eBGP ECMP (true/false)",
+      "log_nbr_state_changes: log adjacency changes (true/false)",
+      "graceful_restart_enable: graceful restart (true/false)",
+      "gr_restart_time: graceful restart time",
+      "gr_stale_routes_time: stale routes timer"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'BGP_GLOBALS|default'",
+    "redis_command": "redis-cli -n 4 KEYS 'BGP_GLOBALS*'"
+  },
+  "CONFIG_DB:BGP_PEER_RANGE": {
+    "table": "BGP_PEER_RANGE",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "bgp-4"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "direct-redis-write",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "BGP_PEER_RANGE|default|<group-name>",
+    "relevant_fields": [
+      "name: peer group name",
+      "ip_range: list of IP prefixes for dynamic neighbor matching",
+      "src_intf: source interface for this peer group"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'BGP_PEER_RANGE|default|<group>'",
+    "redis_command": "redis-cli -n 4 KEYS 'BGP_PEER_RANGE*'"
+  },
+  "CONFIG_DB:ROUTE_TABLE (APPL_DB)": {
+    "table": "ROUTE_TABLE (APPL_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "bgp-4"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "direct-redis-write",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "ROUTE_TABLE:<prefix/len>",
+    "relevant_fields": [
+      "nexthop: comma-separated list of next-hop IPs (ECMP)",
+      "ifname: egress interface name(s)",
+      "distance: administrative distance",
+      "metric: route metric",
+      "weight: ECMP weight",
+      "nexthop-vrf: VRF for the nexthop (for VRF route leak)"
+    ],
+    "verify_command": "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+    "redis_command": "redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l"
+  },
+  "CONFIG_DB:BGP_MONITORS": {
+    "table": "BGP_MONITORS",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "bgp-4"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "direct-redis-write",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "BGP_MONITORS|<peer-ip>",
+    "relevant_fields": [
+      "name: monitor description",
+      "asn: monitor peer AS",
+      "ip_addr: monitor peer IP"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'BGP_MONITORS|<ip>'",
+    "redis_command": "redis-cli -n 4 KEYS 'BGP_MONITORS*'"
+  }
+}

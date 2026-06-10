@@ -1,0 +1,152 @@
+{
+  "tree_id": "bgp-not-establishing",
+  "display_name": "BGP session not establishing",
+  "entry_symptom": "BGP peer stuck in Idle/Active/Connect state",
+  "related_protocol": "bgp-4",
+  "related_errors": ["direct-frr-vtysh"],
+  "related_code_paths": ["route-install-bgp"],
+
+  "nodes": [
+    {
+      "node_id": "n1",
+      "node_type": "branch",
+      "question": "What state is the BGP session in?",
+      "commands": ["show bgp summary", "docker exec bgp vtysh -c 'show bgp summary'"],
+      "branches": {
+        "Idle": "n2",
+        "Active": "n4",
+        "Connect": "n4",
+        "OpenSent": "n7",
+        "OpenConfirm": "n8",
+        "No entry shown": "n9"
+      }
+    },
+    {
+      "node_id": "n2",
+      "node_type": "branch",
+      "question": "Does the BGP session show 'Idle (Admin)' or just 'Idle'?",
+      "commands": ["docker exec bgp vtysh -c 'show bgp neighbors <peer_ip>' | head -20"],
+      "branches": {
+        "Idle (Admin)": "n3",
+        "Idle (no Admin)": "n4"
+      }
+    },
+    {
+      "node_id": "n3",
+      "node_type": "leaf",
+      "finding": "BGP neighbor is administratively shut down",
+      "action": "Check CONFIG_DB for shutdown state: redis-cli -n 4 HGETALL 'BGP_NEIGHBOR|<peer_ip>'. If admin_status is 'down', enable with: config bgp startup neighbor <peer_ip>. Also check if bgpcfgd applied a shutdown template.",
+      "commands": ["redis-cli -n 4 HGETALL 'BGP_NEIGHBOR|<peer_ip>'"]
+    },
+    {
+      "node_id": "n4",
+      "node_type": "branch",
+      "question": "Can you ping the peer IP from the correct source interface?",
+      "commands": ["ping -c 3 -I <source_interface_ip> <peer_ip>"],
+      "branches": {
+        "yes": "n5",
+        "no": "n10"
+      }
+    },
+    {
+      "node_id": "n5",
+      "node_type": "branch",
+      "question": "Can you establish a TCP connection to the peer on port 179?",
+      "commands": ["docker exec bgp bash -c 'echo | nc -w 3 <peer_ip> 179'"],
+      "branches": {
+        "yes (connection accepted)": "n6",
+        "no (connection refused or timeout)": "n11"
+      }
+    },
+    {
+      "node_id": "n6",
+      "node_type": "branch",
+      "question": "Is the BGP configuration in CONFIG_DB consistent with FRR running config?",
+      "commands": [
+        "redis-cli -n 4 HGETALL 'BGP_NEIGHBOR|<peer_ip>'",
+        "docker exec bgp vtysh -c 'show running-config' | grep -A5 'neighbor <peer_ip>'"
+      ],
+      "branches": {
+        "CONFIG_DB has neighbor but FRR does not": "n12",
+        "Both have neighbor but AS numbers differ": "n13",
+        "Both match": "n14"
+      }
+    },
+    {
+      "node_id": "n7",
+      "node_type": "leaf",
+      "finding": "Session stuck in OpenSent -- TCP connected but no OPEN response from peer",
+      "action": "The local router sent an OPEN message but the peer did not respond. Check: (1) Peer BGP process is running, (2) AS number mismatch -- peer may be rejecting the OPEN, (3) Check peer's BGP log for notification messages. Run: docker exec bgp vtysh -c 'show bgp neighbors <peer_ip>' to see last notification received.",
+      "commands": ["docker exec bgp vtysh -c 'show bgp neighbors <peer_ip>' | grep -i 'notification'"]
+    },
+    {
+      "node_id": "n8",
+      "node_type": "leaf",
+      "finding": "Session stuck in OpenConfirm -- OPEN messages exchanged but KEEPALIVE not received",
+      "action": "Both sides exchanged OPEN messages but the peer did not send a KEEPALIVE to confirm. This is rare. Check: (1) Hold timer mismatch (one side has hold=0), (2) Capability negotiation failure, (3) Peer may have crashed after sending OPEN. Check logs: docker exec bgp cat /var/log/frr/bgpd.log | tail -50",
+      "commands": ["docker exec bgp cat /var/log/frr/bgpd.log | tail -50"]
+    },
+    {
+      "node_id": "n9",
+      "node_type": "leaf",
+      "finding": "BGP neighbor not configured or bgpcfgd has not synced config to FRR",
+      "action": "Verify neighbor exists in CONFIG_DB: redis-cli -n 4 KEYS 'BGP_NEIGHBOR|*'. If present but not in FRR, bgpcfgd may have failed. Check: docker exec bgp supervisorctl status bgpcfgd; journalctl -u bgp | grep bgpcfgd. If bgpcfgd is running but neighbor is missing from FRR, check for template errors in /var/log/syslog | grep bgpcfgd.",
+      "commands": [
+        "redis-cli -n 4 KEYS 'BGP_NEIGHBOR|*'",
+        "docker exec bgp supervisorctl status bgpcfgd"
+      ]
+    },
+    {
+      "node_id": "n10",
+      "node_type": "leaf",
+      "finding": "Layer 3 connectivity to peer is broken",
+      "action": "Troubleshoot IP connectivity: (1) Check interface status: show interfaces status, (2) Check IP addresses: show ip interface, (3) Check routing to peer: show ip route <peer_ip>, (4) Check ARP: show arp | grep <peer_ip>, (5) If peer is multi-hop, check intermediate path with traceroute.",
+      "commands": [
+        "show interfaces status",
+        "show ip interface",
+        "show ip route <peer_ip>",
+        "show arp"
+      ]
+    },
+    {
+      "node_id": "n11",
+      "node_type": "leaf",
+      "finding": "TCP port 179 blocked or peer BGP not listening",
+      "action": "Check: (1) ACL/iptables blocking port 179: iptables -L -n | grep 179, (2) CoPP policy dropping BGP: check copp configuration, (3) Peer's BGP process not running, (4) Peer is listening on a different IP (update-source mismatch). Also verify SONiC CoPP is not rate-limiting BGP: redis-cli -n 4 HGETALL 'COPP_TABLE|copp-system-bgp'.",
+      "commands": [
+        "sudo iptables -L -n | grep 179",
+        "redis-cli -n 4 HGETALL 'COPP_TABLE|copp-system-bgp'"
+      ]
+    },
+    {
+      "node_id": "n12",
+      "node_type": "leaf",
+      "finding": "bgpcfgd has not synced CONFIG_DB neighbor to FRR",
+      "action": "This is a bgpcfgd issue. Check bgpcfgd logs: journalctl -u bgp | grep bgpcfgd. Common causes: (1) bgpcfgd crashed or stuck, (2) Jinja2 template rendering error, (3) Missing required fields in CONFIG_DB BGP_NEIGHBOR entry. Try restarting bgpcfgd: docker exec bgp supervisorctl restart bgpcfgd. If that fails, check the template at /usr/share/sonic/templates/bgpd.conf.j2.",
+      "commands": [
+        "docker exec bgp supervisorctl status bgpcfgd",
+        "journalctl -u bgp | grep bgpcfgd | tail -20"
+      ]
+    },
+    {
+      "node_id": "n13",
+      "node_type": "leaf",
+      "finding": "AS number mismatch between CONFIG_DB and FRR or between peers",
+      "action": "Verify AS numbers match: (1) CONFIG_DB: redis-cli -n 4 HGETALL 'BGP_NEIGHBOR|<peer_ip>' -- check 'asn' field, (2) FRR: docker exec bgp vtysh -c 'show bgp neighbors <peer_ip>' -- check 'remote AS'. If they differ, the peer will reject the OPEN message with a NOTIFICATION (Bad Peer AS). Fix in CONFIG_DB: config bgp neighbor <peer_ip> remote-as <correct_asn>.",
+      "commands": [
+        "redis-cli -n 4 HGETALL 'BGP_NEIGHBOR|<peer_ip>'",
+        "docker exec bgp vtysh -c 'show bgp neighbors <peer_ip>' | grep 'remote AS'"
+      ]
+    },
+    {
+      "node_id": "n14",
+      "node_type": "leaf",
+      "finding": "Configuration appears correct but session still not establishing",
+      "action": "Advanced debugging: (1) Check for authentication mismatch: redis-cli -n 4 HGETALL 'BGP_NEIGHBOR|<peer_ip>' | grep password, (2) Check for capability mismatch in NOTIFICATION: docker exec bgp vtysh -c 'show bgp neighbors <peer_ip>' | grep -i 'capability', (3) Check for maximum-prefix limit exceeded, (4) Packet capture: tcpdump -i <interface> -n 'tcp port 179' -c 20. (5) Check if this is a human error -- someone configured via vtysh directly.",
+      "commands": [
+        "docker exec bgp vtysh -c 'show bgp neighbors <peer_ip>'",
+        "sudo tcpdump -i any -n 'tcp port 179 and host <peer_ip>' -c 10"
+      ]
+    }
+  ]
+}

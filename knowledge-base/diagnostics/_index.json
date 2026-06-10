@@ -1,0 +1,14 @@
+{
+  "bgp-not-establishing": {
+    "display_name": "BGP session not establishing",
+    "entry_symptom": "BGP peer stuck in Idle/Active/Connect state"
+  },
+  "route-missing-hardware": {
+    "display_name": "Route missing from hardware forwarding table",
+    "entry_symptom": "Route visible in control plane but traffic not forwarding"
+  },
+  "port-down": {
+    "display_name": "Interface/port down",
+    "entry_symptom": "Interface shows down or no link"
+  }
+}

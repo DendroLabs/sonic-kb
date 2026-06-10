@@ -1,0 +1,992 @@
+{
+  "protocol_id": "bgp-4",
+  "protocol_name": "BGP-4",
+  "protocol_family": "routing",
+  "standard": "RFC 4271",
+  "category": "routing",
+  "purpose": "Border Gateway Protocol version 4 -- path-vector EGP for inter-AS routing and NLRI exchange",
+  "operates_at": "Layer 3",
+  "transport": "TCP port 179",
+  "def_refs": [
+    "timer:bgp-hold",
+    "timer:bgp-keepalive",
+    "timer:bgp-connect-retry",
+    "daemon:orchagent",
+    "daemon:fpmsyncd",
+    "daemon:bgpcfgd",
+    "db:config_db",
+    "db:appl_db"
+  ],
+  "states": [
+    {
+      "name": "IDLE",
+      "description": "Not attempting to connect; initial state or after an error resets the FSM. The BGP process is waiting for a ManualStart or AutomaticStart event before initiating a TCP connection to the peer. In SONiC/FRR, bgpd enters this state after a NOTIFICATION is received, too many retries, or on explicit 'neighbor <ip> shutdown'.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "show bgp summary",
+        "vtysh -c 'show bgp summary'",
+        "show ip bgp summary"
+      ]
+    },
+    {
+      "name": "CONNECT",
+      "description": "Waiting for the TCP three-way handshake to complete. bgpd has initiated a TCP SYN to the peer on port 179 and the ConnectRetry timer is running. If the TCP connection completes, the FSM moves to OPENSENT. If it fails, the FSM falls back to ACTIVE.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "show bgp summary",
+        "vtysh -c 'show bgp summary'",
+        "sudo ss -tnp | grep 179"
+      ]
+    },
+    {
+      "name": "ACTIVE",
+      "description": "TCP connection failed; retrying. Despite its misleading name, ACTIVE is a failure indicator -- bgpd is actively trying (and failing) to establish a TCP session to the peer. The ConnectRetry timer controls re-attempt intervals. In SONiC this is the most common symptom of IP reachability or ACL issues.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "show bgp summary",
+        "vtysh -c 'show bgp neighbors <ip>'",
+        "ping <peer-ip> -I <src-interface>"
+      ]
+    },
+    {
+      "name": "OPENSENT",
+      "description": "TCP connection is up; a BGP OPEN message has been sent to the peer and bgpd is waiting for the peer's OPEN in return. The OPEN carries the local AS number, hold-time, BGP Identifier (router-id), and capability options. A Hold Timer (large value, typically 4 minutes per RFC) is started.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "vtysh -c 'show bgp neighbors <ip>'",
+        "sudo tcpdump -i any tcp port 179 -c 20"
+      ]
+    },
+    {
+      "name": "OPENCONFIRM",
+      "description": "A valid OPEN has been received from the peer and a KEEPALIVE has been sent locally. The FSM is waiting for the peer's KEEPALIVE (or NOTIFICATION). Upon receiving KEEPALIVE the session moves to ESTABLISHED. A NOTIFICATION or expired Hold Timer returns to IDLE.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "vtysh -c 'show bgp neighbors <ip>'",
+        "sudo tcpdump -i any tcp port 179 -c 20"
+      ]
+    },
+    {
+      "name": "ESTABLISHED",
+      "description": "Session is fully up. UPDATE, KEEPALIVE, and ROUTE-REFRESH messages are exchanged. Routes are being advertised, received, and installed into the FRR RIB. This is the only steady-state operational state. In SONiC, routes then flow bgpd -> zebra -> fpmsyncd -> APPL_DB -> orchagent -> ASIC_DB -> syncd.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "show bgp summary",
+        "vtysh -c 'show bgp summary'",
+        "vtysh -c 'show bgp ipv4 unicast'",
+        "show ip bgp",
+        "show ip route bgp"
+      ]
+    }
+  ],
+  "transitions": [
+    {
+      "from_state": "IDLE",
+      "to_state": "CONNECT",
+      "trigger": "ManualStart or AutomaticStart event; bgpd initiates TCP connection to peer on port 179 and starts ConnectRetry timer",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "CONNECT",
+      "to_state": "OPENSENT",
+      "trigger": "TCP connection completes (three-way handshake done); bgpd sends OPEN message and starts Hold Timer",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "CONNECT",
+      "to_state": "ACTIVE",
+      "trigger": "TCP connection failed or ConnectRetry timer expired; bgpd falls back to ACTIVE to listen for passive open",
+      "failure_if_stuck": "Peer IP unreachable, TCP/179 blocked by iptables/nftables, wrong update-source, or MTU mismatch preventing TCP SYN"
+    },
+    {
+      "from_state": "ACTIVE",
+      "to_state": "OPENSENT",
+      "trigger": "Passive TCP open succeeds (peer connects to us) or new active TCP attempt succeeds; OPEN message sent",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "ACTIVE",
+      "to_state": "CONNECT",
+      "trigger": "ConnectRetry timer expires; bgpd retries active TCP connection to peer",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "ACTIVE",
+      "to_state": "IDLE",
+      "trigger": "Too many connection failures, idle-hold timer running, or neighbor shutdown",
+      "failure_if_stuck": "Persistent reachability problem; check IP connectivity and container health (is bgpd running?)"
+    },
+    {
+      "from_state": "OPENSENT",
+      "to_state": "OPENCONFIRM",
+      "trigger": "Valid OPEN received from peer; bgpd sends KEEPALIVE and negotiates hold-time and capabilities",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "OPENSENT",
+      "to_state": "ACTIVE",
+      "trigger": "TCP session reset or collision detection; bgpd falls back to retry",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "OPENSENT",
+      "to_state": "IDLE",
+      "trigger": "Invalid OPEN received (NOTIFICATION sent) -- parameter mismatch: AS number, BGP version, router-id collision, capability negotiation failure, or MD5 TCP-AO authentication failure",
+      "failure_if_stuck": "Check: remote AS config, BGP version, duplicate router-IDs, MD5 password mismatch"
+    },
+    {
+      "from_state": "OPENCONFIRM",
+      "to_state": "ESTABLISHED",
+      "trigger": "KEEPALIVE received from peer; negotiated hold-time set, session declared up",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "OPENCONFIRM",
+      "to_state": "IDLE",
+      "trigger": "NOTIFICATION received or Hold Timer expired waiting for KEEPALIVE",
+      "failure_if_stuck": "MD5 authentication mismatch or one-sided capability rejection; check 'vtysh -c show bgp neighbors' for notification reason"
+    },
+    {
+      "from_state": "ESTABLISHED",
+      "to_state": "IDLE",
+      "trigger": "NOTIFICATION received (error in UPDATE, max-prefix exceeded, etc.), Hold Timer expired (missing KEEPALIVEs), TCP session lost, or 'clear bgp' command issued",
+      "failure_if_stuck": ""
+    }
+  ],
+  "timers": [
+    {
+      "name": "ConnectRetry",
+      "description": "Time between TCP connection attempts when in CONNECT or ACTIVE state. Restarted on each connection failure.",
+      "default": "120s (RFC 4271 default)",
+      "range": "1-65535s",
+      "on_expiry": "Retry TCP connection to peer",
+      "sonic_default": "10s (FRR bgpd default)",
+      "sonic_config_path": "CONFIG_DB BGP_NEIGHBOR|<ip>: -- not directly configurable via sonic-cfggen; set via vtysh 'timers connect <seconds>' under neighbor",
+      "sonic_frr_path": "bgpd: peer->v_connect (FRR source: bgpd/bgp_fsm.c)",
+      "tuning_advice": "Lower for faster new session establishment in lab; FRR default of 10s is reasonable for production"
+    },
+    {
+      "name": "Hold Timer",
+      "description": "Maximum time between received KEEPALIVE or UPDATE messages before declaring the peer dead. Negotiated in OPEN: the smaller value of the two peers' proposed hold-times is used. When it expires bgpd sends NOTIFICATION (Hold Timer Expired) and tears down the session.",
+      "default": "180s (negotiated; RFC recommends peer proposes 90s, FRR default is 180s)",
+      "range": "0 or 3-65535s (0 disables hold-timer)",
+      "on_expiry": "Peer declared dead; NOTIFICATION Cease/Hold Timer Expired sent; session torn down; routes withdrawn from RIB",
+      "sonic_default": "180s (FRR bgpd default)",
+      "sonic_config_path": "CONFIG_DB BGP_NEIGHBOR|<ip>: holdtime field, or BGP_GLOBALS timers_holdtime",
+      "sonic_frr_path": "bgpd: peer->v_holdtime (FRR source: bgpd/bgp_fsm.c)",
+      "tuning_advice": "Use BFD for sub-second failure detection rather than aggressive hold-timers. For data-center eBGP, 9s hold / 3s keepalive is common. 0 disables but risks never detecting dead peer."
+    },
+    {
+      "name": "Keepalive Timer",
+      "description": "Interval at which bgpd sends KEEPALIVE messages to the peer to reset the peer's Hold Timer. Automatically calculated as hold-time / 3. Not independently configurable in most FRR deployments.",
+      "default": "60s (1/3 of 180s hold time)",
+      "range": "0-65535s",
+      "on_expiry": "Send KEEPALIVE to peer",
+      "sonic_default": "60s (FRR bgpd default; derived from hold-timer)",
+      "sonic_config_path": "CONFIG_DB BGP_NEIGHBOR|<ip>: keepalive field, or BGP_GLOBALS timers_keepalive",
+      "sonic_frr_path": "bgpd: peer->v_keepalive (FRR source: bgpd/bgp_keepalive.c)",
+      "tuning_advice": "Set via 'timers <keepalive> <holdtime>' under 'router bgp' or per-neighbor. Common for DC fabrics: 'timers 3 9'."
+    },
+    {
+      "name": "MRAI (MinRouteAdvertisementInterval)",
+      "description": "Minimum time between consecutive UPDATEs to the same peer for the same prefix. Batches rapid route changes to prevent UPDATE storms. eBGP default is 30s, iBGP default is 5s. FRR SONiC deployments commonly set this to 0 for fast convergence.",
+      "default": "30s (eBGP), 5s (iBGP) per RFC",
+      "range": "0-600s",
+      "on_expiry": "Pending batched UPDATEs are sent to the peer",
+      "sonic_default": "0s in most SONiC deployments (advertisement-interval 0 is common in bgpcfgd templates)",
+      "sonic_config_path": "FRR vtysh: 'neighbor <ip> advertisement-interval <seconds>' under 'router bgp'",
+      "sonic_frr_path": "bgpd: peer->v_routeadv (FRR source: bgpd/bgp_route.c)",
+      "tuning_advice": "Set to 0 for data-center fabrics requiring fast convergence. Keep default for WAN peering to protect against UPDATE storms from unstable peers."
+    },
+    {
+      "name": "Idle Hold Timer",
+      "description": "After a session is reset due to an error (e.g., NOTIFICATION received), bgpd may delay before attempting to reconnect. The idle-hold timer enforces a back-off window. FRR implements exponential back-off on repeated failures.",
+      "default": "5s initial; FRR doubles on repeated failures up to 120s",
+      "range": "0-65535s",
+      "on_expiry": "BGP allowed to move from IDLE to CONNECT and attempt reconnection",
+      "sonic_default": "FRR default exponential back-off (5s, 10s, 20s ... 120s cap)",
+      "sonic_config_path": "Not directly configurable via CONFIG_DB; controlled by FRR back-off logic",
+      "sonic_frr_path": "bgpd: peer->idle_holdtime (FRR source: bgpd/bgp_fsm.c)",
+      "tuning_advice": "Not tunable in standard SONiC. If a peer is oscillating, the back-off dampens reconnect attempts automatically."
+    }
+  ],
+  "messages": [
+    {
+      "name": "OPEN",
+      "description": "Establishes BGP session parameters. The first message sent after TCP connects. Both peers exchange OPENs; mismatches result in NOTIFICATION and session teardown.",
+      "when_sent": "Immediately after TCP three-way handshake completes (CONNECT -> OPENSENT)",
+      "key_fields": [
+        "BGP Version (must be 4)",
+        "My AS (2-byte; 4-byte via capabilities)",
+        "Hold Time (proposed; negotiated to minimum of both peers)",
+        "BGP Identifier (router-id -- must be unique per peer)",
+        "Optional Parameters length",
+        "Optional Parameters: Capabilities TLVs -- MP-BGP AFI/SAFI (RFC 4760), 4-byte ASN (RFC 6793), Route Refresh (RFC 2918), Graceful Restart (RFC 4724), ADD-PATH (RFC 7911), Enhanced Route Refresh (RFC 7313)"
+      ]
+    },
+    {
+      "name": "UPDATE",
+      "description": "Advertises new routes (NLRIs) and/or withdraws previously advertised routes. The core BGP message for routing information exchange. After session establishment, bgpd sends the full RIB as UPDATEs; thereafter only incremental changes are sent.",
+      "when_sent": "During initial table exchange after ESTABLISHED; subsequently whenever routing information changes (new route, withdrawal, attribute change)",
+      "key_fields": [
+        "Withdrawn Routes Length",
+        "Withdrawn Routes (list of prefixes being removed)",
+        "Total Path Attribute Length",
+        "Path Attributes: ORIGIN (IGP/EGP/INCOMPLETE), AS_PATH, NEXT_HOP, MULTI_EXIT_DISC (MED), LOCAL_PREF (iBGP only), ATOMIC_AGGREGATE, AGGREGATOR, COMMUNITY (RFC 1997), LARGE_COMMUNITY (RFC 8092), EXTENDED_COMMUNITY (RFC 4360), MP_REACH_NLRI (RFC 4760), MP_UNREACH_NLRI (RFC 4760)",
+        "NLRI (Network Layer Reachability Information -- list of prefixes being advertised)"
+      ]
+    },
+    {
+      "name": "KEEPALIVE",
+      "description": "Maintains session liveness by resetting the peer's Hold Timer. Contains only the 19-byte BGP common header (no body). Also used to acknowledge the peer's OPEN during the OPENCONFIRM state.",
+      "when_sent": "Every keepalive-interval (default 60s, derived as hold-time/3); also once during OPENCONFIRM to acknowledge the peer's OPEN",
+      "key_fields": [
+        "(19-byte BGP common header only: Marker=0xFF*16, Length=19, Type=4)"
+      ]
+    },
+    {
+      "name": "NOTIFICATION",
+      "description": "Reports a protocol error and terminates the session. After sending NOTIFICATION, bgpd closes the TCP connection and returns to IDLE. The error code and subcode identify the exact cause.",
+      "when_sent": "Whenever a BGP error is detected: OPEN parameter mismatch, invalid UPDATE, Hold Timer expiry, maximum-prefix exceeded, finite state machine error, administrative reset",
+      "key_fields": [
+        "Error Code: 1=Message Header Error, 2=OPEN Message Error, 3=UPDATE Message Error, 4=Hold Timer Expired, 5=Finite State Machine Error, 6=Cease",
+        "Error Subcode: further qualifies the error (e.g., Cease/6.1=Maximum Number of Prefixes Reached, Cease/6.2=Administrative Shutdown, Cease/6.3=Peer De-configured, Cease/6.4=Administrative Reset, Cease/6.8=Hard Reset)",
+        "Data: variable-length field containing the offending value or attribute"
+      ]
+    },
+    {
+      "name": "ROUTE-REFRESH",
+      "description": "Requests the peer to re-advertise its full BGP table for a specific AFI/SAFI without tearing down the session. Used after an inbound policy change to re-apply the new policy to routes already received. Requires the Route Refresh capability to be negotiated in OPEN.",
+      "when_sent": "Triggered by operator ('clear bgp <ip> soft in') or automatically after inbound policy change if soft-reconfiguration is not configured",
+      "key_fields": [
+        "AFI (Address Family Identifier: 1=IPv4, 2=IPv6, 25=L2VPN)",
+        "Reserved (must be 0)",
+        "SAFI (Subsequent Address Family Identifier: 1=unicast, 2=multicast, 4=MPLS-labeled, 70=EVPN, 128=MPLS VPN)"
+      ]
+    }
+  ],
+  "failure_modes": [
+    {
+      "scenario": "Session stuck in ACTIVE or CONNECT -- TCP not establishing",
+      "description": "bgpd cannot complete the TCP three-way handshake to the peer on port 179. The session oscillates between CONNECT and ACTIVE states indefinitely. In SONiC this is the most common BGP failure and almost always means a Layer 3 reachability or firewall problem -- not a BGP protocol issue.",
+      "symptoms": [
+        "'show bgp summary' shows state Active or Connect for the neighbor",
+        "Session uptime shows 'never' or resets frequently",
+        "'sudo ss -tnp | grep 179' shows no ESTABLISHED connection to peer IP",
+        "bgpd logs show repeated 'bgpd[]: %ADJCHANGE: ... Active' or connection refused messages"
+      ],
+      "root_causes": [
+        "Peer IP address unreachable -- no route to peer, wrong IP configured",
+        "iptables/nftables rule on the SONiC host blocking TCP port 179 (check 'sudo iptables -L -n | grep 179')",
+        "BGP container not running or bgpd process crashed inside bgp container",
+        "Incorrect update-source -- bgpd is sourcing TCP from the wrong interface/IP",
+        "eBGP multihop not configured when peer is more than 1 hop away (TTL=1 default for eBGP)",
+        "MD5 TCP authentication mismatch -- peer sends RST on SYN with wrong or missing MD5 signature",
+        "MTU mismatch -- TCP SYN succeeds but large BGP OPENs are fragmented/dropped",
+        "Wrong remote-as configured -- peer rejects the connection at the TCP level or sends NOTIFICATION"
+      ],
+      "resolution": [
+        "Ping peer IP from SONiC: 'ping <peer-ip> -I <src-interface>'",
+        "Check iptables: 'sudo iptables -L -n | grep 179' and 'sudo ip6tables -L -n | grep 179'",
+        "Check bgp container: 'docker ps | grep bgp' and 'docker exec bgp vtysh -c show bgp summary'",
+        "Verify update-source: 'docker exec bgp vtysh -c \"show bgp neighbors <ip>\"' -- check 'Local host'",
+        "For multihop eBGP: add 'neighbor <ip> ebgp-multihop <ttl>' in FRR config",
+        "Verify MD5 password matches on both ends under neighbor config",
+        "Check MTU: 'ip link show <interface>' and compare with peer"
+      ],
+      "verify_commands": [
+        {
+          "command": "show bgp summary",
+          "look_for": "Neighbor state column -- Active or Connect indicates TCP not up",
+          "confirms_if": "Shows Active or Connect state for the peer"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp neighbors <ip>'",
+          "look_for": "BGP state field, Last error, Local host/port, Foreign host/port",
+          "confirms_if": "Shows detailed FSM state and local source IP being used"
+        },
+        {
+          "command": "sudo ss -tnp | grep 179",
+          "look_for": "ESTAB entries on port 179 to the peer IP; SYN-SENT indicates TCP not completing",
+          "confirms_if": "No ESTAB entry to peer IP confirms TCP is not connecting"
+        },
+        {
+          "command": "ping <peer-ip> -I <src-interface> -c 3",
+          "look_for": "Packet loss -- any loss indicates IP reachability problem",
+          "confirms_if": "100% packet loss confirms the peer IP is unreachable from this source"
+        },
+        {
+          "command": "sudo iptables -L -n | grep 179",
+          "look_for": "DROP or REJECT rules matching port 179",
+          "confirms_if": "Matching DROP rule on port 179 confirms firewall is blocking BGP TCP"
+        },
+        {
+          "command": "docker ps | grep bgp",
+          "look_for": "bgp container status -- should show 'Up' not 'Exited'",
+          "confirms_if": "Exited or missing bgp container confirms BGP daemon is not running"
+        }
+      ]
+    },
+    {
+      "scenario": "Session flapping -- ESTABLISHED cycling to IDLE repeatedly",
+      "description": "The BGP session reaches ESTABLISHED but drops and re-establishes repeatedly. Each flap triggers route withdrawals and re-advertisements that propagate instability upstream and downstream. In SONiC the most common causes are Hold Timer expiry (CPU-bound bgpd or high-latency path) and underlying link or tunnel instability.",
+      "symptoms": [
+        "'show bgp summary' shows short uptime (seconds to minutes) for the neighbor",
+        "syslog shows repeated '%ADJCHANGE: neighbor <ip> Down' and 'Up' entries",
+        "Downstream peers receive repeated prefix withdrawals and re-advertisements",
+        "'docker exec bgp vtysh -c \"show bgp neighbors <ip>\"' shows high Connections dropped count"
+      ],
+      "root_causes": [
+        "Hold Timer expiry: bgpd not sending KEEPALIVEs within hold-time due to CPU overload or I/O stall in bgp container",
+        "Underlying link or tunnel flapping (the IP path to the peer goes down briefly)",
+        "NOTIFICATION from peer: max-prefix limit exceeded, capability mismatch on re-negotiation, MD5 change",
+        "bgp container OOM killed by Linux kernel -- bgpd restarts and sessions reset",
+        "BFD failure declaring peer dead faster than BGP timers (correct behavior, but may look like BGP flap)",
+        "FRR bgpd bug causing crash-restart cycle (check 'docker inspect bgp' for restart count)"
+      ],
+      "resolution": [
+        "Check last NOTIFICATION reason: 'docker exec bgp vtysh -c \"show bgp neighbors <ip>\"' -- look for Last error",
+        "Check bgp container resource usage: 'docker stats bgp'",
+        "Check bgpd crash/restart: 'docker inspect bgp | grep RestartCount'",
+        "Check system syslog: 'sudo tail -f /var/log/syslog | grep -E \"BGP|bgpd\"'",
+        "If Hold Timer expiry: either increase timers ('timers 10 30') or reduce bgpd CPU load",
+        "If BFD-triggered: investigate the underlay path stability",
+        "Check kernel OOM: 'sudo dmesg | grep -i oom | tail -20'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp neighbors <ip>'",
+          "look_for": "Last error field, Connections established/dropped counts, hold time, last reset reason",
+          "confirms_if": "High Connections dropped count and short uptime confirm flapping; Last error field identifies cause"
+        },
+        {
+          "command": "sudo grep -E 'BGP|bgpd|ADJCHANGE' /var/log/syslog | tail -50",
+          "look_for": "Repeated Up/Down transitions with timestamps; NOTIFICATION error codes",
+          "confirms_if": "Repeated adjacency change log messages confirm flapping with timing pattern"
+        },
+        {
+          "command": "docker stats bgp --no-stream",
+          "look_for": "CPU % and MEM USAGE -- high CPU in bgp container can cause KEEPALIVE misses",
+          "confirms_if": "CPU above 80% in bgp container confirms KEEPALIVE suppression by CPU overload"
+        },
+        {
+          "command": "docker inspect bgp | grep -A2 RestartCount",
+          "look_for": "RestartCount > 0 indicates bgpd container has been restarted",
+          "confirms_if": "Non-zero RestartCount confirms bgpd has crashed and been restarted"
+        },
+        {
+          "command": "sudo dmesg | grep -i oom | tail -20",
+          "look_for": "OOM kill events targeting bgpd or the bgp container cgroup",
+          "confirms_if": "OOM kill event for bgpd confirms memory pressure is crashing the session"
+        }
+      ]
+    },
+    {
+      "scenario": "Routes not being advertised to peer",
+      "description": "The BGP session is ESTABLISHED but the peer receives zero or fewer prefixes than expected from this SONiC device. Routes exist in the local FRR BGP table but are not being sent. Almost always a policy, address-family activation, or next-hop issue.",
+      "symptoms": [
+        "Peer reports 0 prefixes received from this router",
+        "'docker exec bgp vtysh -c \"show bgp neighbors <ip> advertised-routes\"' returns empty or partial list",
+        "Routes visible in 'show bgp ipv4 unicast' locally but not on remote end",
+        "No UPDATE messages seen in 'sudo tcpdump -i any tcp port 179' after session establishes"
+      ],
+      "root_causes": [
+        "Address family not activated for the neighbor (must add 'neighbor <ip> activate' under address-family ipv4 unicast in FRR)",
+        "Outbound route-map or prefix-list denying all or some routes",
+        "No 'network' statement and no redistribution configured -- nothing to advertise",
+        "Route not selected as best path by BGP best-path algorithm (only best paths are advertised)",
+        "next-hop-self not set for iBGP -- eBGP next-hop is not reachable by iBGP peers",
+        "bgpcfgd template error: outbound policy applied that was not intended",
+        "Peer is in a different address family (e.g., IPv6 unicast) and IPv4 unicast is the active one"
+      ],
+      "resolution": [
+        "Check address-family activation: 'docker exec bgp vtysh -c \"show bgp neighbors <ip>\"' -- look for 'AF activated' lines",
+        "Check outbound policy: look for 'route-map' or 'prefix-list' in FRR neighbor config",
+        "Verify network statements: 'docker exec bgp vtysh -c \"show running-config\"' under 'router bgp'",
+        "Check best path: 'docker exec bgp vtysh -c \"show bgp ipv4 unicast <prefix>\"' -- routes without '>' are not best and won't be advertised",
+        "After policy change, soft reset: 'docker exec bgp vtysh -c \"clear bgp <ip> soft out\"'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp neighbors <ip> advertised-routes'",
+          "look_for": "List of prefixes being sent to this peer; empty means nothing is being advertised",
+          "confirms_if": "Empty output confirms routes are not being advertised to this specific peer"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp ipv4 unicast'",
+          "look_for": "'>' (best path) marker on routes -- only best-path routes are advertised; routes without '>' will not be sent",
+          "confirms_if": "Routes without '>' marker will not be advertised regardless of policy"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp neighbors <ip>'",
+          "look_for": "Address-family activation status, outbound route-map name, community-list filters",
+          "confirms_if": "Shows exactly which outbound policy is applied to this neighbor and which AFIs are activated"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp neighbors <ip> policy'",
+          "look_for": "Outbound route-map and prefix-list names applied to the neighbor",
+          "confirms_if": "Presence of an outbound policy name indicates filtering is in place; check that policy for deny clauses"
+        }
+      ]
+    },
+    {
+      "scenario": "Routes received from peer but not installed in Linux kernel RIB",
+      "description": "BGP session is ESTABLISHED and 'show bgp ipv4 unicast' shows routes from the peer with the '>' best-path marker, but 'show ip route' does not have these routes and traffic is not forwarded. The route is stuck in the FRR BGP table and never reaches zebra.",
+      "symptoms": [
+        "'show bgp ipv4 unicast' shows route with '>' (best) but 'show ip route' does not have the prefix",
+        "Traffic to the destination black-holes despite BGP showing the route",
+        "'docker exec bgp vtysh -c \"show ip route <prefix>\"' returns no entry",
+        "fpmsyncd logs may show no activity for the affected prefix"
+      ],
+      "root_causes": [
+        "BGP next-hop unreachable from zebra's perspective -- next-hop not in the kernel routing table",
+        "iBGP peer without next-hop-self -- the eBGP next-hop is not reachable by the internal router",
+        "VRF mismatch -- route learned in default VRF but needs to be in a management or data VRF",
+        "FRR zebra not running or unresponsive -- bgpd cannot push routes to kernel",
+        "Maximum prefix import limit in zebra (rarely hit but possible on large tables)",
+        "BFD declaring next-hop unreachable even though BGP session is up (path asymmetry)"
+      ],
+      "resolution": [
+        "Check next-hop reachability: 'docker exec bgp vtysh -c \"show ip route <next-hop-ip>\"'",
+        "For iBGP: add 'neighbor <ip> next-hop-self' on the border router",
+        "Check zebra: 'docker exec bgp vtysh -c \"show ip route\"' -- if zebra has no routes at all, zebra may be down",
+        "Check FRR process health: 'docker exec bgp supervisorctl status'",
+        "Check bgpd -> zebra nexthop tracking: 'docker exec bgp vtysh -c \"show bgp nexthop\"'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp ipv4 unicast <prefix>'",
+          "look_for": "Next-hop address and whether it is marked 'not accessible' or 'inaccessible'; '>' indicates best but zebra may still reject it",
+          "confirms_if": "Route in BGP table with '>' but not in 'show ip route' confirms BGP-to-RIB installation failure"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp nexthop'",
+          "look_for": "Next-hop reachability status column -- 'reachable' vs 'unreachable'; IGP metric",
+          "confirms_if": "Unreachable next-hop in nexthop table confirms why the route is not installed in the RIB"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip route <next-hop-ip>'",
+          "look_for": "Whether a route to the BGP next-hop exists in the kernel/zebra RIB",
+          "confirms_if": "No route to next-hop confirms the root cause -- zebra cannot install the BGP route"
+        },
+        {
+          "command": "docker exec bgp supervisorctl status",
+          "look_for": "All FRR processes (bgpd, zebra, staticd) should show RUNNING",
+          "confirms_if": "zebra in STOPPED or FATAL state explains why no routes are installed"
+        }
+      ]
+    },
+    {
+      "scenario": "Routes in Linux kernel RIB but not programmed into ASIC hardware",
+      "description": "Routes exist in the Linux kernel routing table ('show ip route bgp' shows them) and in FRR, but traffic is still not forwarded -- the routes were never pushed into the ASIC forwarding table. The failure is in the SONiC pipeline: fpmsyncd -> APPL_DB -> orchagent -> ASIC_DB -> syncd. This is the most SONiC-specific BGP failure mode.",
+      "symptoms": [
+        "'show ip route bgp' shows the prefix in the kernel RIB",
+        "'show route-map' shows no filtering",
+        "Traffic to prefix is dropped or not forwarded by ASIC",
+        "APPL_DB ROUTE_TABLE may have the entry but ASIC_DB does not",
+        "orchagent logs show SAI errors: 'ERR orchagent: Failed to create/set route entry'",
+        "syncd logs show SAI_STATUS_TABLE_FULL or SAI_STATUS_INSUFFICIENT_RESOURCES"
+      ],
+      "root_causes": [
+        "fpmsyncd not running or failed to push route to APPL_DB -- check fpmsyncd health",
+        "orchagent failed to translate APPL_DB route to SAI call -- check orchagent logs for SAI errors",
+        "ASIC FIB/LPM table full -- TCAM or LPM resource exhaustion; SAI returns table-full error",
+        "syncd crashed or is in error state -- ASIC_DB entries queued but not programmed",
+        "Next-hop neighbor (ARP/ND) not resolved -- orchagent waiting for neighbor entry before installing route",
+        "ECMP group limit exceeded on the ASIC",
+        "Route stuck in APPL_DB without reaching ASIC_DB -- orchagent dependency on another table (e.g., nexthop group)"
+      ],
+      "resolution": [
+        "Check APPL_DB ROUTE_TABLE: 'redis-cli -n 0 HGETALL \"ROUTE_TABLE:<prefix>\"'",
+        "Check ASIC_DB for route: 'redis-cli -n 1 KEYS \"ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*\" | grep <prefix>'",
+        "Check orchagent logs: 'docker logs swss 2>&1 | grep -E \"ERROR|WARN|route\" | tail -50'",
+        "Check syncd logs: 'docker logs syncd 2>&1 | grep -E \"ERROR|SAI_STATUS\" | tail -50'",
+        "Check FIB resource limits: 'show system resources' or platform-specific ASIC capacity",
+        "Verify fpmsyncd is running: 'docker exec bgp supervisorctl status fpmsyncd'",
+        "Restart fpmsyncd if stuck: 'docker exec bgp supervisorctl restart fpmsyncd' (non-disruptive to BGP sessions)"
+      ],
+      "verify_commands": [
+        {
+          "command": "show ip route bgp",
+          "look_for": "Prefix present in kernel RIB with BGP source code 'B'; confirms route made it out of FRR but need to verify ASIC programming",
+          "confirms_if": "Route in kernel RIB confirms FRR->kernel path is working; absence of route in ASIC confirms pipeline failure downstream"
+        },
+        {
+          "command": "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+          "look_for": "nexthop, ifname fields present in APPL_DB; absence means fpmsyncd has not published the route",
+          "confirms_if": "Empty result means fpmsyncd failed to write to APPL_DB; populated result means failure is in orchagent or syncd"
+        },
+        {
+          "command": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep <prefix>",
+          "look_for": "Matching key for the prefix; absence means orchagent or syncd has not programmed the route into ASIC_DB",
+          "confirms_if": "Key absent in ASIC_DB confirms route was not programmed into hardware"
+        },
+        {
+          "command": "docker logs swss 2>&1 | grep -E 'ERROR|WARN|SAI|route' | tail -50",
+          "look_for": "SAI_STATUS_TABLE_FULL, SAI_STATUS_INSUFFICIENT_RESOURCES, or 'Failed to create route entry' errors",
+          "confirms_if": "SAI error messages in orchagent logs confirm ASIC programming failure with specific error code"
+        },
+        {
+          "command": "docker logs syncd 2>&1 | grep -E 'ERROR|SAI_STATUS' | tail -30",
+          "look_for": "SAI API call failures or status codes indicating ASIC errors",
+          "confirms_if": "SAI errors in syncd confirm the ASIC rejected the route programming"
+        },
+        {
+          "command": "docker exec bgp supervisorctl status fpmsyncd",
+          "look_for": "fpmsyncd process status -- should be RUNNING",
+          "confirms_if": "fpmsyncd in STOPPED or FATAL state confirms the APPL_DB publishing step is broken"
+        }
+      ]
+    },
+    {
+      "scenario": "BGP configuration not taking effect -- bgpcfgd not syncing",
+      "description": "An operator has modified BGP configuration via 'config bgp' CLI commands or by directly editing CONFIG_DB, but the changes do not appear in FRR ('docker exec bgp vtysh -c show running-config' shows the old config). bgpcfgd is the daemon that translates CONFIG_DB -> FRR vtysh commands via Jinja2 templates. If bgpcfgd is stuck, crashed, or misconfigured, CONFIG_DB changes are silently not applied.",
+      "symptoms": [
+        "CONFIG_DB shows the new neighbor or timer configuration",
+        "'docker exec bgp vtysh -c show running-config' does NOT show the new config",
+        "New BGP neighbor never comes up despite being configured via CLI",
+        "Timer or policy changes configured via 'config bgp' have no effect on FRR behavior",
+        "bgpcfgd logs show template rendering errors or database subscription failures"
+      ],
+      "root_causes": [
+        "bgpcfgd process crashed or exited inside the bgp container",
+        "CONFIG_DB entry has a malformed key or missing required field that causes bgpcfgd template rendering to fail silently",
+        "bgpcfgd Jinja2 template bug -- certain config combinations cause a rendering exception",
+        "CONFIG_DB change made via direct redis-cli write that bypassed validation -- malformed JSON or key format",
+        "bgpcfgd is running but the CONFIG_DB subscriber thread lost the connection (Redis subscription dropped)",
+        "Direct vtysh changes were made previously and conflict with what bgpcfgd tries to apply (bgpcfgd will overwrite on next config push)"
+      ],
+      "resolution": [
+        "Check bgpcfgd status: 'docker exec bgp supervisorctl status bgpcfgd'",
+        "Check bgpcfgd logs: 'docker exec bgp cat /var/log/bgpcfgd.log' or 'docker logs bgp 2>&1 | grep bgpcfgd'",
+        "Verify CONFIG_DB entry: 'redis-cli -n 4 HGETALL \"BGP_NEIGHBOR|<ip>\"'",
+        "Restart bgpcfgd: 'docker exec bgp supervisorctl restart bgpcfgd' (will re-read all CONFIG_DB and push to FRR)",
+        "If CONFIG_DB is malformed: fix via 'config bgp ...' CLI, not direct redis-cli writes",
+        "After bgpcfgd restart, confirm: 'docker exec bgp vtysh -c show running-config' shows the expected neighbor"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp supervisorctl status bgpcfgd",
+          "look_for": "bgpcfgd should be RUNNING; STOPPED or FATAL means it crashed",
+          "confirms_if": "bgpcfgd not in RUNNING state confirms config sync is broken"
+        },
+        {
+          "command": "docker logs bgp 2>&1 | grep -i bgpcfgd | tail -30",
+          "look_for": "Template rendering errors, exception tracebacks, or Redis connection errors",
+          "confirms_if": "Error messages in bgpcfgd output confirm config sync failure and may identify the specific template or key causing the issue"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'BGP_NEIGHBOR|<ip>'",
+          "look_for": "rrclient, name, local_addr, nhopself, holdtime, keepalive, asn, admin_status fields",
+          "confirms_if": "Correct values in CONFIG_DB confirm the problem is in bgpcfgd sync (not in the config itself); missing fields indicate a bad config write"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show running-config' | grep -A5 'neighbor <ip>'",
+          "look_for": "Whether the neighbor appears in FRR running config with the expected parameters",
+          "confirms_if": "Absence of neighbor in FRR running-config despite CONFIG_DB having it confirms bgpcfgd sync failure"
+        }
+      ]
+    },
+    {
+      "scenario": "Direct vtysh config overwritten by bgpcfgd on restart",
+      "description": "An operator made BGP configuration changes directly via 'docker exec bgp vtysh' without updating CONFIG_DB. The changes worked temporarily. After bgpcfgd restarts (due to container restart, config reload, or bgpcfgd crash-recovery), it re-applies CONFIG_DB to FRR and overwrites the manual vtysh changes. This is a SONiC-specific human error pattern -- vtysh is not the source of truth in SONiC.",
+      "symptoms": [
+        "BGP configuration change worked after 'docker exec bgp vtysh' but disappeared after container restart or 'config reload'",
+        "'docker exec bgp vtysh -c show running-config' shows config that does not match what was manually entered",
+        "Neighbor that was manually added is gone after restart",
+        "Timer or policy manually set via vtysh reverted to old values"
+      ],
+      "root_causes": [
+        "Operator used 'docker exec bgp vtysh' to configure BGP directly, bypassing CONFIG_DB",
+        "bgpcfgd controls FRR config and re-applies CONFIG_DB state on every restart, overwriting any manual changes",
+        "FRR integrated config mode not enabled -- /etc/frr/bgpd.conf is generated by bgpcfgd from templates, not written directly",
+        "Operator unaware that SONiC architecture separates configuration source of truth (CONFIG_DB) from FRR runtime config"
+      ],
+      "resolution": [
+        "Always use SONiC CLI ('config bgp ...') to make persistent BGP configuration changes",
+        "Check what CONFIG_DB has: 'redis-cli -n 4 KEYS \"BGP*\"' to see all BGP-related CONFIG_DB tables",
+        "Add missing config via SONiC CLI: 'config bgp neighbor <ip> ...'",
+        "Save config: 'config save' to persist CONFIG_DB to /etc/sonic/config_db.json",
+        "Verify FRR picked it up: 'docker exec bgp vtysh -c show running-config' after bgpcfgd processes the change"
+      ],
+      "verify_commands": [
+        {
+          "command": "redis-cli -n 4 KEYS 'BGP*'",
+          "look_for": "BGP_NEIGHBOR, BGP_GLOBALS, BGP_PEER_RANGE entries -- these are the source of truth bgpcfgd uses",
+          "confirms_if": "Missing entry in CONFIG_DB for a neighbor that exists in vtysh confirms the config was made directly in vtysh"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show running-config' | grep -c 'neighbor'",
+          "look_for": "Number of neighbor entries in FRR vs number of BGP_NEIGHBOR entries in CONFIG_DB",
+          "confirms_if": "More neighbors in FRR than CONFIG_DB confirms manual vtysh additions that will be lost on restart"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'BGP_GLOBALS|default'",
+          "look_for": "router_id, local_asn, and global BGP parameters",
+          "confirms_if": "Shows the CONFIG_DB source of truth for global BGP parameters; discrepancy with FRR running-config confirms drift"
+        }
+      ]
+    },
+    {
+      "scenario": "BGP routes received but ECMP paths not installed in hardware",
+      "description": "BGP has multiple equal-cost paths to a prefix (ECMP) but only one path (or none) appears in 'show ip route'. Either BGP multipath is not configured in FRR, or orchagent failed to create the ECMP nexthop group in the ASIC. In data-center spine-leaf fabrics running SONiC with eBGP underlay, ECMP is critical for full bandwidth utilization.",
+      "symptoms": [
+        "'show bgp ipv4 unicast <prefix>' shows multiple paths with '*' (multipath) marker but 'show ip route' shows only one nexthop",
+        "Traffic is not load-balanced across fabric links",
+        "ASIC_DB shows only one nexthop for the route entry where multiple are expected",
+        "orchagent logs show 'Failed to create nexthop group' or ECMP group count exceeded"
+      ],
+      "root_causes": [
+        "BGP multipath not configured in FRR -- 'maximum-paths <n>' not set under address-family",
+        "bgpcfgd template does not include maximum-paths in its FRR config output",
+        "ECMP nexthop group limit exceeded on the ASIC (platform-specific limit -- e.g., 4K or 16K groups)",
+        "AS path length differs between paths and 'bestpath as-path multipath-relax' is not configured for eBGP ECMP in spine-leaf",
+        "orchagent SAI error creating ECMP group -- ASIC resource exhaustion"
+      ],
+      "resolution": [
+        "Configure multipath in FRR: 'maximum-paths <n>' and 'maximum-paths ibgp <n>' under 'address-family ipv4 unicast'",
+        "For eBGP spine-leaf ECMP: add 'bgp bestpath as-path multipath-relax' under 'router bgp'",
+        "Check ECMP group count: 'redis-cli -n 1 KEYS \"ASIC_STATE:SAI_OBJECT_TYPE_NEXT_HOP_GROUP*\" | wc -l'",
+        "Check orchagent logs for nexthop group errors: 'docker logs swss 2>&1 | grep -i \"nexthop group\" | tail -30'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp ipv4 unicast <prefix>'",
+          "look_for": "'*' (multipath) marker on multiple paths; absence of '*' means BGP is not selecting multiple paths",
+          "confirms_if": "Only one path marked '>' with no '*' paths confirms multipath is not configured or not eligible"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show running-config' | grep maximum-paths",
+          "look_for": "'maximum-paths' setting under address-family; absent means ECMP is disabled",
+          "confirms_if": "Missing maximum-paths confirms BGP multipath is not configured in FRR"
+        },
+        {
+          "command": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_NEXT_HOP_GROUP*' | wc -l",
+          "look_for": "Total count of ECMP groups in ASIC_DB; compare against platform ECMP group limit",
+          "confirms_if": "Count at or near platform limit confirms ECMP group resource exhaustion"
+        },
+        {
+          "command": "docker logs swss 2>&1 | grep -i 'nexthop group' | tail -30",
+          "look_for": "SAI errors creating nexthop groups; SAI_STATUS_TABLE_FULL or similar",
+          "confirms_if": "SAI nexthop group creation errors confirm ASIC ECMP resource exhaustion"
+        }
+      ]
+    },
+    {
+      "scenario": "fpmsyncd not forwarding routes from FRR kernel to APPL_DB",
+      "description": "FRR (zebra) has installed routes into the Linux kernel routing table but fpmsyncd, which monitors the kernel netlink socket for route changes and publishes them to APPL_DB ROUTE_TABLE, has stalled or disconnected. Routes exist in 'ip route show' output but never appear in APPL_DB and therefore never reach orchagent or the ASIC.",
+      "symptoms": [
+        "'ip route show' (inside bgp container or host) shows BGP routes in kernel",
+        "APPL_DB ROUTE_TABLE is empty or missing the expected prefixes: 'redis-cli -n 0 KEYS \"ROUTE_TABLE*\"'",
+        "fpmsyncd process shows as RUNNING but has not updated APPL_DB recently",
+        "No orchagent or syncd activity for the affected prefixes",
+        "Routes that appeared briefly in APPL_DB are now stale/missing after fpmsyncd restart"
+      ],
+      "root_causes": [
+        "fpmsyncd lost its netlink socket connection to the kernel and did not reconnect",
+        "fpmsyncd lost its Redis connection to APPL_DB",
+        "FPM (Forwarding Plane Manager) protocol socket between zebra and fpmsyncd is broken",
+        "fpmsyncd crashed and restarted, flushing APPL_DB ROUTE_TABLE entries it owned but not yet re-syncing",
+        "zebra FPM module not loaded or FPM connection not established (check 'docker exec bgp vtysh -c show zebra fpm stats')"
+      ],
+      "resolution": [
+        "Check fpmsyncd: 'docker exec bgp supervisorctl status fpmsyncd'",
+        "Check fpmsyncd logs: 'docker logs bgp 2>&1 | grep fpmsyncd | tail -30'",
+        "Verify FPM connection: 'docker exec bgp vtysh -c \"show zebra fpm stats\"' -- should show connected and messages sent",
+        "Restart fpmsyncd (safe, does not affect BGP sessions): 'docker exec bgp supervisorctl restart fpmsyncd'",
+        "After restart, fpmsyncd re-syncs kernel routes to APPL_DB; verify: 'redis-cli -n 0 KEYS \"ROUTE_TABLE*\" | wc -l'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp supervisorctl status fpmsyncd",
+          "look_for": "fpmsyncd process state -- should be RUNNING",
+          "confirms_if": "STOPPED or FATAL state confirms fpmsyncd is not publishing routes"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show zebra fpm stats'",
+          "look_for": "Connection status (connected/disconnected), messages sent count, last update time",
+          "confirms_if": "Disconnected or zero messages sent confirms FPM socket is broken between zebra and fpmsyncd"
+        },
+        {
+          "command": "redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l",
+          "look_for": "Count of route entries in APPL_DB; should be non-zero if BGP routes are installed in kernel",
+          "confirms_if": "Zero entries when kernel has BGP routes confirms fpmsyncd is not publishing to APPL_DB"
+        },
+        {
+          "command": "docker exec bgp ip route show proto bgp | wc -l",
+          "look_for": "Count of BGP routes in the Linux kernel routing table inside the bgp container",
+          "confirms_if": "Non-zero count in kernel but zero in APPL_DB confirms the fpmsyncd pipeline failure"
+        }
+      ]
+    },
+    {
+      "scenario": "BGP session stuck in OPENSENT -- OPEN parameter mismatch",
+      "description": "The TCP connection succeeds and bgpd sends its OPEN message, but the session never advances to OPENCONFIRM or ESTABLISHED. Instead it returns to ACTIVE or IDLE. The cause is a BGP OPEN message parameter mismatch: the peer sends NOTIFICATION and rejects the OPEN. This generates a Notification message with an OPEN Message Error code.",
+      "symptoms": [
+        "Session briefly reaches OPENSENT or OPENCONFIRM then drops back to ACTIVE/IDLE",
+        "'docker exec bgp vtysh -c \"show bgp neighbors <ip>\"' shows 'Last error: Open Message Error' or 'Bad Peer AS' or 'Unacceptable Hold Time'",
+        "tcpdump on port 179 shows BGP NOTIFICATION packet with error code 2 (OPEN Message Error)",
+        "Session never stays in OPENSENT/OPENCONFIRM for more than a second"
+      ],
+      "root_causes": [
+        "Remote AS number mismatch: 'neighbor <ip> remote-as <N>' does not match peer's actual AS",
+        "Router-ID collision: both sides have the same BGP router-id and collision detection triggers rejection",
+        "Hold time incompatibility: peer proposes hold-time < 3 seconds (RFC minimum) or other end rejects the proposed value",
+        "4-byte ASN capability not supported by peer but local bgpd is advertising it",
+        "MD5 TCP-AO authentication: TCP session has MD5 but session makes it to OPEN stage with wrong hash",
+        "VRF mismatch: neighbor configured in wrong VRF context in FRR",
+        "AFI/SAFI capability mismatch causing one side to send NOTIFICATION"
+      ],
+      "resolution": [
+        "Check last NOTIFICATION: 'docker exec bgp vtysh -c \"show bgp neighbors <ip>\"' -- Last error and Last error subcode fields",
+        "Capture OPEN message: 'sudo tcpdump -i any tcp port 179 -c 50 -w /tmp/bgp.pcap' then inspect OPENs",
+        "Verify remote-as: confirm the peer's configured ASN matches 'neighbor <ip> remote-as' in CONFIG_DB",
+        "Check router-ids: 'docker exec bgp vtysh -c \"show bgp\"' -- compare router-id on both ends",
+        "If hold-time issue: configure compatible 'timers <keepalive> <holdtime>' on both sides"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp neighbors <ip>'",
+          "look_for": "Last error field: error code and subcode (e.g., 'OPEN Message Error/Bad Peer AS', 'Hold Timer Expired', 'Unacceptable Hold Time')",
+          "confirms_if": "OPEN Message Error in Last error field confirms parameter mismatch at session negotiation"
+        },
+        {
+          "command": "sudo tcpdump -i any tcp port 179 -c 30 -nn",
+          "look_for": "BGP NOTIFICATION packet with error code 2 (OPEN Message Error); direction shows which side is rejecting",
+          "confirms_if": "NOTIFICATION from peer with error code 2 confirms peer rejected our OPEN parameters"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'BGP_NEIGHBOR|<ip>'",
+          "look_for": "asn field in CONFIG_DB for this neighbor",
+          "confirms_if": "Correct ASN in CONFIG_DB vs actual peer ASN -- mismatch confirms wrong remote-as configuration"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "type": "transport",
+      "name": "TCP connectivity on port 179",
+      "description": "BGP requires an established TCP session to the peer on port 179. In SONiC the bgp container must have IP reachability to the peer and no iptables/nftables rules blocking TCP/179."
+    },
+    {
+      "type": "daemon",
+      "name": "FRR stack (bgpd + zebra)",
+      "description": "BGP in SONiC runs inside the 'bgp' Docker container via FRR. bgpd handles the BGP FSM and route selection. zebra maintains the kernel RIB and receives routes from bgpd via the FRR inter-process socket. Both must be running for BGP to function."
+    },
+    {
+      "type": "daemon",
+      "name": "bgpcfgd",
+      "description": "Translates CONFIG_DB BGP entries into FRR vtysh commands. Required for any CONFIG_DB-driven BGP configuration to reach FRR. Runs inside the bgp container alongside bgpd."
+    },
+    {
+      "type": "daemon",
+      "name": "fpmsyncd",
+      "description": "Subscribes to Linux kernel netlink events for route changes and publishes them to APPL_DB ROUTE_TABLE. Without fpmsyncd, routes in the kernel RIB never reach orchagent or the ASIC. Runs inside the bgp container."
+    },
+    {
+      "type": "daemon",
+      "name": "orchagent (swss container)",
+      "description": "Consumes APPL_DB ROUTE_TABLE entries and translates them into SAI API calls written to ASIC_DB. Routes are not programmed into hardware until orchagent processes them successfully."
+    },
+    {
+      "type": "daemon",
+      "name": "syncd (syncd container)",
+      "description": "Reads ASIC_DB and calls the vendor SAI library to program the physical ASIC forwarding tables. The final step in the route programming pipeline."
+    },
+    {
+      "type": "database",
+      "name": "CONFIG_DB (Redis DB 4)",
+      "description": "Source of truth for BGP configuration: BGP_NEIGHBOR, BGP_GLOBALS, BGP_PEER_RANGE tables. bgpcfgd reads from here to drive FRR configuration."
+    },
+    {
+      "type": "database",
+      "name": "APPL_DB (Redis DB 0)",
+      "description": "Route publication bus between fpmsyncd and orchagent. Routes must appear in ROUTE_TABLE here before they can reach the ASIC."
+    },
+    {
+      "type": "protocol",
+      "name": "BFD (optional)",
+      "description": "Bidirectional Forwarding Detection provides sub-second peer failure detection. When BFD declares a peer down, it triggers BGP session teardown faster than the Hold Timer. Configured as 'neighbor <ip> bfd' in FRR."
+    }
+  ],
+  "config_db_tables": [
+    {
+      "table": "BGP_NEIGHBOR",
+      "key_pattern": "BGP_NEIGHBOR|<vrf>|<peer-ip>  or  BGP_NEIGHBOR|<peer-ip>",
+      "relevant_fields": [
+        "asn: remote AS number",
+        "name: human-readable neighbor name/description",
+        "local_addr: update-source IP address",
+        "nhopself: next-hop-self (true/false)",
+        "rrclient: route-reflector-client (true/false)",
+        "holdtime: proposed hold timer in seconds",
+        "keepalive: keepalive interval in seconds",
+        "admin_status: up/down (administrative shutdown)",
+        "auth_password: MD5 TCP authentication password",
+        "ebgp_multihop: eBGP multihop TTL value"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'BGP_NEIGHBOR|<ip>'",
+      "redis_command": "redis-cli -n 4 KEYS 'BGP_NEIGHBOR*'"
+    },
+    {
+      "table": "BGP_GLOBALS",
+      "key_pattern": "BGP_GLOBALS|default  (or VRF name)",
+      "relevant_fields": [
+        "local_asn: local AS number",
+        "router_id: BGP router ID (must be unique)",
+        "load_balance_mp_relax: enable multipath-relax for eBGP ECMP (true/false)",
+        "log_nbr_state_changes: log adjacency changes (true/false)",
+        "graceful_restart_enable: graceful restart (true/false)",
+        "gr_restart_time: graceful restart time",
+        "gr_stale_routes_time: stale routes timer"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'BGP_GLOBALS|default'",
+      "redis_command": "redis-cli -n 4 KEYS 'BGP_GLOBALS*'"
+    },
+    {
+      "table": "BGP_PEER_RANGE",
+      "key_pattern": "BGP_PEER_RANGE|default|<group-name>",
+      "relevant_fields": [
+        "name: peer group name",
+        "ip_range: list of IP prefixes for dynamic neighbor matching",
+        "src_intf: source interface for this peer group"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'BGP_PEER_RANGE|default|<group>'",
+      "redis_command": "redis-cli -n 4 KEYS 'BGP_PEER_RANGE*'"
+    },
+    {
+      "table": "ROUTE_TABLE (APPL_DB)",
+      "key_pattern": "ROUTE_TABLE:<prefix/len>",
+      "relevant_fields": [
+        "nexthop: comma-separated list of next-hop IPs (ECMP)",
+        "ifname: egress interface name(s)",
+        "distance: administrative distance",
+        "metric: route metric",
+        "weight: ECMP weight",
+        "nexthop-vrf: VRF for the nexthop (for VRF route leak)"
+      ],
+      "verify_command": "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+      "redis_command": "redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l"
+    },
+    {
+      "table": "BGP_MONITORS",
+      "key_pattern": "BGP_MONITORS|<peer-ip>",
+      "relevant_fields": [
+        "name: monitor description",
+        "asn: monitor peer AS",
+        "ip_addr: monitor peer IP"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'BGP_MONITORS|<ip>'",
+      "redis_command": "redis-cli -n 4 KEYS 'BGP_MONITORS*'"
+    }
+  ],
+  "sonic_notes": [
+    {
+      "note": "BGP in SONiC runs inside the 'bgp' Docker container via FRR (Free Range Routing). The bgpd process handles the BGP FSM, best-path selection, and UPDATE processing. Zebra handles the kernel RIB. Do NOT confuse 'configure BGP' with 'edit vtysh directly' -- bgpcfgd controls the FRR configuration from CONFIG_DB.",
+      "human_error_risk": "HIGH",
+      "source_ref": "sonic-buildimage:src/sonic-frr/ and src/sonic-bgpcfgd/"
+    },
+    {
+      "note": "bgpcfgd translates CONFIG_DB BGP_NEIGHBOR, BGP_GLOBALS, and BGP_PEER_RANGE tables into FRR vtysh commands using Jinja2 templates. It subscribes to CONFIG_DB via redis pub/sub and re-renders on every change. Changes made directly via 'docker exec bgp vtysh' are NOT persisted and will be overwritten on the next bgpcfgd restart or config reload.",
+      "human_error_risk": "HIGH",
+      "source_ref": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/"
+    },
+    {
+      "note": "The BGP route programming pipeline in SONiC is: bgpd (BGP table) -> zebra (kernel RIB) -> fpmsyncd (APPL_DB ROUTE_TABLE) -> orchagent (ASIC_DB SAI route objects) -> syncd (vendor SAI library) -> ASIC forwarding table. A failure at any stage in this pipeline stops routes from reaching hardware. Always check each stage when routes are in FRR but not forwarding.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "sonic-buildimage:src/sonic-swss/orchagent/routeorch.cpp and src/sonic-frr/patch/bgpd_fpm.patch"
+    },
+    {
+      "note": "fpmsyncd connects to zebra via the FPM (Forwarding Plane Manager) protocol, a lightweight socket protocol on localhost port 2620. If the FPM socket breaks (e.g., zebra restart), fpmsyncd must reconnect and resync. Check 'docker exec bgp vtysh -c show zebra fpm stats' to verify the connection is active. Restarting fpmsyncd ('docker exec bgp supervisorctl restart fpmsyncd') is safe and non-disruptive to BGP sessions.",
+      "human_error_risk": "LOW",
+      "source_ref": "sonic-buildimage:src/sonic-frr/ (fpmsyncd) and FRR zebra FPM module"
+    },
+    {
+      "note": "In SONiC, BGP configuration is not in /etc/frr/bgpd.conf as a static file in production. bgpcfgd generates and applies FRR config dynamically. The canonical BGP config lives in CONFIG_DB and is persisted to /etc/sonic/config_db.json via 'config save'. Always run 'config save' after BGP config changes or they will be lost on reboot.",
+      "human_error_risk": "HIGH",
+      "source_ref": "SONiC design doc: Configuration Management"
+    },
+    {
+      "note": "SONiC uses FRR integrated configuration mode ('frr defaults traditional' or 'frr defaults datacenter') depending on the build. In 'datacenter' defaults mode, some BGP behaviors differ from traditional IOS-style FRR defaults: EBGP multihop is more permissive, log-adjacency-changes is on by default, and 'bgp bestpath as-path multipath-relax' may be enabled by default in some SONiC distros.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "FRR documentation: frr defaults and SONiC bgpcfgd template"
+    },
+    {
+      "note": "SONiC BGP does NOT use Cisco-style 'neighbor X route-reflector-client' CLI. Route reflector configuration is in CONFIG_DB BGP_NEIGHBOR table as 'rrclient: true'. bgpcfgd translates this to 'neighbor <ip> route-reflector-client' in FRR. Forgetting this distinction when troubleshooting with vtysh-familiar engineers causes confusion.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/template/bgpd/bgpd.conf.j2"
+    },
+    {
+      "note": "BGP ECMP in SONiC spine-leaf fabrics requires 'load_balance_mp_relax: true' in BGP_GLOBALS|default (CONFIG_DB) which maps to 'bgp bestpath as-path multipath-relax' in FRR. Without this, eBGP ECMP does not work because all spine paths have different AS_PATHs (each spine has a unique AS in typical BGP unnumbered or numbered underlay designs).",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "SONiC BGP design for ECMP and sonic-bgpcfgd globals template"
+    },
+    {
+      "note": "BGP unnumbered (RFC 5549) is widely used in SONiC data-center fabrics. In this model, peering is done over link-local IPv6 addresses without requiring explicit IP address configuration on each BGP neighbor. The neighbor is specified by interface name ('neighbor <ifname> interface remote-as external'). bgpcfgd supports this via BGP_PEER_RANGE with src_intf field. Ensure IPv6 link-local is enabled on the peering interface.",
+      "human_error_risk": "LOW",
+      "source_ref": "RFC 5549 and SONiC BGP unnumbered design"
+    }
+  ],
+  "sonic_frr_mapping": {
+    "frr_process": "bgpd",
+    "frr_config_file": "/etc/frr/bgpd.conf (generated by bgpcfgd; do not edit directly)",
+    "bgpcfgd_source": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/",
+    "config_managed_by": "bgpcfgd (Jinja2 templates rendering CONFIG_DB into FRR vtysh commands)",
+    "container": "bgp",
+    "frr_socket": "/var/run/frr/bgpd.vty",
+    "fpm_port": "localhost:2620 (zebra FPM module to fpmsyncd)",
+    "bgpcfgd_templates": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/template/bgpd/",
+    "supervisor_config": "/etc/supervisor/conf.d/bgpd.conf (inside bgp container)"
+  },
+  "key_commands": [
+    "show bgp summary",
+    "show ip bgp summary",
+    "show bgp neighbors",
+    "show bgp neighbors <ip>",
+    "show bgp ipv4 unicast",
+    "show bgp ipv4 unicast <prefix>",
+    "show ip route bgp",
+    "docker exec bgp vtysh -c 'show bgp summary'",
+    "docker exec bgp vtysh -c 'show bgp neighbors <ip>'",
+    "docker exec bgp vtysh -c 'show bgp ipv4 unicast'",
+    "docker exec bgp vtysh -c 'show bgp nexthop'",
+    "docker exec bgp vtysh -c 'show zebra fpm stats'",
+    "docker exec bgp vtysh -c 'show running-config'",
+    "docker exec bgp supervisorctl status",
+    "redis-cli -n 4 KEYS 'BGP*'",
+    "redis-cli -n 4 HGETALL 'BGP_NEIGHBOR|<ip>'",
+    "redis-cli -n 4 HGETALL 'BGP_GLOBALS|default'",
+    "redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l",
+    "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+    "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | wc -l",
+    "docker logs bgp 2>&1 | grep -i bgpcfgd | tail -30",
+    "docker logs swss 2>&1 | grep -E 'ERROR|route' | tail -30",
+    "sudo ss -tnp | grep 179"
+  ],
+  "related_protocols": [
+    "bfd",
+    "ospfv2",
+    "static-routing",
+    "vxlan-evpn"
+  ],
+  "tags": [
+    "routing",
+    "egp",
+    "path-vector",
+    "inter-as",
+    "ebgp",
+    "ibgp",
+    "frr",
+    "bgpcfgd",
+    "fpmsyncd",
+    "ecmp",
+    "data-center"
+  ]
+}

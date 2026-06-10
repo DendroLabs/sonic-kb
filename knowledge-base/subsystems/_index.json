@@ -1,0 +1,110 @@
+{
+  "swss-container": {
+    "display_name": "Switch State Service (swss)",
+    "container_name": "swss",
+    "startup_order": 3,
+    "purpose": "Central orchestration -- APPL_DB to ASIC_DB translation",
+    "key_daemons": ["orchagent", "portmgrd", "intfmgrd", "vlanmgrd", "neighsyncd", "portsyncd", "routesyncd", "buffermgrd", "coppmgrd", "tunnelmgrd"],
+    "depends_on": ["database-container", "syncd-container"],
+    "critical": true
+  },
+  "bgp-container": {
+    "display_name": "BGP / FRR Container",
+    "container_name": "bgp",
+    "startup_order": 4,
+    "purpose": "FRR routing stack with SONiC integration",
+    "key_daemons": ["bgpd", "zebra", "staticd", "fpmsyncd", "bgpcfgd", "bfdd"],
+    "depends_on": ["database-container", "swss-container"],
+    "critical": true
+  },
+  "syncd-container": {
+    "display_name": "Syncd Container",
+    "container_name": "syncd",
+    "startup_order": 2,
+    "purpose": "SAI to vendor ASIC SDK bridge",
+    "key_daemons": ["syncd", "dsserve"],
+    "depends_on": ["database-container"],
+    "critical": true
+  },
+  "database-container": {
+    "display_name": "Database Container",
+    "container_name": "database",
+    "startup_order": 1,
+    "purpose": "Central Redis engine for all inter-container communication",
+    "key_daemons": ["redis-server", "redis-sentinel"],
+    "depends_on": [],
+    "critical": true
+  },
+  "teamd-container": {
+    "display_name": "TeamD Container",
+    "container_name": "teamd",
+    "startup_order": 5,
+    "purpose": "LAG/PortChannel management via Linux teamd",
+    "key_daemons": ["teammgrd", "teamsyncd", "teamd"],
+    "depends_on": ["database-container", "swss-container"],
+    "critical": false
+  },
+  "lldp-container": {
+    "display_name": "LLDP Container",
+    "container_name": "lldp",
+    "startup_order": 6,
+    "purpose": "LLDP neighbor discovery",
+    "key_daemons": ["lldpd", "lldpmgrd", "lldp_syncd"],
+    "depends_on": ["database-container"],
+    "critical": false
+  },
+  "pmon-container": {
+    "display_name": "Platform Monitor Container",
+    "container_name": "pmon",
+    "startup_order": 7,
+    "purpose": "Hardware monitoring -- fans, PSUs, transceivers, LEDs",
+    "key_daemons": ["psud", "syseepromd", "xcvrd", "thermalctld", "ledmgrd", "pcied"],
+    "depends_on": ["database-container"],
+    "critical": false
+  },
+  "radv-container": {
+    "display_name": "Router Advertisement Container",
+    "container_name": "radv",
+    "startup_order": 8,
+    "purpose": "IPv6 Router Advertisement daemon (radvd) for SLAAC prefix announcement",
+    "key_daemons": ["radvd", "radv_conf_mgr"],
+    "depends_on": ["database-container"],
+    "critical": false
+  },
+  "dhcp-relay-container": {
+    "display_name": "DHCP Relay Container",
+    "container_name": "dhcp_relay",
+    "startup_order": 9,
+    "purpose": "DHCP relay agent for forwarding DHCP requests across L3 boundaries",
+    "key_daemons": ["dhcrelay", "dhcp6relay", "dhcpmon"],
+    "depends_on": ["database-container"],
+    "critical": false
+  },
+  "snmp-container": {
+    "display_name": "SNMP Container",
+    "container_name": "snmp",
+    "startup_order": 10,
+    "purpose": "SNMP agent for network management polling and traps",
+    "key_daemons": ["snmpd", "snmp_subagent"],
+    "depends_on": ["database-container"],
+    "critical": false
+  },
+  "telemetry-container": {
+    "display_name": "Telemetry Container",
+    "container_name": "telemetry",
+    "startup_order": 11,
+    "purpose": "gRPC-based streaming telemetry (gNMI) for state and counters",
+    "key_daemons": ["telemetry", "dialout_client"],
+    "depends_on": ["database-container"],
+    "critical": false
+  },
+  "macsec-container": {
+    "display_name": "MACsec Container",
+    "container_name": "macsec",
+    "startup_order": 12,
+    "purpose": "IEEE 802.1AE MACsec key agreement and SA management",
+    "key_daemons": ["wpa_supplicant"],
+    "depends_on": ["database-container", "swss-container"],
+    "critical": false
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "daemon": "syncd",
+  "log_file": "/var/log/syncd.log",
+  "container": "syncd",
+  "messages": [
+    {
+      "log_id": "log:syncd:sai-init-fail",
+      "pattern": "sai_api_initialize.*fail|SAI initialization failed",
+      "meaning": "syncd failed to initialize the SAI API -- cannot communicate with ASIC",
+      "severity": "CRITICAL",
+      "likely_causes": [
+        "Vendor SAI library (libsai.so) missing or corrupt",
+        "ASIC hardware failure or not detected",
+        "Kernel driver for ASIC not loaded",
+        "Incompatible SAI library version"
+      ],
+      "next_steps": [
+        "Check if ASIC kernel module is loaded: lsmod | grep <vendor>",
+        "Check dmesg for hardware errors: dmesg | tail -50",
+        "Verify libsai.so exists: docker exec syncd ls -la /usr/lib/libsai*",
+        "Try cold reboot: sudo reboot"
+      ],
+      "related_code_path": "",
+      "source_ref": "sonic-sairedis:syncd/VendorSai.cpp"
+    },
+    {
+      "log_id": "log:syncd:sai-status-failure",
+      "pattern": "SAI_STATUS_FAILURE|SAI_STATUS_NOT_SUPPORTED|SAI_STATUS_TABLE_FULL",
+      "meaning": "SAI API call returned an error status from the vendor ASIC SDK",
+      "severity": "ERROR",
+      "likely_causes": [
+        "SAI_STATUS_TABLE_FULL: ASIC table capacity reached",
+        "SAI_STATUS_NOT_SUPPORTED: Feature not supported on this platform",
+        "SAI_STATUS_FAILURE: Generic vendor SDK error",
+        "SAI_STATUS_INVALID_PARAMETER: Bad parameter from orchagent"
+      ],
+      "next_steps": [
+        "Decode the specific SAI status code from the log",
+        "Check ASIC resource usage: crm show resources all",
+        "Check platform capabilities with vendor documentation",
+        "If TABLE_FULL: reduce route/ACL/neighbor count or change TCAM profile"
+      ],
+      "related_code_path": "route-install-bgp",
+      "source_ref": "sonic-sairedis:syncd/Syncd.cpp"
+    },
+    {
+      "log_id": "log:syncd:notification",
+      "pattern": "FDB.*event|port.*state.*notification|BFD.*session",
+      "meaning": "ASIC hardware notification received -- FDB learning event, port state change, or BFD session event",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "Normal ASIC operation -- hardware events propagated to software",
+        "FDB: MAC address learned/aged/moved",
+        "Port: Physical link state change detected by PHY"
+      ],
+      "next_steps": [
+        "Usually informational -- no action needed unless excessive",
+        "High rate of FDB notifications may indicate MAC flapping",
+        "High rate of port notifications may indicate link instability"
+      ],
+      "related_code_path": "",
+      "source_ref": "sonic-sairedis:syncd/NotificationProcessor.cpp"
+    }
+  ]
+}

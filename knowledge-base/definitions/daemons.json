@@ -1,0 +1,535 @@
+[
+  {
+    "def_id": "daemon:orchagent",
+    "process_name": "orchagent",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "orchagent/orchdaemon.cpp",
+    "purpose": "Central orchestration agent. Subscribes to APPL_DB tables (routes, neighbors, ports, VLANs, ACLs, tunnels) and translates each desired-state entry into SAI API calls written to ASIC_DB. Syncd consumes ASIC_DB to drive the vendor SDK. Orchagent is the single point of ASIC programming for all SONiC features.",
+    "subscribes_to": [
+      "db:appl_db"
+    ],
+    "writes_to": [
+      "db:asic_db",
+      "db:flex_counter_db",
+      "db:appl_state_db",
+      "db:state_db"
+    ],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarting swss tears down and rebuilds all SAI state. Causes a brief forwarding interruption while orchagent replays APPL_DB into ASIC_DB. On platforms without Warm Reboot, this resets hardware forwarding tables.",
+    "restart_safe": false,
+    "related_daemons": [
+      "daemon:syncd",
+      "daemon:fpmsyncd",
+      "daemon:portsyncd",
+      "daemon:neighsyncd"
+    ]
+  },
+  {
+    "def_id": "daemon:syncd",
+    "process_name": "syncd",
+    "container": "syncd",
+    "repo": "sonic-sairedis",
+    "source_path": "syncd/Syncd.cpp",
+    "purpose": "SAI-to-SDK bridge. Consumes ASIC_DB entries written by orchagent and calls the vendor SAI implementation (libsai.so) to program the forwarding ASIC. Also polls ASIC counters via the flex-counter framework and publishes them to COUNTERS_DB. Vendor-specific; each platform ships its own libsai.",
+    "subscribes_to": [
+      "db:asic_db",
+      "db:flex_counter_db"
+    ],
+    "writes_to": [
+      "db:counters_db",
+      "db:state_db"
+    ],
+    "restart_command": "sudo systemctl restart syncd",
+    "restart_warning": "Restarting syncd without Warm Reboot causes a hardware forwarding reset. All programmed SAI objects are destroyed; orchagent must replay the full ASIC_DB to restore state. Traffic loss for the duration of the replay.",
+    "restart_safe": false,
+    "related_daemons": [
+      "daemon:orchagent"
+    ]
+  },
+  {
+    "def_id": "daemon:fpmsyncd",
+    "process_name": "fpmsyncd",
+    "container": "bgp",
+    "repo": "sonic-swss",
+    "source_path": "fpmsyncd/fpmsyncd.cpp",
+    "purpose": "FPM (Forwarding Plane Manager) synchronization daemon. Receives RIB updates from FRR's zebra process via the FPM socket (Unix socket, default port 2620) and writes them as ROUTE_TABLE entries into APPL_DB. Bridges the FRR routing stack and the SONiC forwarding pipeline.",
+    "subscribes_to": [
+      "frr:zebra (FPM socket)"
+    ],
+    "writes_to": [
+      "db:appl_db"
+    ],
+    "restart_command": "sudo systemctl restart bgp",
+    "restart_warning": "Restarting the bgp container restarts FRR (bgpd, zebra, staticd) and fpmsyncd together. BGP sessions will drop; routes will be withdrawn and re-installed after reconvergence.",
+    "restart_safe": false,
+    "related_daemons": [
+      "daemon:bgpcfgd",
+      "daemon:orchagent"
+    ]
+  },
+  {
+    "def_id": "daemon:bgpcfgd",
+    "process_name": "bgpcfgd",
+    "container": "bgp",
+    "repo": "sonic-buildimage",
+    "source_path": "src/sonic-bgpcfgd/bgpcfgd/main.py",
+    "purpose": "BGP configuration daemon. Watches CONFIG_DB for BGP neighbor, peer-group, prefix-list, route-map, and global ASN changes and translates them into FRR vtysh configuration commands applied live. Ensures FRR configuration stays in sync with CONFIG_DB without requiring a BGP container restart.",
+    "subscribes_to": [
+      "db:config_db"
+    ],
+    "writes_to": [
+      "frr:bgpd (via vtysh)"
+    ],
+    "restart_command": "sudo systemctl restart bgp",
+    "restart_warning": "Restarting bgp container drops all BGP sessions. FRR will re-read its startup config and bgpcfgd will replay CONFIG_DB entries. Expect full BGP reconvergence delay.",
+    "restart_safe": false,
+    "related_daemons": [
+      "daemon:fpmsyncd"
+    ]
+  },
+  {
+    "def_id": "daemon:portsyncd",
+    "process_name": "portsyncd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "portsyncd/portsyncd.cpp",
+    "purpose": "Port synchronization daemon. Reads port configuration (speed, MTU, admin state, FEC mode, auto-negotiation) from CONFIG_DB and writes desired state to APPL_DB:PORT_TABLE. Also monitors netlink events for kernel-level link state changes and publishes them to STATE_DB:PORT_TABLE, gating other daemons that wait for port readiness.",
+    "subscribes_to": [
+      "db:config_db",
+      "kernel:netlink (link events)"
+    ],
+    "writes_to": [
+      "db:appl_db",
+      "db:state_db"
+    ],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarting swss restarts the entire swss container including orchagent. See orchagent restart warning.",
+    "restart_safe": false,
+    "related_daemons": [
+      "daemon:orchagent",
+      "daemon:portmgrd"
+    ]
+  },
+  {
+    "def_id": "daemon:neighsyncd",
+    "process_name": "neighsyncd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "neighsyncd/neighsyncd.cpp",
+    "purpose": "Neighbor synchronization daemon. Monitors the kernel ARP/NDP table via netlink NEIGH events and writes resolved neighbor entries (IP-to-MAC mappings) to APPL_DB:NEIGH_TABLE. Orchagent converts these into SAI neighbor and next-hop objects in ASIC_DB.",
+    "subscribes_to": [
+      "kernel:netlink (neigh events)",
+      "db:state_db"
+    ],
+    "writes_to": [
+      "db:appl_db"
+    ],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarting swss flushes APPL_DB neighbor entries. Hardware ARP/NDP table is rebuilt from kernel state after restart. Expect brief traffic blackholing for connected hosts while neighbors are re-resolved.",
+    "restart_safe": false,
+    "related_daemons": [
+      "daemon:orchagent",
+      "daemon:portsyncd"
+    ]
+  },
+  {
+    "def_id": "daemon:portmgrd",
+    "process_name": "portmgrd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "cfgmgr/portmgrd.cpp",
+    "purpose": "Port manager daemon. Subscribes to CONFIG_DB:PORT table and applies port configuration to the Linux kernel (via netlink/ip commands): sets MTU, admin state (ip link set up/down), and interface description. Counterpart to portsyncd; portmgrd handles the kernel side while portsyncd handles the SAI/APPL_DB side.",
+    "subscribes_to": [
+      "db:config_db",
+      "db:state_db"
+    ],
+    "writes_to": [
+      "kernel:netlink",
+      "db:state_db"
+    ],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarting swss restarts the entire swss container. See orchagent restart warning.",
+    "restart_safe": false,
+    "related_daemons": [
+      "daemon:portsyncd",
+      "daemon:intfmgrd"
+    ]
+  },
+  {
+    "def_id": "daemon:intfmgrd",
+    "process_name": "intfmgrd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "cfgmgr/intfmgrd.cpp",
+    "purpose": "Interface manager daemon. Subscribes to CONFIG_DB:INTERFACE and CONFIG_DB:VLAN_INTERFACE tables and applies IP address assignments to Linux kernel interfaces. Writes interface entries to APPL_DB for orchagent to create the corresponding RIF (Router Interface) SAI objects. Handles IPv4 and IPv6 address add/delete events.",
+    "subscribes_to": [
+      "db:config_db",
+      "db:state_db"
+    ],
+    "writes_to": [
+      "db:appl_db",
+      "kernel:netlink"
+    ],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarting swss restarts the entire swss container. See orchagent restart warning.",
+    "restart_safe": false,
+    "related_daemons": [
+      "daemon:portmgrd",
+      "daemon:vlanmgrd",
+      "daemon:orchagent"
+    ]
+  },
+  {
+    "def_id": "daemon:vlanmgrd",
+    "process_name": "vlanmgrd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "cfgmgr/vlanmgrd.cpp",
+    "purpose": "VLAN manager daemon. Subscribes to CONFIG_DB:VLAN and CONFIG_DB:VLAN_MEMBER tables and creates/destroys Linux VLAN bridge interfaces and bridge FDB entries. Writes VLAN and VLAN member entries to APPL_DB so orchagent can create the corresponding SAI VLAN objects and port membership.",
+    "subscribes_to": [
+      "db:config_db",
+      "db:state_db"
+    ],
+    "writes_to": [
+      "db:appl_db",
+      "kernel:netlink"
+    ],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarting swss restarts the entire swss container. See orchagent restart warning.",
+    "restart_safe": false,
+    "related_daemons": [
+      "daemon:intfmgrd",
+      "daemon:orchagent"
+    ]
+  },
+  {
+    "def_id": "daemon:teammgrd",
+    "process_name": "teammgrd",
+    "container": "teamd",
+    "repo": "sonic-buildimage",
+    "source_path": "dockers/docker-teamd/teammgrd.py",
+    "purpose": "Team (LAG/PortChannel) manager daemon. Subscribes to CONFIG_DB:PORTCHANNEL and CONFIG_DB:PORTCHANNEL_MEMBER tables and manages the teamd (libteam) process lifecycle: starts/stops a teamd instance per PortChannel and adds/removes member ports. Writes LAG state to APPL_DB:LAG_TABLE for orchagent.",
+    "subscribes_to": [
+      "db:config_db",
+      "db:state_db"
+    ],
+    "writes_to": [
+      "db:appl_db",
+      "db:state_db"
+    ],
+    "restart_command": "sudo systemctl restart teamd",
+    "restart_warning": "Restarting the teamd container causes all LACP sessions to drop momentarily. PortChannel interfaces will briefly go down; traffic on LAG members will fall back to individual links or blackhole depending on upstream switch behavior.",
+    "restart_safe": false,
+    "related_daemons": [
+      "daemon:teamsyncd",
+      "daemon:orchagent"
+    ]
+  },
+  {
+    "def_id": "daemon:teamsyncd",
+    "process_name": "teamsyncd",
+    "container": "teamd",
+    "repo": "sonic-swss",
+    "source_path": "teamsyncd/teamsyncd.cpp",
+    "purpose": "Team synchronization daemon. Subscribes to LAG state changes from the teamd processes (via libteamdctl) and publishes LAG member port state (selected/deselected by LACP) to APPL_DB:LAG_MEMBER_TABLE. Orchagent uses this to add or remove ports from the SAI LAG object.",
+    "subscribes_to": [
+      "teamd (via libteamdctl socket)",
+      "db:state_db"
+    ],
+    "writes_to": [
+      "db:appl_db"
+    ],
+    "restart_command": "sudo systemctl restart teamd",
+    "restart_warning": "See teammgrd restart warning. teamsyncd runs in the same container.",
+    "restart_safe": false,
+    "related_daemons": [
+      "daemon:teammgrd",
+      "daemon:orchagent"
+    ]
+  },
+  {
+    "def_id": "daemon:lldpsyncd",
+    "process_name": "lldpsyncd",
+    "container": "lldp",
+    "repo": "sonic-buildimage",
+    "source_path": "dockers/docker-lldp/lldpsyncd.py",
+    "purpose": "LLDP synchronization daemon. Polls the lldpd process for neighbor information (via lldpcli) and publishes discovered LLDP neighbor entries to APPL_DB:LLDP_ENTRY_TABLE. These entries are used by the topology discovery CLI and optionally by lldpmgrd for interface description auto-population.",
+    "subscribes_to": [
+      "lldpd (via lldpcli)"
+    ],
+    "writes_to": [
+      "db:appl_db"
+    ],
+    "restart_command": "sudo systemctl restart lldp",
+    "restart_warning": "Restarting the lldp container causes lldpd to restart, dropping all active LLDP sessions. Neighbors will take up to one tx-interval (default 30s) to be re-learned.",
+    "restart_safe": true,
+    "related_daemons": [
+      "daemon:lldpmgrd"
+    ]
+  },
+  {
+    "def_id": "daemon:lldpmgrd",
+    "process_name": "lldpmgrd",
+    "container": "lldp",
+    "repo": "sonic-buildimage",
+    "source_path": "dockers/docker-lldp/lldpmgrd.py",
+    "purpose": "LLDP manager daemon. Subscribes to CONFIG_DB:DEVICE_METADATA and CONFIG_DB:PORT tables and configures the lldpd process accordingly: sets the chassis ID, system description, and per-port LLDP parameters (admin status, tx/rx enable). Translates SONiC CONFIG_DB intent into lldpcli commands.",
+    "subscribes_to": [
+      "db:config_db"
+    ],
+    "writes_to": [
+      "lldpd (via lldpcli)"
+    ],
+    "restart_command": "sudo systemctl restart lldp",
+    "restart_warning": "See lldpsyncd restart warning. lldpmgrd runs in the same container.",
+    "restart_safe": true,
+    "related_daemons": [
+      "daemon:lldpsyncd"
+    ]
+  },
+  {
+    "def_id": "daemon:xcvrd",
+    "process_name": "xcvrd",
+    "container": "pmon",
+    "repo": "sonic-platform-daemons",
+    "source_path": "sonic-xcvrd/xcvrd/xcvrd.py",
+    "purpose": "Transceiver daemon. Manages pluggable optics and DAC cables: reads EEPROM data (vendor, part number, serial, DOM measurements) from SFP/QSFP/OSFP modules via the platform SFP API and publishes it to STATE_DB:TRANSCEIVER_INFO and STATE_DB:TRANSCEIVER_DOM_SENSOR tables. Also handles module initialization sequences and high-power module power-up state machines.",
+    "subscribes_to": [
+      "platform:sfp_api (EEPROM reads)",
+      "db:config_db",
+      "db:state_db"
+    ],
+    "writes_to": [
+      "db:state_db"
+    ],
+    "restart_command": "sudo systemctl restart pmon",
+    "restart_warning": "Restarting pmon restarts all platform monitoring daemons (xcvrd, psud, thermalctld, syseepromd). DOM and transceiver state will be briefly unavailable. No forwarding impact; purely monitoring.",
+    "restart_safe": true,
+    "related_daemons": []
+  },
+  {
+    "def_id": "daemon:nbrmgrd",
+    "process_name": "nbrmgrd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "cfgmgr/nbrmgrd.cpp",
+    "purpose": "Neighbor manager daemon. Manages static ARP/NDP entries and neighbor probing from CONFIG_DB. Writes neighbor entries to kernel via netlink.",
+    "subscribes_to": ["db:config_db"],
+    "writes_to": ["kernel:netlink"],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarts entire swss container. See orchagent restart warning.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:neighsyncd"]
+  },
+  {
+    "def_id": "daemon:buffermgrd",
+    "process_name": "buffermgrd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "cfgmgr/buffermgrd.cpp",
+    "purpose": "Buffer manager daemon. Translates CONFIG_DB buffer pool/profile/PG/queue configuration into APPL_DB entries for orchagent to program SAI buffer objects.",
+    "subscribes_to": ["db:config_db", "db:state_db"],
+    "writes_to": ["db:appl_db"],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarts entire swss container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:orchagent"]
+  },
+  {
+    "def_id": "daemon:coppmgrd",
+    "process_name": "coppmgrd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "cfgmgr/coppmgrd.cpp",
+    "purpose": "CoPP (Control Plane Policing) manager daemon. Reads COPP_TABLE from CONFIG_DB and writes CoPP trap/policer entries to APPL_DB for orchagent to program in SAI.",
+    "subscribes_to": ["db:config_db"],
+    "writes_to": ["db:appl_db"],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarts entire swss container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:orchagent"]
+  },
+  {
+    "def_id": "daemon:tunnelmgrd",
+    "process_name": "tunnelmgrd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "cfgmgr/tunnelmgrd.cpp",
+    "purpose": "Tunnel manager daemon. Manages VXLAN tunnel configuration from CONFIG_DB and writes tunnel entries to APPL_DB for orchagent VxlanTunnelOrch.",
+    "subscribes_to": ["db:config_db"],
+    "writes_to": ["db:appl_db"],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarts entire swss container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:orchagent"]
+  },
+  {
+    "def_id": "daemon:sflowmgrd",
+    "process_name": "sflowmgrd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "cfgmgr/sflowmgrd.cpp",
+    "purpose": "sFlow manager daemon. Manages sFlow sampling configuration from CONFIG_DB.",
+    "subscribes_to": ["db:config_db"],
+    "writes_to": ["db:appl_db"],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarts entire swss container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:orchagent"]
+  },
+  {
+    "def_id": "daemon:natmgrd",
+    "process_name": "natmgrd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "cfgmgr/natmgrd.cpp",
+    "purpose": "NAT manager daemon. Manages NAT/NAPT configuration from CONFIG_DB.",
+    "subscribes_to": ["db:config_db"],
+    "writes_to": ["db:appl_db", "kernel:iptables"],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarts entire swss container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:orchagent"]
+  },
+  {
+    "def_id": "daemon:macsecmgrd",
+    "process_name": "macsecmgrd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "cfgmgr/macsecmgrd.cpp",
+    "purpose": "MACsec manager daemon. Manages MACsec encryption configuration from CONFIG_DB.",
+    "subscribes_to": ["db:config_db"],
+    "writes_to": ["db:appl_db"],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarts entire swss container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:orchagent"]
+  },
+  {
+    "def_id": "daemon:routesyncd",
+    "process_name": "routesyncd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "routesyncd/routesyncd.cpp",
+    "purpose": "Route synchronization daemon. Monitors kernel routing table via netlink for directly-connected and locally-originated routes, writes them to APPL_DB:ROUTE_TABLE.",
+    "subscribes_to": ["kernel:netlink (route events)"],
+    "writes_to": ["db:appl_db"],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "Restarts entire swss container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:orchagent", "daemon:fpmsyncd"]
+  },
+  {
+    "def_id": "daemon:bgpd",
+    "process_name": "bgpd",
+    "container": "bgp",
+    "repo": "sonic-frr",
+    "source_path": "bgpd/bgp_main.c",
+    "purpose": "FRR BGP daemon. Implements BGP-4 protocol: establishes sessions, exchanges routes, runs best-path selection. Managed by bgpcfgd; do not configure directly via vtysh.",
+    "subscribes_to": ["frr:zebra (ZAPI)"],
+    "writes_to": ["frr:zebra (ZAPI)"],
+    "restart_command": "sudo systemctl restart bgp",
+    "restart_warning": "Restarts entire bgp container. All BGP sessions will drop.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:zebra", "daemon:bgpcfgd"]
+  },
+  {
+    "def_id": "daemon:zebra",
+    "process_name": "zebra",
+    "container": "bgp",
+    "repo": "sonic-frr",
+    "source_path": "zebra/main.c",
+    "purpose": "FRR Zebra daemon. Central RIB manager for FRR. Receives routes from all FRR protocol daemons, selects best route, programs kernel FIB via netlink, and notifies fpmsyncd via FPM socket.",
+    "subscribes_to": ["frr:bgpd", "frr:ospfd", "frr:staticd"],
+    "writes_to": ["kernel:netlink", "fpmsyncd (FPM socket)"],
+    "restart_command": "sudo systemctl restart bgp",
+    "restart_warning": "Restarts entire bgp container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:bgpd", "daemon:fpmsyncd"]
+  },
+  {
+    "def_id": "daemon:staticd",
+    "process_name": "staticd",
+    "container": "bgp",
+    "repo": "sonic-frr",
+    "source_path": "staticd/static_main.c",
+    "purpose": "FRR static route daemon. Manages static routes configured via FRR and installs them into zebra RIB.",
+    "subscribes_to": ["frr:zebra (ZAPI)"],
+    "writes_to": ["frr:zebra (ZAPI)"],
+    "restart_command": "sudo systemctl restart bgp",
+    "restart_warning": "Restarts entire bgp container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:zebra"]
+  },
+  {
+    "def_id": "daemon:frrcfgd",
+    "process_name": "frrcfgd",
+    "container": "bgp",
+    "repo": "sonic-buildimage",
+    "source_path": "src/sonic-frr-mgmt-framework/frrcfgd/frrcfgd.py",
+    "purpose": "Unified FRR configuration daemon (alternative to bgpcfgd). Event-driven CONFIG_DB subscriber that supports OSPF, VRFs, IGMP, PIM in addition to BGP. Enabled by setting frr_mgmt_framework_config=true in DEVICE_METADATA.",
+    "subscribes_to": ["db:config_db"],
+    "writes_to": ["frr (via vtysh)"],
+    "restart_command": "sudo systemctl restart bgp",
+    "restart_warning": "Restarts entire bgp container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:bgpcfgd"]
+  },
+  {
+    "def_id": "daemon:ospfd",
+    "process_name": "ospfd",
+    "container": "bgp",
+    "repo": "sonic-frr",
+    "source_path": "ospfd/ospf_main.c",
+    "purpose": "FRR OSPF daemon. Implements OSPFv2 protocol.",
+    "subscribes_to": ["frr:zebra (ZAPI)"],
+    "writes_to": ["frr:zebra (ZAPI)"],
+    "restart_command": "sudo systemctl restart bgp",
+    "restart_warning": "Restarts entire bgp container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:zebra"]
+  },
+  {
+    "def_id": "daemon:ospf6d",
+    "process_name": "ospf6d",
+    "container": "bgp",
+    "repo": "sonic-frr",
+    "source_path": "ospf6d/ospf6_main.c",
+    "purpose": "FRR OSPFv3 daemon. Implements OSPFv3 for IPv6.",
+    "subscribes_to": ["frr:zebra (ZAPI)"],
+    "writes_to": ["frr:zebra (ZAPI)"],
+    "restart_command": "sudo systemctl restart bgp",
+    "restart_warning": "Restarts entire bgp container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:zebra"]
+  },
+  {
+    "def_id": "daemon:isisd",
+    "process_name": "isisd",
+    "container": "bgp",
+    "repo": "sonic-frr",
+    "source_path": "isisd/isis_main.c",
+    "purpose": "FRR IS-IS daemon. Implements IS-IS protocol.",
+    "subscribes_to": ["frr:zebra (ZAPI)"],
+    "writes_to": ["frr:zebra (ZAPI)"],
+    "restart_command": "sudo systemctl restart bgp",
+    "restart_warning": "Restarts entire bgp container.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:zebra"]
+  },
+  {
+    "def_id": "daemon:bfdd",
+    "process_name": "bfdd",
+    "container": "bgp",
+    "repo": "sonic-frr",
+    "source_path": "bfdd/bfdd.c",
+    "purpose": "FRR BFD daemon. Implements Bidirectional Forwarding Detection for sub-second failure detection.",
+    "subscribes_to": ["frr:zebra (ZAPI)"],
+    "writes_to": ["frr:zebra (ZAPI)"],
+    "restart_command": "sudo systemctl restart bgp",
+    "restart_warning": "Restarts entire bgp container. All BFD sessions will drop, triggering protocol failovers.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:zebra", "daemon:bgpd"]
+  }
+]

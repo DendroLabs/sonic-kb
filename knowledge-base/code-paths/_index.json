@@ -1,0 +1,27 @@
+{
+  "route-install-bgp": {
+    "display_name": "BGP learned route installation to ASIC",
+    "trigger": "BGP session receives UPDATE with new prefix",
+    "entity_type": "route"
+  },
+  "route-install-static": {
+    "display_name": "Static route installation to ASIC",
+    "trigger": "User configures a static route via config CLI",
+    "entity_type": "route"
+  },
+  "port-config": {
+    "display_name": "Port configuration change",
+    "trigger": "User changes port speed, MTU, or admin state",
+    "entity_type": "port"
+  },
+  "vlan-create": {
+    "display_name": "VLAN creation and member assignment",
+    "trigger": "User creates a VLAN and adds member ports",
+    "entity_type": "vlan"
+  },
+  "lag-create": {
+    "display_name": "LAG/PortChannel creation",
+    "trigger": "User creates a PortChannel and adds member ports",
+    "entity_type": "lag"
+  }
+}

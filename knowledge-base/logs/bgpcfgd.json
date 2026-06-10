@@ -1,0 +1,58 @@
+{
+  "daemon": "bgpcfgd",
+  "log_file": "/var/log/syslog (tagged bgp#bgpcfgd)",
+  "container": "bgp",
+  "messages": [
+    {
+      "log_id": "log:bgpcfgd:template-error",
+      "pattern": "template.*error|jinja2.*error|TemplateSyntaxError",
+      "meaning": "bgpcfgd failed to render a Jinja2 template for FRR configuration",
+      "severity": "ERROR",
+      "likely_causes": [
+        "Invalid or missing fields in CONFIG_DB BGP tables",
+        "Custom template modification broke Jinja2 syntax",
+        "bgpcfgd code bug after SONiC upgrade"
+      ],
+      "next_steps": [
+        "Check CONFIG_DB BGP entries: redis-cli -n 4 KEYS 'BGP_*'",
+        "Check template: cat /usr/share/sonic/templates/bgpd.conf.j2",
+        "Check bgpcfgd logs: journalctl -u bgp | grep bgpcfgd | tail -30",
+        "Try regenerating: sonic-cfggen -d -t /usr/share/sonic/templates/bgpd.conf.j2"
+      ],
+      "related_code_path": "route-install-bgp",
+      "source_ref": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/template.py"
+    },
+    {
+      "log_id": "log:bgpcfgd:vtysh-fail",
+      "pattern": "vtysh.*failed|vtysh.*error|vtysh.*command rejected",
+      "meaning": "bgpcfgd's vtysh command to configure FRR was rejected",
+      "severity": "ERROR",
+      "likely_causes": [
+        "FRR (bgpd) rejected the configuration command",
+        "Syntax error in generated vtysh command",
+        "FRR is not running or crashed"
+      ],
+      "next_steps": [
+        "Check FRR status: docker exec bgp supervisorctl status",
+        "Try the vtysh command manually: docker exec bgp vtysh -c '<command>'",
+        "Check FRR log: docker exec bgp cat /var/log/frr/bgpd.log | tail -30"
+      ],
+      "related_code_path": "",
+      "source_ref": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/"
+    },
+    {
+      "log_id": "log:bgpcfgd:config-sync",
+      "pattern": "CONFIG_DB.*update|neighbor.*added|neighbor.*removed",
+      "meaning": "bgpcfgd detected a CONFIG_DB change and is syncing to FRR",
+      "severity": "INFO",
+      "likely_causes": [
+        "Normal operation -- user made a config change via CLI/API"
+      ],
+      "next_steps": [
+        "Usually informational -- verify the change took effect in FRR: docker exec bgp vtysh -c 'show running-config'"
+      ],
+      "related_code_path": "",
+      "source_ref": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/"
+    }
+  ]
+}

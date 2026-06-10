@@ -1,0 +1,60 @@
+{
+  "error_id": "direct-frr-vtysh",
+  "display_name": "Direct FRR configuration via docker exec bgp vtysh bypassing bgpcfgd",
+  "severity": "HIGH",
+  "category": "config-integrity",
+  "sonic_version": "202511",
+  "pattern": "Engineer connects directly to the FRR daemon inside the bgp container using 'docker exec -it bgp vtysh' and issues configuration commands (router bgp, neighbor, route-map, prefix-list, etc.) instead of using the SONiC config CLI or editing CONFIG_DB. Changes take effect immediately in FRR but are invisible to bgpcfgd and are not saved in CONFIG_DB.",
+  "what_goes_wrong": "In SONiC 202511, bgpcfgd is the authoritative translator between CONFIG_DB and FRR. It watches CONFIG_DB via swsscommon's SubscriberStateTable and generates FRR configuration by rendering Jinja2 templates (in /usr/share/sonic/templates/bgpd.conf.j2 and frr.conf.j2), then calls 'vtysh -f' to apply them. Any configuration written directly via vtysh is not reflected in CONFIG_DB, not persisted to /etc/sonic/config_db.json, and will be silently overwritten the next time bgpcfgd renders and applies its template -- which happens on bgp container restart, 'config reload', or when bgpcfgd processes any CONFIG_DB change event that triggers a full FRR config regeneration.",
+  "symptoms": [
+    "BGP neighbor comes up after vtysh change but drops after 'config reload' or bgp container restart with no config CLI change made",
+    "'show bgp summary' shows a neighbor or route-map that is absent from 'show running-config' (SONiC config CLI output)",
+    "After bgp container restart: 'show bgp summary' reverts to state matching CONFIG_DB, losing the vtysh-applied changes",
+    "Route-map or prefix-list applied in vtysh is visible in 'vtysh -c \"show running-config\"' but absent from 'config list bgp' or the CONFIG_DB BGP_NEIGHBOR table",
+    "bgpcfgd log shows 'Generating FRR config' after a CONFIG_DB event, then FRR config reverts to the generated template",
+    "Engineer reports 'I fixed the BGP config this morning but it broke again after the container crashed'"
+  ],
+  "detection_commands": [
+    {
+      "command": "diff <(docker exec bgp vtysh -c 'show running-config' 2>/dev/null) <(docker exec bgp python3 /usr/lib/python3/dist-packages/bgpcfgd/bgpcfgd.py --print-config 2>/dev/null || sonic-cfggen -d -t /usr/share/sonic/templates/frr.conf.j2 2>/dev/null) | head -60",
+      "purpose": "Diff the live FRR running config (what vtysh sees) against what bgpcfgd would generate from the current CONFIG_DB state. Lines present in FRR but absent from the generated config were added via direct vtysh and will be lost on the next bgpcfgd render."
+    },
+    {
+      "command": "docker exec bgp vtysh -c 'show running-config' 2>/dev/null | grep -vE '^(Building|Current|!|\\s*$)' | sort > /tmp/frr_live.txt && sonic-cfggen -d -t /usr/share/sonic/templates/frr.conf.j2 2>/dev/null | grep -vE '^(Building|Current|!|\\s*$)' | sort > /tmp/frr_expected.txt && diff /tmp/frr_live.txt /tmp/frr_expected.txt",
+      "purpose": "Sorted diff to identify neighbor statements, route-maps, or prefix-lists present in the live FRR config but not in the CONFIG_DB-derived template. Each '< ' line is a direct-vtysh addition that will be lost on restart."
+    },
+    {
+      "command": "redis-cli -n 4 KEYS 'BGP_NEIGHBOR|*' | sort",
+      "purpose": "List all BGP neighbors known to CONFIG_DB. Compare against 'docker exec bgp vtysh -c \"show bgp neighbors\"' to find neighbors configured directly in FRR that have no CONFIG_DB entry."
+    },
+    {
+      "command": "docker exec bgp vtysh -c 'show running-config' 2>/dev/null | grep -E '^\\s*(neighbor|route-map|prefix-list|router bgp)' | sort",
+      "purpose": "Extract the BGP-relevant lines from the live FRR config for manual comparison against CONFIG_DB BGP tables."
+    },
+    {
+      "command": "redis-cli -n 4 KEYS 'BGP_PEER_RANGE|*' 'ROUTE_MAP|*' 'PREFIX_LIST|*' 2>/dev/null | sort",
+      "purpose": "Check CONFIG_DB for route-map and prefix-list entries. Any route-map or prefix-list visible in 'vtysh -c show running-config' but absent here was configured directly in FRR."
+    },
+    {
+      "command": "docker logs bgp --since 1h 2>&1 | grep -E '(bgpcfgd|Generating|template|frr.conf|vtysh -f)' | tail -30",
+      "purpose": "Look for bgpcfgd log lines showing when it last generated and applied a FRR config template. The timestamp of the last 'Generating FRR config' entry is the point after which any vtysh changes would still be present -- a subsequent entry means they were overwritten."
+    },
+    {
+      "command": "journalctl --since '2 hours ago' | grep -E 'docker.*bgp.*vtysh|vtysh.*conf|bgp.*configure' | head -20",
+      "purpose": "Audit the system journal for evidence of direct vtysh invocations. May not catch all sessions but will capture invocations logged by the shell or audit daemon."
+    }
+  ],
+  "correct_procedure": "Use the SONiC config CLI for all BGP configuration: 'config bgp neighbor add', 'config bgp neighbor remove', 'config bgp listen range', etc. For route-maps, prefix-lists, and other FRR policy objects that the SONiC CLI does not yet expose, add them to the bgpcfgd Jinja2 templates or use the 'config bgp device-global' and BGP_GLOBALS CONFIG_DB table entries. After making changes, run 'config save' to persist. If direct FRR debugging is needed (e.g., 'show bgp' for diagnosis), use 'docker exec bgp vtysh' in read-only mode: 'vtysh -c \"show bgp summary\"'. Never enter FRR configuration mode (conf t) via vtysh.",
+  "why_it_breaks": [
+    "bgpcfgd owns the FRR config. On any CONFIG_DB change event that triggers a template re-render, bgpcfgd calls 'vtysh -f /etc/frr/frr.conf' with the freshly generated config, which replaces the entire FRR running config including any direct vtysh additions.",
+    "FRR's own /etc/frr/frr.conf is also overwritten by bgpcfgd renders. If someone saves via 'vtysh -c write', that file will be overwritten on the next bgpcfgd render cycle.",
+    "bgp container restarts (e.g., after an OOM kill, a 'systemctl restart bgp', or a 'config reload') fully re-initialize FRR from the bgpcfgd-generated config. Direct vtysh state is not persisted anywhere.",
+    "Changes made via vtysh are invisible to 'show running-config' in the SONiC CLI (which reads CONFIG_DB), creating a split-brain where the operator believes their change is in effect but it does not survive the next restart."
+  ],
+  "prevention": "Restrict shell access to the bgp container in production: remove 'docker' group membership from non-admin users, or configure sudoers to allow only read-only vtysh invocations ('vtysh -c \"show ...\"'). Add a bgpcfgd config-drift check to the monitoring stack: alert when the diff between live FRR config and the expected template output is non-empty.",
+  "related_errors": ["manual-config-db-json-edit", "direct-redis-write"],
+  "ref_daemons": ["daemon:bgpcfgd"],
+  "ref_dbs": ["db:config_db"],
+  "keywords": ["vtysh", "docker exec bgp", "frr", "bgp container", "conf t", "configure terminal", "router bgp", "direct frr", "frr config"],
+  "context_keywords": ["bgp", "frr", "vtysh", "container", "neighbor", "route-map", "prefix-list", "configure"]
+}

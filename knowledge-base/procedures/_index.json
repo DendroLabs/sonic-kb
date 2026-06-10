@@ -1,0 +1,26 @@
+{
+  "config-reload": {
+    "procedure_name": "Configuration Reload",
+    "category": "configuration",
+    "risk_level": "medium",
+    "purpose": "Reload configuration from disk into running CONFIG_DB"
+  },
+  "sonic-upgrade": {
+    "procedure_name": "SONiC Image Upgrade",
+    "category": "system-operations",
+    "risk_level": "high",
+    "purpose": "Upgrade SONiC OS image"
+  },
+  "warm-reboot": {
+    "procedure_name": "Warm Reboot",
+    "category": "system-operations",
+    "risk_level": "medium",
+    "purpose": "Reboot with minimal traffic disruption"
+  },
+  "container-restart": {
+    "procedure_name": "Container Restart",
+    "category": "system-operations",
+    "risk_level": "varies",
+    "purpose": "Restart a specific SONiC Docker container"
+  }
+}

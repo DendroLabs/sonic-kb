@@ -1,0 +1,66 @@
+{
+  "error_id": "direct-redis-write",
+  "display_name": "Direct redis-cli write to CONFIG_DB or APPL_DB bypassing mgrd validation",
+  "severity": "HIGH",
+  "category": "config-integrity",
+  "sonic_version": "202511",
+  "pattern": "Engineer uses 'redis-cli -n 4 HSET ...' (CONFIG_DB) or 'redis-cli -n 0 HSET ...' (APPL_DB) to write entries directly into Redis, bypassing the SONiC config CLI, sonic-cfggen, and the *mgrd daemon validation layer. Often done to 'quickly test' a config change or work around a perceived CLI limitation.",
+  "what_goes_wrong": "CONFIG_DB (Redis DB 4) is the config source of truth, but all writes are expected to go through validated paths (CLI, sonic-cfggen, gNMI, REST). The *mgrd daemons (portmgrd, intfmgrd, vlanmgrd, etc.) subscribe to CONFIG_DB via swsscommon and process changes through their own validation and state-machine logic before writing to APPL_DB. A direct redis-cli write to CONFIG_DB bypasses this validation -- a port speed value with a wrong type, an MTU out of the allowed range, or a missing required field will be accepted by Redis but will cause the relevant mgrd daemon to log an error, silently skip the entry, or in worst cases enter a crash-restart loop. Direct writes to APPL_DB (DB 0) are even more dangerous: orchagent subscribes to APPL_DB and translates entries into SAI calls to program the ASIC. A malformed or logically inconsistent APPL_DB entry can cause orchagent to generate an invalid SAI call, which may crash syncd or wedge the ASIC programming pipeline. Neither CONFIG_DB nor APPL_DB writes via redis-cli are persisted to /etc/sonic/config_db.json -- they are lost on reboot or overwritten on the next 'config reload'.",
+  "symptoms": [
+    "Config change applied via redis-cli takes effect immediately but disappears after reboot or 'config reload'",
+    "portmgrd, intfmgrd, or vlanmgrd logs 'doTask: Failed to set' or 'Unsupported' errors immediately after the redis-cli write",
+    "orchagent logs SAI_STATUS_INVALID_PARAMETER or 'Failed to create' after a direct APPL_DB write",
+    "'show interface status' or 'show ip route' does not reflect the change despite the Redis key being present",
+    "Daemon enters a retry loop: same error message repeats every few seconds in syslog, tied to the malformed key",
+    "'config save' followed by 'config reload' reverts the change (file was saved before the direct Redis write, so reload restores old state)",
+    "APPL_DB entry is present but the corresponding ASIC_DB SAI object is absent, indicating orchagent rejected the programming request"
+  ],
+  "detection_commands": [
+    {
+      "command": "redis-cli -n 4 DEBUG JMAP 2>/dev/null; redis-cli -n 4 MONITOR &\nexport MPID=$!\nsleep 5\nkill $MPID 2>/dev/null",
+      "purpose": "Use Redis MONITOR to capture live writes to CONFIG_DB for a 5-second window. Any HSET/HMSET/DEL not originating from a known swsscommon client (portmgrd, intfmgrd, vlanmgrd, bgpcfgd, swss, CLI) is a direct redis-cli write. Run this before reproducing the problem to catch it in the act."
+    },
+    {
+      "command": "diff <(redis-cli -n 4 KEYS '*' | sort) <(python3 -c \"import json; d=json.load(open('/etc/sonic/config_db.json')); [print(t+'|'+k) for t,tbl in d.items() if isinstance(tbl,dict) for k in tbl.keys()]\" | sort) 2>/dev/null",
+      "purpose": "Diff the current Redis CONFIG_DB key set against keys in the saved config_db.json file. Keys present in Redis but absent from the file were written directly to Redis (either via redis-cli or a CLI change that was not saved). Keys absent from Redis but present in the file were deleted from Redis without updating the file."
+    },
+    {
+      "command": "for key in $(redis-cli -n 4 KEYS '*'); do\n  redis_val=$(redis-cli -n 4 HGETALL \"$key\" 2>/dev/null)\n  echo \"=== $key ===\"\n  echo \"$redis_val\"\ndone 2>/dev/null | grep -A5 '===' | head -80",
+      "purpose": "Dump all CONFIG_DB keys and their field values. Use this to manually inspect for obviously malformed values (e.g., string where integer expected, empty required fields) that a direct redis-cli write may have introduced."
+    },
+    {
+      "command": "journalctl -u swss --since '1 hour ago' | grep -E '(portmgrd|intfmgrd|vlanmgrd).*[Ee]rror|Failed to set|Unsupported|doTask' | tail -30",
+      "purpose": "Check swss service logs for mgrd daemon errors that would follow a malformed CONFIG_DB write. A burst of repeated 'doTask' or 'Failed to set' errors on a specific key immediately after a suspicious timestamp indicates that key was written directly to Redis with invalid content."
+    },
+    {
+      "command": "journalctl -u swss --since '1 hour ago' | grep -E '(orchagent).*(SAI_STATUS|Failed to create|sai_create|Error)' | tail -30",
+      "purpose": "Check for orchagent SAI programming failures that follow a direct APPL_DB write. SAI_STATUS_INVALID_PARAMETER or repeated 'Failed to create' errors on route, neighbor, or port objects indicate a malformed APPL_DB entry reached orchagent."
+    },
+    {
+      "command": "diff <(redis-cli -n 0 KEYS '*' | sort) <(redis-cli -n 1 KEYS 'ASIC_STATE:*' | sed 's/ASIC_STATE://g' | sort) 2>/dev/null | grep '^<' | head -30",
+      "purpose": "Identify APPL_DB entries (DB 0) that have no corresponding ASIC_DB object (DB 1). An APPL_DB route or neighbor with no ASIC_STATE counterpart indicates orchagent rejected the SAI programming -- often because the entry was written directly to APPL_DB with a logically inconsistent or malformed value."
+    },
+    {
+      "command": "redis-cli -n 4 HGETALL 'PORT|Ethernet0' 2>/dev/null",
+      "purpose": "Spot-check a representative CONFIG_DB entry. Compare the field types and values against the SONiC CONFIG_DB schema (e.g., speed must be an integer string like '100000', mtu must be '9100' not 9100). Type mismatches from direct redis-cli writes are a common source of mgrd failures."
+    },
+    {
+      "command": "last -n 20 | grep -v reboot && journalctl --since '2 hours ago' | grep -E 'redis-cli|MONITOR' | head -20",
+      "purpose": "Audit recent logins and any journal entries referencing redis-cli usage. May help correlate a direct write with a specific engineer login session."
+    }
+  ],
+  "correct_procedure": "All CONFIG_DB changes must go through the SONiC config CLI ('config ...' commands) or the validated northbound APIs (gNMI, REST). These paths enforce schema validation, write atomically to Redis, and trigger the correct mgrd notification. After any change, run 'config save' to persist the Redis state to /etc/sonic/config_db.json. For APPL_DB: never write to it directly. It is written exclusively by *mgrd daemons and *syncd processes as part of the config pipeline. For debugging a pipeline stall, read APPL_DB entries with 'redis-cli -n 0 HGETALL ...' but never write to it.",
+  "why_it_breaks": [
+    "redis-cli writes bypass the swsscommon validation layer. The *mgrd daemons assume CONFIG_DB entries are well-formed because the CLI enforces schema. A malformed field value from redis-cli is accepted by Redis but causes the mgrd to fail silently or enter an error loop.",
+    "Direct CONFIG_DB writes are not persisted to /etc/sonic/config_db.json. 'config reload' or reboot restores the file-backed state, erasing the direct write.",
+    "Direct APPL_DB writes may be processed by orchagent before the corresponding CONFIG_DB entry exists, causing orchagent to produce a SAI call with incomplete dependency data (e.g., a route nexthop with no corresponding neighbor entry), which syncd will reject.",
+    "The swsscommon notification model relies on Redis keyspace events. A direct HSET does generate a keyspace event and will trigger mgrd subscribers, but the mgrd has no way to distinguish a CLI-validated write from a raw redis-cli write. If the value is malformed, the mgrd will fail and the key will remain in a broken state until corrected.",
+    "CONFIG_DB writes via redis-cli are not auditable through the standard 'config diff' / 'config show' workflow. They create invisible divergence between the operator's mental model and the actual device state."
+  ],
+  "prevention": "Remove non-admin users from the 'redis' and 'docker' groups on production switches. Add a redis AUTH password (sonic-cfggen supports REDIS_AUTH_PASSWORD in /etc/sonic/sonic_environment) to prevent unauthenticated redis-cli access. Implement a nightly reconciliation check: diff the live CONFIG_DB key set against the saved config_db.json and alert on divergence. Consider enabling Redis ACLs (available in Redis 6+, which SONiC 202511 uses) to restrict WRITE commands to the swsscommon service account.",
+  "related_errors": ["manual-config-db-json-edit", "direct-frr-vtysh"],
+  "ref_daemons": ["daemon:portmgrd", "daemon:intfmgrd", "daemon:bgpcfgd"],
+  "ref_dbs": ["db:config_db", "db:appl_db"],
+  "keywords": ["redis-cli", "HSET", "HMSET", "direct redis", "redis write", "DB 4", "DB 0", "config_db redis", "appl_db redis", "redis -n 4", "redis -n 0"],
+  "context_keywords": ["redis", "cli", "write", "direct", "bypass", "hset", "config_db", "appl_db", "database"]
+}

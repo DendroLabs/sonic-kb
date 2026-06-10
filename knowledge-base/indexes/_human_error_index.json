@@ -1,0 +1,81 @@
+{
+  "direct-redis-write": {
+    "display_name": "Direct redis-cli write to CONFIG_DB or APPL_DB bypassing mgrd validation",
+    "severity": "HIGH",
+    "keywords": [
+      "redis-cli",
+      "HSET",
+      "HMSET",
+      "direct redis",
+      "redis write",
+      "DB 4",
+      "DB 0",
+      "config_db redis",
+      "appl_db redis",
+      "redis -n 4",
+      "redis -n 0"
+    ],
+    "context_keywords": [
+      "redis",
+      "cli",
+      "write",
+      "direct",
+      "bypass",
+      "hset",
+      "config_db",
+      "appl_db",
+      "database"
+    ]
+  },
+  "manual-config-db-json-edit": {
+    "display_name": "Manual edit of config_db.json bypassing ConfigDB",
+    "severity": "HIGH",
+    "keywords": [
+      "config_db.json",
+      "edit",
+      "manual",
+      "json",
+      "vi",
+      "nano",
+      "vim",
+      "sed",
+      "text editor",
+      "hand edit",
+      "hand-edit"
+    ],
+    "context_keywords": [
+      "config",
+      "file",
+      "edit",
+      "change",
+      "reload",
+      "json",
+      "save"
+    ]
+  },
+  "direct-frr-vtysh": {
+    "display_name": "Direct FRR configuration via docker exec bgp vtysh bypassing bgpcfgd",
+    "severity": "HIGH",
+    "keywords": [
+      "vtysh",
+      "docker exec bgp",
+      "frr",
+      "bgp container",
+      "conf t",
+      "configure terminal",
+      "router bgp",
+      "direct frr",
+      "frr config"
+    ],
+    "context_keywords": [
+      "bgp",
+      "frr",
+      "vtysh",
+      "container",
+      "neighbor",
+      "route-map",
+      "prefix-list",
+      "configure"
+    ]
+  }
+}

@@ -1,0 +1,35 @@
+[project]
+name = "sonic-knowledge-base"
+version = "0.1.0"
+description = "Pre-compiled SONiC troubleshooting knowledge base with MCP server"
+requires-python = ">=3.11"
+dependencies = [
+    "rich>=13.0",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+vector = [
+    "sentence-transformers>=3.0",
+    "numpy>=1.26",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+sonic-kb = "src.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

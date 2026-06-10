@@ -1,0 +1,45 @@
+{
+  "version": "202511",
+  "rules": [
+    {
+      "id": "rule:never-advise-direct-db-write",
+      "text": "Never advise the user to write directly to Redis with redis-cli unless the specific operation is documented as safe. Always recommend the config CLI, sonic-cfggen, or API instead. Call detect_human_error first if direct DB writes are suspected.",
+      "severity": "critical"
+    },
+    {
+      "id": "rule:frr-not-sonic",
+      "text": "FRR documentation is NOT SONiC documentation. FRR config via vtysh is managed by bgpcfgd and will be overwritten on restart or config reload. Always qualify FRR advice with the bgpcfgd wrapper. Never tell users to configure BGP/OSPF directly via vtysh without warning.",
+      "severity": "critical"
+    },
+    {
+      "id": "rule:verify-before-suggest",
+      "text": "Before suggesting any SONiC CLI command, verify it exists in the KB. If not indexed, state that explicitly rather than guessing syntax from training data.",
+      "severity": "mandatory"
+    },
+    {
+      "id": "rule:version-scope",
+      "text": "This KB covers SONiC 202511. For other versions, state the version uncertainty explicitly. SONiC CONFIG_DB schemas and CLI syntax can change between releases.",
+      "severity": "mandatory"
+    },
+    {
+      "id": "rule:cite-source",
+      "text": "When answering from KB data, cite at least one source reference (source_ref field). If no source reference is available, prefix the answer with the KB file that provided the data.",
+      "severity": "advisory"
+    },
+    {
+      "id": "rule:config-db-is-truth",
+      "text": "CONFIG_DB (Redis DB 4) is the source of truth for SONiC configuration while the system is running. /etc/sonic/config_db.json is only loaded at boot. If they differ, the running CONFIG_DB takes precedence. Use 'config save' to persist running to disk.",
+      "severity": "mandatory"
+    },
+    {
+      "id": "rule:restart-impact-warning",
+      "text": "Always warn about traffic impact before recommending container restarts. swss restart reprograms the entire ASIC. syncd restart is even more disruptive. Prefer warm_restart when available.",
+      "severity": "mandatory"
+    },
+    {
+      "id": "rule:not-indexed-response",
+      "text": "If a tool returns kb_coverage='not_indexed' or null, say so explicitly: 'This topic is not yet indexed in the SONiC KB.' Do not fall back to training data without flagging it.",
+      "severity": "mandatory"
+    }
+  ]
+}

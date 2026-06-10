@@ -1,0 +1,93 @@
+{
+  "procedure_id": "config-reload",
+  "procedure_name": "Configuration Reload",
+  "category": "configuration",
+  "risk_level": "medium",
+  "purpose": "Reload configuration from /etc/sonic/config_db.json into running CONFIG_DB (Redis), restarting affected services",
+  "def_refs": ["db:config_db", "daemon:portmgrd", "daemon:intfmgrd", "daemon:bgpcfgd"],
+
+  "prerequisites": [
+    "Verify the config file is valid JSON: python3 -c \"import json; json.load(open('/etc/sonic/config_db.json'))\"",
+    "Understand that unsaved running config changes will be LOST -- config reload replaces Redis with the file",
+    "Plan for brief traffic disruption as services restart"
+  ],
+
+  "warnings": [
+    "config reload replaces the running CONFIG_DB with the file. If you made changes and did NOT run 'config save', those changes will be lost.",
+    "All *mgrd daemons will restart, causing brief service interruption",
+    "BGP sessions will flap as bgpcfgd re-renders FRR config",
+    "LAG/PortChannel may briefly flap as teammgrd restarts"
+  ],
+
+  "steps": [
+    {
+      "step_id": "step-1",
+      "step": 1,
+      "action": "Backup current running config",
+      "command": "sudo sonic-cfggen -d --print-data > /tmp/config_backup_$(date +%Y%m%d_%H%M%S).json",
+      "verification": {
+        "command": "ls -la /tmp/config_backup_*.json | tail -1",
+        "look_for": "File exists with non-zero size",
+        "confirms_if": "Backup file was created successfully"
+      },
+      "next_step_id": "step-2",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "Always backup before reload. This captures the RUNNING config, not the file."
+    },
+    {
+      "step_id": "step-2",
+      "step": 2,
+      "action": "Validate the config file to be loaded",
+      "command": "python3 -c \"import json; d=json.load(open('/etc/sonic/config_db.json')); print(f'Valid JSON: {len(d)} top-level keys')\"",
+      "verification": {
+        "command": "sonic-cfggen -j /etc/sonic/config_db.json --print-data > /dev/null 2>&1 && echo 'Valid' || echo 'Invalid'",
+        "look_for": "Valid",
+        "confirms_if": "sonic-cfggen can parse the config file"
+      },
+      "next_step_id": "step-3",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "Catch JSON syntax errors before they cause a failed reload"
+    },
+    {
+      "step_id": "step-3",
+      "step": 3,
+      "action": "Execute config reload",
+      "command": "sudo config reload -y",
+      "verification": {
+        "command": "show runningconfiguration all | head -5",
+        "look_for": "Configuration output appears",
+        "confirms_if": "Config was loaded successfully into Redis"
+      },
+      "next_step_id": "step-4",
+      "rollback_step_id": "rollback-3",
+      "daemon_impact": ["daemon:portmgrd", "daemon:intfmgrd", "daemon:vlanmgrd", "daemon:bgpcfgd", "daemon:teammgrd"],
+      "warning": "This restarts multiple daemons. BGP will flap. Expect 10-30 seconds of disruption."
+    },
+    {
+      "step_id": "step-4",
+      "step": 4,
+      "action": "Verify services recovered",
+      "command": "show system-health summary",
+      "verification": {
+        "command": "show bgp summary; show interfaces status | head -20",
+        "look_for": "BGP sessions re-established, interfaces up",
+        "confirms_if": "All critical services are running and functional"
+      },
+      "next_step_id": null,
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "BGP may take 30-60 seconds to fully reconverge depending on number of peers and routes"
+    }
+  ],
+
+  "rollback": [
+    {
+      "step_id": "rollback-3",
+      "action": "Restore previous running config from backup",
+      "command": "sudo config load /tmp/config_backup_<timestamp>.json -y",
+      "notes": "Replace <timestamp> with the backup file you created in step 1"
+    }
+  ]
+}

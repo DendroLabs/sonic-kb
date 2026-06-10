@@ -1,0 +1,230 @@
+[
+  {
+    "daemon": "orchagent",
+    "log_id": "log:orch:sai-create-route-fail",
+    "pattern": "SAI_STATUS.*create_route_entry",
+    "meaning": "orchagent failed to program a route into the ASIC via SAI",
+    "severity": "ERROR",
+    "likely_causes": [
+      "ASIC FIB/TCAM table full -- check scale limits",
+      "SAI library bug or platform-specific constraint",
+      "syncd crashed or not running",
+      "Invalid next-hop object ID (neighbor not resolved)"
+    ],
+    "next_steps": [
+      "Check syncd status: docker exec syncd supervisorctl status syncd",
+      "Check ASIC utilization: show system-resources or crm show resources all",
+      "Review syncd log: docker exec syncd cat /var/log/syncd.log | tail -50",
+      "Check if next-hop neighbor exists: redis-cli -n 0 HGETALL 'NEIGH_TABLE:<interface>:<nexthop_ip>'"
+    ],
+    "related_code_path": "route-install-bgp",
+    "source_ref": "sonic-swss:orchagent/routeorch.cpp"
+  },
+  {
+    "daemon": "orchagent",
+    "log_id": "log:orch:sai-create-neighbor-fail",
+    "pattern": "SAI_STATUS.*create_neighbor_entry",
+    "meaning": "orchagent failed to program a neighbor (ARP/ND) entry into the ASIC",
+    "severity": "ERROR",
+    "likely_causes": [
+      "Neighbor table full in ASIC",
+      "Invalid interface/router interface object",
+      "syncd not responding"
+    ],
+    "next_steps": [
+      "Check neighbor table capacity: crm show resources all | grep neighbor",
+      "Verify ARP entry exists in kernel: ip neigh show <ip>",
+      "Check APPL_DB: redis-cli -n 0 HGETALL 'NEIGH_TABLE:<intf>:<ip>'"
+    ],
+    "related_code_path": "arp-resolution",
+    "source_ref": "sonic-swss:orchagent/neighorch.cpp"
+  },
+  {
+    "daemon": "orchagent",
+    "log_id": "log:orch:consumer-timeout",
+    "pattern": "ConsumerStateTable.*timeout|slow consumer",
+    "meaning": "orchagent is falling behind processing APPL_DB notifications",
+    "severity": "WARN",
+    "likely_causes": [
+      "CPU congestion -- too many routes being programmed simultaneously",
+      "syncd slow to respond (ASIC programming delay)",
+      "Memory pressure causing swap"
+    ],
+    "next_steps": [
+      "Check CPU: show processes cpu",
+      "Check memory: show system-memory",
+      "Check if bulk route update in progress (e.g., BGP convergence)"
+    ],
+    "related_code_path": "route-install-bgp",
+    "source_ref": "sonic-swss:orchagent/orchdaemon.cpp"
+  },
+  {
+    "daemon": "orchagent",
+    "log_id": "log:orch:port-oper-status",
+    "pattern": "Port.*oper.*status.*(up|down)",
+    "meaning": "Port operational status changed -- link up or down event",
+    "severity": "NOTICE",
+    "likely_causes": [
+      "Physical link change (cable, transceiver, peer port)",
+      "Admin shutdown/no-shutdown",
+      "Auto-negotiation failure"
+    ],
+    "next_steps": [
+      "Check interface status: show interfaces status",
+      "Check transceiver: show interfaces transceiver eeprom <interface>",
+      "Check for link flapping: show logging | grep <interface>"
+    ],
+    "related_code_path": "port-config",
+    "source_ref": "sonic-swss:orchagent/portsorch.cpp"
+  },
+  {
+    "daemon": "orchagent",
+    "log_id": "log:orch:warm-restart",
+    "pattern": "warm.*restart|WarmStart",
+    "meaning": "orchagent warm restart state change -- reconciliation in progress or complete",
+    "severity": "NOTICE",
+    "likely_causes": [
+      "Warm restart was initiated via config warm_restart enable",
+      "swss container restarted with warm_restart enabled"
+    ],
+    "next_steps": [
+      "Check warm restart state: show warm_restart state",
+      "Wait for reconciliation to complete before making config changes"
+    ],
+    "related_code_path": "",
+    "source_ref": "sonic-swss:orchagent/orchdaemon.cpp"
+  },
+  {
+    "daemon": "orchagent",
+    "log_id": "log:orch:crm-threshold",
+    "pattern": "CRM.*exceeded|CRM.*threshold",
+    "meaning": "Critical Resource Monitoring detected resource usage above threshold",
+    "severity": "WARN",
+    "likely_causes": [
+      "ASIC table approaching capacity (routes, neighbors, ACLs, next-hops)",
+      "Resource leak in orchagent"
+    ],
+    "next_steps": [
+      "Check all CRM resources: crm show resources all",
+      "Identify which resource is near capacity",
+      "Review if routes/neighbors can be reduced or TCAM profile adjusted"
+    ],
+    "related_code_path": "",
+    "source_ref": "sonic-swss:orchagent/crmorch.cpp"
+  },
+  {
+    "daemon": "syncd",
+    "log_id": "log:syncd:sai-init-fail",
+    "pattern": "sai_api_initialize.*fail|SAI initialization failed",
+    "meaning": "syncd failed to initialize the SAI API -- cannot communicate with ASIC",
+    "severity": "CRITICAL",
+    "likely_causes": [
+      "Vendor SAI library (libsai.so) missing or corrupt",
+      "ASIC hardware failure or not detected",
+      "Kernel driver for ASIC not loaded",
+      "Incompatible SAI library version"
+    ],
+    "next_steps": [
+      "Check if ASIC kernel module is loaded: lsmod | grep <vendor>",
+      "Check dmesg for hardware errors: dmesg | tail -50",
+      "Verify libsai.so exists: docker exec syncd ls -la /usr/lib/libsai*",
+      "Try cold reboot: sudo reboot"
+    ],
+    "related_code_path": "",
+    "source_ref": "sonic-sairedis:syncd/VendorSai.cpp"
+  },
+  {
+    "daemon": "syncd",
+    "log_id": "log:syncd:sai-status-failure",
+    "pattern": "SAI_STATUS_FAILURE|SAI_STATUS_NOT_SUPPORTED|SAI_STATUS_TABLE_FULL",
+    "meaning": "SAI API call returned an error status from the vendor ASIC SDK",
+    "severity": "ERROR",
+    "likely_causes": [
+      "SAI_STATUS_TABLE_FULL: ASIC table capacity reached",
+      "SAI_STATUS_NOT_SUPPORTED: Feature not supported on this platform",
+      "SAI_STATUS_FAILURE: Generic vendor SDK error",
+      "SAI_STATUS_INVALID_PARAMETER: Bad parameter from orchagent"
+    ],
+    "next_steps": [
+      "Decode the specific SAI status code from the log",
+      "Check ASIC resource usage: crm show resources all",
+      "Check platform capabilities with vendor documentation",
+      "If TABLE_FULL: reduce route/ACL/neighbor count or change TCAM profile"
+    ],
+    "related_code_path": "route-install-bgp",
+    "source_ref": "sonic-sairedis:syncd/Syncd.cpp"
+  },
+  {
+    "daemon": "syncd",
+    "log_id": "log:syncd:notification",
+    "pattern": "FDB.*event|port.*state.*notification|BFD.*session",
+    "meaning": "ASIC hardware notification received -- FDB learning event, port state change, or BFD session event",
+    "severity": "NOTICE",
+    "likely_causes": [
+      "Normal ASIC operation -- hardware events propagated to software",
+      "FDB: MAC address learned/aged/moved",
+      "Port: Physical link state change detected by PHY"
+    ],
+    "next_steps": [
+      "Usually informational -- no action needed unless excessive",
+      "High rate of FDB notifications may indicate MAC flapping",
+      "High rate of port notifications may indicate link instability"
+    ],
+    "related_code_path": "",
+    "source_ref": "sonic-sairedis:syncd/NotificationProcessor.cpp"
+  },
+  {
+    "daemon": "bgpcfgd",
+    "log_id": "log:bgpcfgd:template-error",
+    "pattern": "template.*error|jinja2.*error|TemplateSyntaxError",
+    "meaning": "bgpcfgd failed to render a Jinja2 template for FRR configuration",
+    "severity": "ERROR",
+    "likely_causes": [
+      "Invalid or missing fields in CONFIG_DB BGP tables",
+      "Custom template modification broke Jinja2 syntax",
+      "bgpcfgd code bug after SONiC upgrade"
+    ],
+    "next_steps": [
+      "Check CONFIG_DB BGP entries: redis-cli -n 4 KEYS 'BGP_*'",
+      "Check template: cat /usr/share/sonic/templates/bgpd.conf.j2",
+      "Check bgpcfgd logs: journalctl -u bgp | grep bgpcfgd | tail -30",
+      "Try regenerating: sonic-cfggen -d -t /usr/share/sonic/templates/bgpd.conf.j2"
+    ],
+    "related_code_path": "route-install-bgp",
+    "source_ref": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/template.py"
+  },
+  {
+    "daemon": "bgpcfgd",
+    "log_id": "log:bgpcfgd:vtysh-fail",
+    "pattern": "vtysh.*failed|vtysh.*error|vtysh.*command rejected",
+    "meaning": "bgpcfgd's vtysh command to configure FRR was rejected",
+    "severity": "ERROR",
+    "likely_causes": [
+      "FRR (bgpd) rejected the configuration command",
+      "Syntax error in generated vtysh command",
+      "FRR is not running or crashed"
+    ],
+    "next_steps": [
+      "Check FRR status: docker exec bgp supervisorctl status",
+      "Try the vtysh command manually: docker exec bgp vtysh -c '<command>'",
+      "Check FRR log: docker exec bgp cat /var/log/frr/bgpd.log | tail -30"
+    ],
+    "related_code_path": "",
+    "source_ref": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/"
+  },
+  {
+    "daemon": "bgpcfgd",
+    "log_id": "log:bgpcfgd:config-sync",
+    "pattern": "CONFIG_DB.*update|neighbor.*added|neighbor.*removed",
+    "meaning": "bgpcfgd detected a CONFIG_DB change and is syncing to FRR",
+    "severity": "INFO",
+    "likely_causes": [
+      "Normal operation -- user made a config change via CLI/API"
+    ],
+    "next_steps": [
+      "Usually informational -- verify the change took effect in FRR: docker exec bgp vtysh -c 'show running-config'"
+    ],
+    "related_code_path": "",
+    "source_ref": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/"
+  }
+]

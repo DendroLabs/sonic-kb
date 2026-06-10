@@ -1,0 +1,56 @@
+{
+  "bgp-4": {
+    "name": "BGP-4",
+    "family": "routing",
+    "category": "routing",
+    "tags": ["routing", "egp", "path-vector", "inter-as", "ebgp", "ibgp", "frr"]
+  },
+  "ospfv2": {
+    "name": "OSPFv2",
+    "family": "routing",
+    "category": "routing",
+    "tags": ["routing", "igp", "link-state", "area", "frr"]
+  },
+  "bfd": {
+    "name": "BFD",
+    "family": "transport",
+    "category": "transport",
+    "tags": ["fault-detection", "sub-second", "convergence", "frr"]
+  },
+  "lacp": {
+    "name": "LACP",
+    "family": "switching",
+    "category": "switching",
+    "tags": ["lag", "port-channel", "bonding", "teamd", "layer-2"]
+  },
+  "lldp": {
+    "name": "LLDP",
+    "family": "adjacency",
+    "category": "adjacency",
+    "tags": ["discovery", "neighbor", "layer-2", "cdp-alternative"]
+  },
+  "stp": {
+    "name": "STP/RSTP",
+    "family": "switching",
+    "category": "switching",
+    "tags": ["loop-prevention", "layer-2", "bridge", "rstp"]
+  },
+  "vxlan-evpn": {
+    "name": "VXLAN/EVPN",
+    "family": "overlay",
+    "category": "overlay",
+    "tags": ["overlay", "vxlan", "evpn", "vtep", "nvo", "frr"]
+  },
+  "static-routing": {
+    "name": "Static Routing",
+    "family": "routing",
+    "category": "routing",
+    "tags": ["routing", "static", "default-route", "frr"]
+  },
+  "mclag": {
+    "name": "MCLAG",
+    "family": "switching",
+    "category": "switching",
+    "tags": ["multi-chassis", "lag", "redundancy", "iccp"]
+  }
+}

@@ -1,0 +1,306 @@
+[
+  {
+    "def_id": "db:appl_db",
+    "db_number": 0,
+    "name": "APPL_DB",
+    "separator": ":",
+    "purpose": "Application desired state. *syncd daemons publish per-feature state here (routes, neighbors, ports, VLANs). Orchagent subscribes and translates entries into SAI calls. This is the boundary between feature daemons and the forwarding-plane pipeline.",
+    "written_by": [
+      "fpmsyncd",
+      "neighsyncd",
+      "portsyncd",
+      "intfmgrd",
+      "vlanmgrd",
+      "teammgrd",
+      "natsyncd",
+      "buffermgrd"
+    ],
+    "read_by": [
+      "orchagent"
+    ],
+    "persistence": "Not persisted to disk. Volatile; rebuilt from CONFIG_DB and kernel state on restart.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Not directly edited by operators. Inspect with 'redis-cli -n 0' for debugging pipeline stalls.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:asic_db",
+    "db_number": 1,
+    "name": "ASIC_DB",
+    "separator": ":",
+    "purpose": "SAI object state mirroring what orchagent has programmed into the forwarding ASIC via libsai. Orchagent writes SAI-typed entries here; syncd reads them and makes the corresponding SAI API calls to the vendor SDK.",
+    "written_by": [
+      "orchagent"
+    ],
+    "read_by": [
+      "syncd"
+    ],
+    "persistence": "Not persisted to disk. Volatile; represents in-flight SAI state.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Read-only for debugging ASIC programming failures. Divergence between APPL_DB and ASIC_DB indicates an orchagent or SAI translation issue.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:counters_db",
+    "db_number": 2,
+    "name": "COUNTERS_DB",
+    "separator": ":",
+    "purpose": "Port-level and queue-level statistics counters polled from the ASIC via SAI. Populated by syncd at regular flex-counter intervals. Source of data for 'show interfaces counters' and Prometheus/telemetry exporters.",
+    "written_by": [
+      "syncd"
+    ],
+    "read_by": [
+      "CLI (show interfaces counters)",
+      "sonic-exporter",
+      "SNMP agent",
+      "telemetry container"
+    ],
+    "persistence": "Not persisted to disk. Counters reset when syncd restarts.",
+    "human_error_risk": "LOW",
+    "human_error_note": "No direct operator writes. Counter resets on 'sonic-clear counters' clear only the cached delta, not the ASIC hardware counters.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:loglevel_db",
+    "db_number": 3,
+    "name": "LOGLEVEL_DB",
+    "separator": ":",
+    "purpose": "Stores per-component log-level and log-output settings. Components read this at startup and watch for updates at runtime via a subscriber thread, enabling dynamic log-level changes without process restart.",
+    "written_by": [
+      "swssloglevel utility",
+      "sonic-cfggen"
+    ],
+    "read_by": [
+      "orchagent",
+      "syncd",
+      "fpmsyncd",
+      "portsyncd",
+      "neighsyncd",
+      "intfmgrd",
+      "vlanmgrd",
+      "portmgrd"
+    ],
+    "persistence": "Not persisted across reboots by default. Reset to component defaults on container restart.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Operator-safe. Setting NOTICE or DEBUG here is the standard way to increase verbosity for troubleshooting without touching config files.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:config_db",
+    "db_number": 4,
+    "name": "CONFIG_DB",
+    "separator": "|",
+    "purpose": "User configuration source of truth. All operator-configured state lives here: interfaces, IP addresses, VLANs, BGP neighbors, ACLs, QoS maps, port speeds. Loaded from /etc/sonic/config_db.json at boot via sonic-cfggen and updated live by CLI commands.",
+    "written_by": [
+      "CLI utilities (config ...)",
+      "sonic-cfggen",
+      "config load / config reload",
+      "restconf",
+      "gnmi",
+      "minigraph parser"
+    ],
+    "read_by": [
+      "portmgrd",
+      "intfmgrd",
+      "vlanmgrd",
+      "bgpcfgd",
+      "teammgrd",
+      "buffermgrd",
+      "natmgrd",
+      "dhcprelayd",
+      "lldpmgrd"
+    ],
+    "persistence": "Backed by /etc/sonic/config_db.json. Changes made via CLI are live immediately in Redis but must be saved with 'config save' to survive reboot.",
+    "human_error_risk": "HIGH",
+    "human_error_note": "Most operator mistakes originate here. Direct redis-cli writes bypass validation. Always use 'config save' after changes or they are lost on reboot. Malformed entries can wedge mgrd daemons in a retry loop.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:flex_counter_db",
+    "db_number": 5,
+    "name": "FLEX_COUNTER_DB",
+    "separator": ":",
+    "purpose": "Configuration for the flex-counter subsystem: which SAI object groups to poll, at what interval, and which stats to collect. Orchagent writes polling group definitions here; syncd reads them to schedule counter collection into COUNTERS_DB.",
+    "written_by": [
+      "orchagent"
+    ],
+    "read_by": [
+      "syncd"
+    ],
+    "persistence": "Not persisted to disk. Rebuilt when orchagent/swss restarts.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Not directly edited by operators in normal operation. Tuning poll intervals may be done via CONFIG_DB:FLEX_COUNTER_TABLE entries.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:state_db",
+    "db_number": 6,
+    "name": "STATE_DB",
+    "separator": "|",
+    "purpose": "Operational state used for cross-module dependencies and readiness gating. Daemons publish 'ready' flags and operational facts here (e.g., port operational status, LAG membership, interface admin state) that other daemons depend on before proceeding with configuration.",
+    "written_by": [
+      "portsyncd",
+      "intfmgrd",
+      "vlanmgrd",
+      "teammgrd",
+      "xcvrd",
+      "buffermgrd",
+      "natsyncd"
+    ],
+    "read_by": [
+      "orchagent",
+      "portmgrd",
+      "intfmgrd",
+      "neighsyncd",
+      "CLI (show interfaces status)"
+    ],
+    "persistence": "Not persisted to disk. Rebuilt from kernel and ASIC state on restart.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Read-only for debugging. Stale STATE_DB entries after a crash can cause mgrd daemons to skip re-configuration; clearing the relevant key manually may be needed.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:snmp_overlay_db",
+    "db_number": 7,
+    "name": "SNMP_OVERLAY_DB",
+    "separator": "|",
+    "purpose": "Stores SNMP-specific overlay data: sysDescr, sysObjectID, and per-interface SNMP index mappings. The SNMP agent (sonic-snmpagent / snmpd) reads and writes here to serve SNMP MIB queries without polling ASIC_DB directly.",
+    "written_by": [
+      "snmpd (sonic-snmpagent)"
+    ],
+    "read_by": [
+      "snmpd (sonic-snmpagent)"
+    ],
+    "persistence": "Not persisted to disk.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Not modified by operators. If SNMP returns stale interface data, restart the snmp container to force a rebuild.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:restapi_db",
+    "db_number": 8,
+    "name": "RESTAPI_DB",
+    "separator": "|",
+    "purpose": "Internal state store for the REST API server (sonic-restapi). Holds request-response context and auth token state needed by the REST API service to maintain session continuity.",
+    "written_by": [
+      "sonic-restapi (REST API server)"
+    ],
+    "read_by": [
+      "sonic-restapi (REST API server)"
+    ],
+    "persistence": "Not persisted to disk.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Not modified by operators directly.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:gb_asic_db",
+    "db_number": 9,
+    "name": "GB_ASIC_DB",
+    "separator": ":",
+    "purpose": "SAI object state for Gearbox (retimer/PHY) devices. Mirrors the role of ASIC_DB (db 1) but scoped to external Gearbox ASICs managed by the gearboxmgrd/gbsyncd subsystem.",
+    "written_by": [
+      "orchagent (gearbox paths)"
+    ],
+    "read_by": [
+      "gbsyncd"
+    ],
+    "persistence": "Not persisted to disk. Present only on platforms with Gearbox ASICs.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Only relevant on platforms with external retimers/PHYs. Absent on most fixed-form-factor switches.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:gb_counters_db",
+    "db_number": 10,
+    "name": "GB_COUNTERS_DB",
+    "separator": ":",
+    "purpose": "Port-level and queue-level statistics counters for Gearbox ASICs. Mirrors the role of COUNTERS_DB (db 2) scoped to Gearbox devices.",
+    "written_by": [
+      "gbsyncd"
+    ],
+    "read_by": [
+      "CLI",
+      "telemetry container"
+    ],
+    "persistence": "Not persisted to disk.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Only relevant on platforms with Gearbox ASICs.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:gb_flex_counter_db",
+    "db_number": 11,
+    "name": "GB_FLEX_COUNTER_DB",
+    "separator": ":",
+    "purpose": "Flex-counter polling configuration for Gearbox ASIC statistics. Mirrors the role of FLEX_COUNTER_DB (db 5) scoped to Gearbox devices.",
+    "written_by": [
+      "orchagent (gearbox paths)"
+    ],
+    "read_by": [
+      "gbsyncd"
+    ],
+    "persistence": "Not persisted to disk.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Only relevant on platforms with Gearbox ASICs.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:chassis_app_db",
+    "db_number": 12,
+    "name": "CHASSIS_APP_DB",
+    "separator": "|",
+    "purpose": "Multi-chassis desired state. On distributed chassis systems (e.g., Cisco 8800, Arista 7800R3), the supervisor publishes system-wide configuration and line-card state here so individual line-card SONiC instances can synchronize.",
+    "written_by": [
+      "chassis-supervisord",
+      "system-health daemon"
+    ],
+    "read_by": [
+      "orchagent (on line cards)",
+      "intfmgrd (on line cards)"
+    ],
+    "persistence": "Not persisted to disk on line cards. Authoritative copy lives on supervisor.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Only present on multi-chassis platforms. Not applicable to fixed-form-factor switches.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:chassis_state_db",
+    "db_number": 13,
+    "name": "CHASSIS_STATE_DB",
+    "separator": "|",
+    "purpose": "Multi-chassis operational state. Line cards publish their operational facts (port status, fabric health, temperature, power) into this DB so the supervisor can aggregate system-level operational state.",
+    "written_by": [
+      "pmon daemons (on line cards)",
+      "portsyncd (on line cards)"
+    ],
+    "read_by": [
+      "chassis-supervisord",
+      "system-health daemon",
+      "CLI (show chassis)"
+    ],
+    "persistence": "Not persisted to disk.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Only present on multi-chassis platforms.",
+    "sonic_version": "202511"
+  },
+  {
+    "def_id": "db:appl_state_db",
+    "db_number": 14,
+    "name": "APPL_STATE_DB",
+    "separator": ":",
+    "purpose": "Read-only mirror of successfully applied application state. After orchagent successfully programs an APPL_DB entry into the ASIC, it publishes the confirmed state here. Allows consumers to distinguish 'desired' (APPL_DB) from 'applied' (APPL_STATE_DB) state without polling ASIC_DB.",
+    "written_by": [
+      "orchagent"
+    ],
+    "read_by": [
+      "CLI (show route, show arp)",
+      "telemetry container",
+      "gnmi server"
+    ],
+    "persistence": "Not persisted to disk. Rebuilt as orchagent confirms entries.",
+    "human_error_risk": "LOW",
+    "human_error_note": "Divergence between APPL_DB and APPL_STATE_DB for the same key indicates a programming failure. Check orchagent logs and ASIC_DB for the corresponding SAI error.",
+    "sonic_version": "202511"
+  }
+]

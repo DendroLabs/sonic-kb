@@ -1,0 +1,95 @@
+{
+  "path_id": "route-install-bgp",
+  "display_name": "BGP learned route installation to ASIC",
+  "trigger": "BGP session receives UPDATE with new prefix",
+  "version": "202511",
+  "def_refs": ["daemon:orchagent", "daemon:fpmsyncd", "daemon:syncd", "daemon:bgpcfgd", "db:appl_db", "db:asic_db"],
+
+  "steps": [
+    {
+      "step": 1,
+      "actor": "bgpd (FRR)",
+      "action": "Receives BGP UPDATE message, runs best-path selection algorithm, installs winning route into FRR RIB",
+      "source_file": "sonic-frr:bgpd/bgp_route.c",
+      "source_function": "bgp_process_main_one()",
+      "output": "Route entry in FRR's BGP RIB and selected as best path",
+      "verify": "docker exec bgp vtysh -c 'show bgp ipv4 unicast <prefix>'"
+    },
+    {
+      "step": 2,
+      "actor": "zebra (FRR)",
+      "action": "Receives route from bgpd via internal ZAPI, installs into zebra RIB, programs Linux kernel via netlink, and sends FPM message to fpmsyncd",
+      "source_file": "sonic-frr:zebra/zebra_rib.c",
+      "source_function": "rib_process_result()",
+      "output": "Route in Linux kernel routing table and FPM message queued",
+      "verify": "ip route show <prefix>"
+    },
+    {
+      "step": 3,
+      "actor": "fpmsyncd",
+      "action": "Receives FPM netlink message from zebra via TCP socket (port 2620), parses RTM_NEWROUTE, writes route to APPL_DB ROUTE_TABLE",
+      "source_file": "sonic-swss:fpmsyncd/routesync.cpp",
+      "source_function": "RouteSync::onRouteMsg()",
+      "db_write": {
+        "db": "db:appl_db",
+        "table": "ROUTE_TABLE",
+        "key_pattern": "ROUTE_TABLE:<prefix>",
+        "fields": ["nexthop", "ifname", "weight", "protocol"]
+      },
+      "verify": "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix>'"
+    },
+    {
+      "step": 4,
+      "actor": "orchagent (RouteOrch)",
+      "action": "Notified of APPL_DB ROUTE_TABLE change via ConsumerStateTable, resolves next-hop to SAI neighbor/next-hop-group objects, calls sai_route_api->create_route_entry()",
+      "source_file": "sonic-swss:orchagent/routeorch.cpp",
+      "source_function": "RouteOrch::addRoute()",
+      "db_write": {
+        "db": "db:asic_db",
+        "table": "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY",
+        "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:{...}",
+        "fields": ["SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID", "SAI_ROUTE_ENTRY_ATTR_PACKET_ACTION"]
+      },
+      "verify": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep '<prefix>'"
+    },
+    {
+      "step": 5,
+      "actor": "syncd",
+      "action": "Receives SAI Redis notification from ASIC_DB, calls vendor SAI library sai_route_api->create_route_entry() which programs the ASIC TCAM/FIB",
+      "source_file": "sonic-sairedis:syncd/Syncd.cpp",
+      "source_function": "Syncd::processSingleEvent()",
+      "sai_call": "VendorSai::create(SAI_OBJECT_TYPE_ROUTE_ENTRY, ...)",
+      "output": "Route programmed in hardware forwarding table",
+      "verify": "show ip route <prefix> (should show in hardware table)"
+    }
+  ],
+
+  "failure_injection_points": [
+    {
+      "between_steps": [1, 2],
+      "failure": "zebra not receiving route from bgpd",
+      "symptom": "Route visible in 'show bgp' but not in 'show ip route' or Linux kernel",
+      "diagnosis": "Check zebra status: docker exec bgp supervisorctl status zebra; check /var/log/frr/zebra.log for errors"
+    },
+    {
+      "between_steps": [2, 3],
+      "failure": "fpmsyncd not writing to APPL_DB",
+      "symptom": "Route in Linux kernel 'ip route show' but not in APPL_DB (redis-cli -n 0 KEYS 'ROUTE_TABLE:*')",
+      "diagnosis": "Check fpmsyncd: docker exec bgp supervisorctl status fpmsyncd; check /var/log/swss/fpmsyncd.log; verify FPM socket connection: ss -tlnp | grep 2620"
+    },
+    {
+      "between_steps": [3, 4],
+      "failure": "orchagent not processing APPL_DB route",
+      "symptom": "Route in APPL_DB ROUTE_TABLE but not in ASIC_DB; 'show ip route' may show route but traffic not forwarding",
+      "diagnosis": "Check orchagent: docker exec swss supervisorctl status orchagent; check /var/log/swss/orchagent.log for SAI errors; check if next-hop is resolved in NEIGH_TABLE"
+    },
+    {
+      "between_steps": [4, 5],
+      "failure": "syncd SAI call failing",
+      "symptom": "Route in ASIC_DB but syncd reports SAI_STATUS_FAILURE; route not in hardware forwarding table",
+      "diagnosis": "Check syncd: docker exec syncd supervisorctl status syncd; check /var/log/syncd.log for SAI error codes; check if ASIC memory (TCAM/FIB) is full"
+    }
+  ],
+
+  "related_paths": ["route-install-static", "route-withdraw-bgp", "arp-resolution"]
+}
