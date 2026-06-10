@@ -1,0 +1,217 @@
+{
+  "tree_id": "lag-not-forming",
+  "display_name": "LAG/PortChannel not forming",
+  "entry_symptom": "PortChannel members not aggregating or LACP not negotiating",
+  "related_protocol": "lacp",
+  "related_errors": [],
+  "related_code_paths": [],
+
+  "nodes": [
+    {
+      "node_id": "n1",
+      "node_type": "branch",
+      "question": "Is the PortChannel configured in CONFIG_DB?",
+      "commands": [
+        "redis-cli -n 4 KEYS 'PORTCHANNEL|*'",
+        "show interfaces portchannel"
+      ],
+      "branches": {
+        "yes": "n2",
+        "no": "n10"
+      }
+    },
+    {
+      "node_id": "n2",
+      "node_type": "branch",
+      "question": "Are member ports assigned to the PortChannel in CONFIG_DB?",
+      "commands": [
+        "redis-cli -n 4 KEYS 'PORTCHANNEL_MEMBER|*'",
+        "show interfaces portchannel"
+      ],
+      "branches": {
+        "yes": "n3",
+        "no": "n11"
+      }
+    },
+    {
+      "node_id": "n3",
+      "node_type": "branch",
+      "question": "Is the teamd process running for this PortChannel (teamdctl shows state)?",
+      "commands": [
+        "docker exec teamd supervisorctl status",
+        "docker exec teamd teamdctl PortChannel1 state dump",
+        "docker exec teamd teamdctl PortChannel1 config dump"
+      ],
+      "branches": {
+        "yes": "n4",
+        "no": "n12"
+      }
+    },
+    {
+      "node_id": "n4",
+      "node_type": "branch",
+      "question": "Are LACPDUs being sent on member ports (runner.active true and tx PDU counters incrementing)?",
+      "commands": [
+        "docker exec teamd teamdctl PortChannel1 state dump",
+        "redis-cli -n 2 HGETALL 'LAG_MEMBER_TABLE|PortChannel1:Ethernet0'",
+        "show interfaces counters | grep -E 'Ethernet'"
+      ],
+      "branches": {
+        "yes": "n6",
+        "no": "n5"
+      }
+    },
+    {
+      "node_id": "n5",
+      "node_type": "branch",
+      "question": "Are all member ports operationally up (link-up)?",
+      "commands": [
+        "show interfaces status",
+        "redis-cli -n 6 HGETALL 'PORT_TABLE|Ethernet0'",
+        "show interfaces transceiver presence"
+      ],
+      "branches": {
+        "yes": "n13",
+        "no": "n14"
+      }
+    },
+    {
+      "node_id": "n6",
+      "node_type": "branch",
+      "question": "Are LACPDUs being received from the partner (rx PDU counters incrementing in teamdctl state)?",
+      "commands": [
+        "docker exec teamd teamdctl PortChannel1 state dump",
+        "sudo tcpdump -i Ethernet0 -n ether proto 0x8809 -c 10"
+      ],
+      "branches": {
+        "yes": "n7",
+        "no": "n15"
+      }
+    },
+    {
+      "node_id": "n7",
+      "node_type": "branch",
+      "question": "Do the LACP system-id and key match between local and partner (actor_key equals partner_key in state dump)?",
+      "commands": [
+        "docker exec teamd teamdctl PortChannel1 state dump",
+        "redis-cli -n 4 HGETALL 'PORTCHANNEL|PortChannel1'",
+        "show lacp neighbor"
+      ],
+      "branches": {
+        "yes": "n8",
+        "no": "n16"
+      }
+    },
+    {
+      "node_id": "n8",
+      "node_type": "branch",
+      "question": "Are actor and partner state flags all set correctly (ACTIVITY, TIMEOUT, AGGREGATION, SYNCHRONIZATION, COLLECTING, DISTRIBUTING)?",
+      "commands": [
+        "docker exec teamd teamdctl PortChannel1 state dump",
+        "show lacp interface Ethernet0",
+        "redis-cli -n 6 HGETALL 'LAG_TABLE|PortChannel1'"
+      ],
+      "branches": {
+        "yes": "n9",
+        "no": "n17"
+      }
+    },
+    {
+      "node_id": "n9",
+      "node_type": "leaf",
+      "finding": "LACP negotiation appears complete but PortChannel still not forwarding -- likely a hardware programming failure in orchagent or syncd",
+      "action": "LACPDUs are exchanged and state flags are correct but the LAG is not forwarding. This points to a failure in the config-to-ASIC pipeline: (1) Check orchagent: docker exec swss supervisorctl status; grep -i 'lag\\|portchannel' /var/log/swss/orchagent.log | tail -30, (2) Check teamsyncd: docker exec teamd supervisorctl status teamsyncd; journalctl -u teamd | grep teamsyncd | tail -20, (3) Check APPL_DB LAG_TABLE: redis-cli -n 0 HGETALL 'LAG_TABLE|PortChannel1', (4) Check ASIC_DB for the LAG object: redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_LAG*', (5) If ASIC_DB entry is missing, syncd may have failed to program the LAG -- check syncd logs.",
+      "commands": [
+        "redis-cli -n 0 HGETALL 'LAG_TABLE|PortChannel1'",
+        "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_LAG*'",
+        "docker exec swss grep -i 'portchannel\\|lag' /var/log/swss/orchagent.log | tail -30"
+      ]
+    },
+    {
+      "node_id": "n10",
+      "node_type": "leaf",
+      "finding": "PortChannel not present in CONFIG_DB -- it was never created or was deleted",
+      "action": "Create the PortChannel: config portchannel add PortChannel1. Optionally set LACP parameters: config portchannel add PortChannel1 --min-links 1 --fallback false. Verify it appears in CONFIG_DB: redis-cli -n 4 HGETALL 'PORTCHANNEL|PortChannel1'. Then add member ports and save: config save -y.",
+      "commands": [
+        "redis-cli -n 4 KEYS 'PORTCHANNEL|*'",
+        "show interfaces portchannel"
+      ]
+    },
+    {
+      "node_id": "n11",
+      "node_type": "leaf",
+      "finding": "PortChannel exists but no member ports are assigned in CONFIG_DB",
+      "action": "Add member ports to the PortChannel: config portchannel member add PortChannel1 Ethernet0. Repeat for each member port. Verify with: redis-cli -n 4 KEYS 'PORTCHANNEL_MEMBER|PortChannel1|*'. Note: member ports must not have IP addresses assigned and must not already be members of a VLAN before being added to a PortChannel. Save config: config save -y.",
+      "commands": [
+        "redis-cli -n 4 KEYS 'PORTCHANNEL_MEMBER|*'",
+        "show interfaces portchannel"
+      ]
+    },
+    {
+      "node_id": "n12",
+      "node_type": "leaf",
+      "finding": "teamd container is running but no teamdctl instance exists for this PortChannel -- teammgrd failed to create the team instance",
+      "action": "The teamd container runs but the per-PortChannel team instance was not started. Check teammgrd: (1) docker exec teamd supervisorctl status teammgrd, (2) journalctl -u teamd | grep teammgrd | tail -30, (3) Check APPL_DB LAG_TABLE for the PortChannel entry (set by teammgrd): redis-cli -n 0 HGETALL 'LAG_TABLE|PortChannel1'. If teammgrd is crashed, restart it: docker exec teamd supervisorctl restart teammgrd. If the whole teamd container is stuck, restart it: sudo systemctl restart teamd (or docker restart teamd). This will recreate all team instances from CONFIG_DB.",
+      "commands": [
+        "docker exec teamd supervisorctl status",
+        "redis-cli -n 0 HGETALL 'LAG_TABLE|PortChannel1'",
+        "journalctl -u teamd | tail -30"
+      ]
+    },
+    {
+      "node_id": "n13",
+      "node_type": "leaf",
+      "finding": "Member ports are up but LACP PDU transmission not starting -- likely LACP is disabled (static LAG configured) or teamd runner misconfiguration",
+      "action": "Check whether the PortChannel is configured as a static LAG (no LACP) or dynamic LACP: (1) redis-cli -n 4 HGETALL 'PORTCHANNEL|PortChannel1' -- look for 'lacp_key' field, (2) docker exec teamd teamdctl PortChannel1 config dump -- check 'runner.name' (should be 'lacp', not 'activebackup' or 'roundrobin'). If configured as static but partner expects LACP, reconfigure: delete and recreate the PortChannel with default (LACP) runner. Also check if admin_status is up: redis-cli -n 4 HGETALL 'PORTCHANNEL|PortChannel1' | grep admin.",
+      "commands": [
+        "redis-cli -n 4 HGETALL 'PORTCHANNEL|PortChannel1'",
+        "docker exec teamd teamdctl PortChannel1 config dump"
+      ]
+    },
+    {
+      "node_id": "n14",
+      "node_type": "leaf",
+      "finding": "One or more member ports are physically down -- LACP cannot start on a link-down port",
+      "action": "Resolve physical link issues first: (1) Check interface status: show interfaces status, (2) Check transceiver presence and DOM: show interfaces transceiver presence; show interfaces transceiver dom, (3) Check for port errors: show interfaces counters errors, (4) Check if port is admin-down: redis-cli -n 4 HGETALL 'PORT|Ethernet0' | grep admin, bring up with: config interface startup Ethernet0, (5) Check cable/SFP on the down port. LACP will not send PDUs on a link-down member -- the PortChannel will not form until minimum links (min_links) are satisfied.",
+      "commands": [
+        "show interfaces status",
+        "show interfaces transceiver presence",
+        "show interfaces counters errors",
+        "redis-cli -n 4 HGETALL 'PORT|Ethernet0'"
+      ]
+    },
+    {
+      "node_id": "n15",
+      "node_type": "leaf",
+      "finding": "Local side sending LACPDUs but partner is not responding -- physical layer issue, partner misconfiguration, or CoPP dropping LACP on the partner",
+      "action": "Diagnose why partner LACPDUs are not arriving: (1) Confirm LACPDUs are actually leaving the local port with a packet capture: sudo tcpdump -i Ethernet0 -n ether proto 0x8809 -c 10 (EtherType 0x8809 is Slow Protocols including LACP), (2) Check if the partner port is configured for LACP at all (partner may be in static/access mode), (3) Check CoPP on the partner -- LACP is a control-plane protocol and can be rate-limited or dropped by a misconfigured CoPP policy: redis-cli -n 4 HGETALL 'COPP_TABLE|copp-system-lacp', (4) Check for VLAN mismatches blocking the untagged LACP frames, (5) Verify the physical path end-to-end -- no intermediate device should be consuming LACP PDUs (they are link-local, EtherType 0x8809, destination 01:80:C2:00:00:02).",
+      "commands": [
+        "sudo tcpdump -i Ethernet0 -n ether proto 0x8809 -c 10",
+        "redis-cli -n 4 HGETALL 'COPP_TABLE|copp-system-lacp'",
+        "show interfaces counters | grep Ethernet0"
+      ]
+    },
+    {
+      "node_id": "n16",
+      "node_type": "leaf",
+      "finding": "LACP parameter mismatch between local and partner -- system priority, port key, or system-id disagreement preventing aggregation",
+      "action": "LACP will not aggregate ports whose actor_key and partner_key do not match, or whose system-id (MAC) is unexpected. Diagnose and fix: (1) Compare actor vs partner fields in: docker exec teamd teamdctl PortChannel1 state dump -- look for 'actor_lacpdu_info' and 'partner_lacpdu_info' blocks, (2) Key mismatch: the LACP key is derived from the PortChannel ID -- ensure both sides use matching port keys. In SONiC the key is set by teammgrd based on the PortChannel index, (3) System priority mismatch: check redis-cli -n 4 HGETALL 'PORTCHANNEL|PortChannel1' for system_priority field; default is 65535. Both sides should match or the higher-priority side controls aggregation, (4) System-ID mismatch: this is the switch MAC address -- normally auto-set but verify with show lacp, (5) After fixing partner config, wait for LACP timeout (1s fast, 30s slow) for re-negotiation.",
+      "commands": [
+        "docker exec teamd teamdctl PortChannel1 state dump",
+        "redis-cli -n 4 HGETALL 'PORTCHANNEL|PortChannel1'",
+        "show lacp neighbor"
+      ]
+    },
+    {
+      "node_id": "n17",
+      "node_type": "leaf",
+      "finding": "LACP state flag mismatch -- most common causes are timeout mode mismatch (fast vs slow) or partner port in INDIVIDUAL (non-aggregatable) mode",
+      "action": "Interpret the state flags from: docker exec teamd teamdctl PortChannel1 state dump. Key flags to check: (1) TIMEOUT flag -- if local is FAST (short timeout, 1s PDU interval) and partner is SLOW (30s PDU interval), they may fail to agree. Check: redis-cli -n 4 HGETALL 'PORTCHANNEL|PortChannel1' | grep fast_rate. Fix by making both sides match (both fast or both slow), (2) AGGREGATION flag -- if partner shows INDIVIDUAL (aggregation=false) the partner port is not willing to aggregate. This means the partner has decided the port should stand alone -- check partner LACP config, (3) SYNCHRONIZATION flag -- if not set on partner, partner has not matched its port to an aggregator. This resolves once key/system-id match, (4) COLLECTING/DISTRIBUTING flags -- set only after SYNC. If stuck without COLLECTING after SYNC, look for orchagent or SAI failure programming the LAG member. Check: docker exec swss grep 'Ethernet0' /var/log/swss/orchagent.log | tail -20.",
+      "commands": [
+        "docker exec teamd teamdctl PortChannel1 state dump",
+        "redis-cli -n 4 HGETALL 'PORTCHANNEL|PortChannel1'",
+        "docker exec swss grep -i 'lag\\|ethernet0' /var/log/swss/orchagent.log | tail -20"
+      ]
+    }
+  ]
+}

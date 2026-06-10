@@ -1,0 +1,1037 @@
+{
+  "protocol_id": "vxlan-evpn",
+  "protocol_name": "VXLAN/EVPN",
+  "protocol_family": "overlay",
+  "standard": "RFC 7348 (VXLAN), RFC 8365 (EVPN overlay)",
+  "category": "overlay",
+  "purpose": "Virtual Extensible LAN with EVPN control plane for scalable overlay networking",
+  "operates_at": "Layer 2 over Layer 3",
+  "transport": "UDP port 4789 (VXLAN encapsulation)",
+  "def_refs": [
+    "daemon:tunnelmgrd",
+    "daemon:orchagent",
+    "daemon:syncd",
+    "daemon:bgpd",
+    "daemon:zebra",
+    "daemon:fpmsyncd",
+    "db:config_db",
+    "db:appl_db",
+    "db:asic_db",
+    "db:state_db"
+  ],
+  "states": [
+    {
+      "name": "VTEP_UNCONFIGURED",
+      "description": "No VXLAN tunnel endpoint (VTEP) has been configured. The VXLAN_TUNNEL table in CONFIG_DB has no entries. tunnelmgrd has nothing to program. No VXLAN overlay traffic is possible.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "redis-cli -n 4 KEYS 'VXLAN_TUNNEL*'",
+        "show vxlan tunnel",
+        "show vxlan interface"
+      ]
+    },
+    {
+      "name": "VTEP_CONFIGURED",
+      "description": "VXLAN_TUNNEL entry exists in CONFIG_DB with a source IP address. tunnelmgrd has received the configuration and is attempting to bring up the VTEP interface. The VXLAN device (vtep<n> or similar) has been created in the kernel but the tunnel is not yet operationally active.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "show vxlan interface",
+        "redis-cli -n 4 HGETALL 'VXLAN_TUNNEL|<name>'",
+        "ip link show type vxlan"
+      ]
+    },
+    {
+      "name": "VTEP_UP",
+      "description": "The VTEP source interface is up and reachable. The VXLAN tunnel device is operationally active. EVPN BGP sessions are ESTABLISHED (if EVPN is in use). VNI mappings have been programmed via VXLAN_TUNNEL_MAP. This is the steady-state operational condition for a functioning VXLAN VTEP.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "show vxlan tunnel",
+        "show vxlan remotevtep",
+        "show vxlan vlanvnimap",
+        "show vxlan remotemac all",
+        "docker exec bgp vtysh -c 'show bgp l2vpn evpn summary'"
+      ]
+    },
+    {
+      "name": "VTEP_DOWN",
+      "description": "The VTEP source interface is administratively down, link-down, or has no IP address. All VXLAN tunnels to remote VTEPs are operationally down. BUM flooding and unicast VXLAN encapsulation are not possible. All overlay forwarding ceases.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "show vxlan tunnel",
+        "show interface <src-intf>",
+        "ip link show type vxlan"
+      ]
+    },
+    {
+      "name": "TUNNEL_PROGRAMMING_FAILED",
+      "description": "CONFIG_DB has VXLAN tunnel and VNI map entries, tunnelmgrd has attempted to program them into APPL_DB, but orchagent or syncd has returned a SAI error. The tunnel exists in software but is not programmed in the ASIC. VXLAN encapsulation/decapsulation will not occur in hardware.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "docker logs swss 2>&1 | grep -E 'VXLAN|tunnel|SAI' | tail -50",
+        "docker logs syncd 2>&1 | grep -E 'ERROR|SAI_STATUS' | tail -30",
+        "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_TUNNEL*'"
+      ]
+    },
+    {
+      "name": "EVPN_LEARNING",
+      "description": "VTEP is up and EVPN BGP sessions are ESTABLISHED. Type-2 (MAC/IP) and Type-3 (IMET) routes are being exchanged. Remote MAC addresses and VTEP endpoints are being populated in the FDB and NVO tables. Overlay traffic is flowing but the network has not yet converged to a complete state.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "docker exec bgp vtysh -c 'show bgp l2vpn evpn'",
+        "show vxlan remotemac all",
+        "show vxlan remotevtep"
+      ]
+    },
+    {
+      "name": "EVPN_CONVERGED",
+      "description": "All EVPN route types (Type-2, Type-3, Type-5 where applicable) have been exchanged and installed. Remote MAC/IP entries are programmed in the ASIC FDB. BUM flooding lists are complete. Overlay unicast, ARP suppression, and inter-VNI routing are all functioning. Full steady-state operation.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "show vxlan remotemac all",
+        "show vxlan remotevtep",
+        "docker exec bgp vtysh -c 'show bgp l2vpn evpn summary'",
+        "docker exec bgp vtysh -c 'show evpn vni detail'",
+        "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY*' | wc -l"
+      ]
+    }
+  ],
+  "transitions": [
+    {
+      "from_state": "VTEP_UNCONFIGURED",
+      "to_state": "VTEP_CONFIGURED",
+      "trigger": "Operator creates VXLAN_TUNNEL entry in CONFIG_DB via 'config vxlan add <name> <src-ip>'; tunnelmgrd detects the change and creates the VXLAN kernel device",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "VTEP_CONFIGURED",
+      "to_state": "VTEP_UP",
+      "trigger": "VTEP source interface comes up with the configured IP address; VNI-to-VLAN mappings provisioned via VXLAN_TUNNEL_MAP; EVPN BGP sessions established",
+      "failure_if_stuck": "Source interface is down or has no IP; loopback IP not configured; tunnelmgrd failed to create VXLAN device; orchagent SAI error on tunnel creation"
+    },
+    {
+      "from_state": "VTEP_CONFIGURED",
+      "to_state": "VTEP_DOWN",
+      "trigger": "Source interface is down or IP address removed",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "VTEP_UP",
+      "to_state": "VTEP_DOWN",
+      "trigger": "Source interface loses link or IP, underlay routing fails to keep source IP reachable, or tunnelmgrd removes the VTEP due to CONFIG_DB deletion",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "VTEP_DOWN",
+      "to_state": "VTEP_CONFIGURED",
+      "trigger": "Source interface comes back up; tunnelmgrd re-evaluates VXLAN_TUNNEL entry",
+      "failure_if_stuck": "Persistent underlay issue; check source interface and loopback configuration"
+    },
+    {
+      "from_state": "VTEP_UP",
+      "to_state": "TUNNEL_PROGRAMMING_FAILED",
+      "trigger": "orchagent receives VXLAN tunnel or FDB entry from APPL_DB but SAI API returns an error; ASIC resource exhaustion or driver bug",
+      "failure_if_stuck": "ASIC VXLAN tunnel table full; SAI driver does not support requested tunnel parameters; check syncd and orchagent logs for SAI error codes"
+    },
+    {
+      "from_state": "VTEP_UP",
+      "to_state": "EVPN_LEARNING",
+      "trigger": "First EVPN BGP session reaches ESTABLISHED and begins exchanging Type-2 or Type-3 routes",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "EVPN_LEARNING",
+      "to_state": "EVPN_CONVERGED",
+      "trigger": "All expected EVPN routes received; remote VTEP list complete; FDB entries programmed in ASIC",
+      "failure_if_stuck": "BGP EVPN session not ESTABLISHED; route filtering dropping Type-2 or Type-3 routes; orchagent failing to program FDB entries"
+    },
+    {
+      "from_state": "EVPN_CONVERGED",
+      "to_state": "EVPN_LEARNING",
+      "trigger": "BGP EVPN session reset; remote VTEP unreachable; bulk MAC flush triggered by link event",
+      "failure_if_stuck": ""
+    }
+  ],
+  "timers": [
+    {
+      "name": "MAC Aging Timer",
+      "description": "Time after which a learned MAC entry that has not been refreshed is aged out of the FDB. In EVPN deployments with ARP suppression, MAC entries are primarily learned via BGP Type-2 routes rather than data-plane flooding, so this timer primarily affects locally learned MACs.",
+      "default": "300s (platform-dependent)",
+      "range": "0-65535s (0 disables aging)",
+      "on_expiry": "MAC entry removed from FDB; if EVPN Type-2 route still present in BGP table, orchagent re-installs from BGP",
+      "sonic_default": "300s (configured per VLAN in CONFIG_DB VLAN table or platform default)",
+      "sonic_config_path": "CONFIG_DB VLAN|Vlan<id>: mac_aging_time field",
+      "sonic_frr_path": "Not applicable -- FDB aging is handled by the ASIC via SAI, not by FRR",
+      "tuning_advice": "Leave at default for most deployments. Setting to 0 in EVPN fabrics can cause stale FDB entries if BGP withdrawals are delayed."
+    },
+    {
+      "name": "ARP Suppression Timer",
+      "description": "Time an ARP entry learned via EVPN Type-2 MAC/IP route is held in the neigh table before being refreshed or expired. Controls how long the VTEP can suppress ARP broadcasts for a remote host without re-querying.",
+      "default": "Linux kernel default (typically 1200s reachable, 30s stale)",
+      "range": "Kernel neigh table gc_stale_time, typically 60-3600s",
+      "on_expiry": "Neighbor entry moves from REACHABLE to STALE; subsequent traffic may trigger ARP probe or EVPN Type-2 re-advertisement",
+      "sonic_default": "Kernel default; not directly configurable via CONFIG_DB",
+      "sonic_config_path": "Not directly configurable via CONFIG_DB; kernel sysctl net.ipv4.neigh.*.gc_stale_time",
+      "sonic_frr_path": "Not applicable -- ARP suppression state maintained by zebra neigh table and kernel",
+      "tuning_advice": "Ensure ARP suppression is enabled per VNI in CONFIG_DB SUPPRESS_VLAN_NEIGH_ARP. Aggressive aging can cause unnecessary ARP flooding across the fabric."
+    },
+    {
+      "name": "EVPN Route Hold Timer",
+      "description": "BGP hold timer on the EVPN peering session. Same as BGP hold timer but specifically for L2VPN EVPN address family neighbors. When the hold timer expires, all EVPN routes from that peer are withdrawn, causing MAC and VTEP flush.",
+      "default": "180s (FRR BGP default)",
+      "range": "0 or 3-65535s",
+      "on_expiry": "EVPN BGP session torn down; all Type-2, Type-3, Type-5 routes from that peer withdrawn; remote MAC entries flushed from FDB",
+      "sonic_default": "180s (inherited from BGP_NEIGHBOR or BGP_GLOBALS timers)",
+      "sonic_config_path": "CONFIG_DB BGP_NEIGHBOR|<ip>: holdtime field",
+      "sonic_frr_path": "bgpd: peer->v_holdtime (FRR source: bgpd/bgp_fsm.c)",
+      "tuning_advice": "Use BFD for fast detection rather than aggressive hold timers. A hold timer expiry causes bulk MAC flush and BUM flooding until EVPN re-converges."
+    },
+    {
+      "name": "Tunnel Endpoint Reachability Check",
+      "description": "Underlay BGP or OSPF convergence timer that determines how quickly the local VTEP detects that a remote VTEP's loopback is unreachable. Not a VXLAN-specific timer but directly controls VTEP tunnel liveness in the absence of BFD.",
+      "default": "Depends on underlay protocol (BGP hold timer 180s; OSPF dead interval 40s)",
+      "range": "Protocol-specific",
+      "on_expiry": "Underlay route to remote VTEP withdrawn; VXLAN traffic to that VTEP is black-holed until route is restored",
+      "sonic_default": "BGP underlay: FRR default 180s hold (or 9s with fast timers); OSPF: 40s dead interval",
+      "sonic_config_path": "BGP underlay: CONFIG_DB BGP_NEIGHBOR holdtime; OSPF: CONFIG_DB OSPFV2_ROUTER_AREA_VIRTUAL_LINK or OSPF interface timer",
+      "sonic_frr_path": "bgpd: peer->v_holdtime or ospfd: dead interval",
+      "tuning_advice": "Enable BFD on underlay BGP sessions to get sub-second VTEP failure detection. Without BFD, black-holing can last for the full BGP hold period."
+    }
+  ],
+  "messages": [
+    {
+      "name": "VXLAN Encapsulated Frame",
+      "description": "A Layer 2 Ethernet frame encapsulated inside a UDP/IP packet using VXLAN. The outer IP header uses the source and destination VTEP addresses. The VXLAN header contains the 24-bit VNI identifying the virtual network segment. Sent over UDP destination port 4789.",
+      "when_sent": "Whenever a packet destined for a remote VTEP host needs to traverse the IP underlay; also for BUM (Broadcast, Unknown unicast, Multicast) frames using head-end replication",
+      "key_fields": [
+        "Outer Ethernet header: src/dst MAC of underlay next-hop",
+        "Outer IP header: src=local VTEP IP, dst=remote VTEP IP",
+        "Outer UDP header: src=ephemeral (flow-based entropy), dst=4789",
+        "VXLAN header: Flags (I-bit set), Reserved, VNI (24-bit), Reserved",
+        "Inner Ethernet frame: original L2 frame including src/dst MAC, VLAN (stripped), payload"
+      ]
+    },
+    {
+      "name": "BGP EVPN Type-2 (MAC/IP Advertisement Route)",
+      "description": "EVPN BGP UPDATE advertising a specific MAC address and optionally its associated IP address within a VNI. Used for remote MAC/ARP learning without data-plane flooding. The receiving VTEP installs the MAC in its FDB pointing to the advertising VTEP. With an IP address included, enables ARP suppression.",
+      "when_sent": "When a local host's MAC (and optionally IP) is learned on the local VTEP via data plane; also when ARP is resolved for a local host and ARP suppression is enabled",
+      "key_fields": [
+        "Route Distinguisher (RD): identifies the originating VRF/VTEP",
+        "ESI (Ethernet Segment Identifier): 10 bytes; zero for single-homed VTEPs",
+        "Ethernet Tag ID: 0 for VLAN-based VNI models",
+        "MAC Address Length: 48 bits",
+        "MAC Address: the advertised Layer 2 address",
+        "IP Address Length: 0 (MAC only) or 32/128 (MAC+IP for ARP suppression)",
+        "IP Address: IPv4 or IPv6 address of the host",
+        "MPLS Label / VNI: encodes the L2 VNI (VXLAN: uses BGP extended community)",
+        "Extended Communities: EVPN Encapsulation (VXLAN=8), Route Target (VNI-derived)"
+      ]
+    },
+    {
+      "name": "BGP EVPN Type-3 (Inclusive Multicast Ethernet Tag Route)",
+      "description": "EVPN BGP UPDATE advertising that a VTEP is present for a given VNI and should receive BUM (Broadcast, Unknown unicast, Multicast) traffic via head-end replication. Each VTEP advertises a Type-3 route per VNI it hosts. Receiving VTEPs build their BUM flood lists from these routes.",
+      "when_sent": "When a VNI is first instantiated on a VTEP (VNI added to VXLAN_TUNNEL_MAP); on EVPN session establishment to re-advertise all active VNIs",
+      "key_fields": [
+        "Route Distinguisher (RD): identifies the originating VTEP",
+        "Ethernet Tag ID: 0 for VLAN-based models",
+        "IP Address Length: 32 (IPv4) or 128 (IPv6)",
+        "Originating Router IP Address: the VTEP source IP (used as the replication target)",
+        "PMSI Tunnel Attribute: Ingress Replication (IR) type with the VTEP IP; VNI encoded in label field",
+        "Extended Communities: Route Target, EVPN Encapsulation (VXLAN=8)"
+      ]
+    },
+    {
+      "name": "BGP EVPN Type-5 (IP Prefix Route)",
+      "description": "EVPN BGP UPDATE advertising an IP prefix (not a MAC/host) across VNI boundaries. Used for inter-VRF routing (IP prefix routing between VXLANs) and for advertising external prefixes into the EVPN fabric. Requires a symmetric IRB or asymmetric IRB model with an L3 VNI.",
+      "when_sent": "When a prefix route (from a directly connected subnet, static route, or redistribution from another protocol) needs to be advertised into the EVPN fabric for inter-VNI or external routing",
+      "key_fields": [
+        "Route Distinguisher (RD): identifies the originating VRF",
+        "Ethernet Segment Identifier: 0",
+        "Ethernet Tag ID: 0",
+        "IP Prefix Length: 0-32 (IPv4) or 0-128 (IPv6)",
+        "IP Prefix: the advertised network",
+        "GW IP Address: gateway IP for the prefix (router's IRB interface IP)",
+        "MPLS Label / L3 VNI: L3 VNI encoded for inter-VRF routing",
+        "Extended Communities: Route Target for the L3 VRF, EVPN Encapsulation (VXLAN=8), Router MAC extended community"
+      ]
+    },
+    {
+      "name": "BGP EVPN Type-1 (Ethernet Auto-Discovery Route)",
+      "description": "Used for Ethernet Segment multi-homing (EVPN multihoming / ESI-based redundancy). Advertises which Ethernet Segments a VTEP is connected to, enabling aliasing and fast convergence. Less common in simple single-homed spine-leaf topologies but present in MCLAG/ESI deployments.",
+      "when_sent": "On VTEP startup for each configured Ethernet Segment (ESI); on link or port state changes for multi-homed segments",
+      "key_fields": [
+        "Route Distinguisher (RD)",
+        "Ethernet Segment Identifier (ESI): 10-byte identifier for the multi-homed segment",
+        "Ethernet Tag ID: per-EVI tag or 0xFFFFFFFF for ESI-level mass withdrawal",
+        "MPLS Label: 0 for withdrawal routes",
+        "Extended Communities: Route Target, ESI Label"
+      ]
+    },
+    {
+      "name": "ARP/ND Suppression (EVPN-driven)",
+      "description": "Not a BGP message type but a key EVPN behavior. When a VTEP has a MAC/IP Type-2 route for a remote host, it locally answers ARP requests for that host's IP without flooding the ARP across the fabric. The local VTEP acts as a proxy ARP responder. Reduces BUM flooding significantly in large overlay networks.",
+      "when_sent": "In response to ARP requests received from local hosts where the VTEP has a corresponding Type-2 MAC/IP route for the requested IP address",
+      "key_fields": [
+        "ARP Reply: src MAC = remote host MAC (from Type-2 route), src IP = requested IP",
+        "Suppressed ARP flood: the ARP request is NOT forwarded over VXLAN to the remote VTEP",
+        "State: SUPPRESS_VLAN_NEIGH_ARP in CONFIG_DB must be set for the VNI/VLAN"
+      ]
+    }
+  ],
+  "failure_modes": [
+    {
+      "scenario": "VTEP source interface not configured or down -- VXLAN tunnel cannot form",
+      "description": "The VXLAN tunnel source IP address (typically a loopback) is either not configured in CONFIG_DB VXLAN_TUNNEL, the source interface does not exist, or the interface is operationally down. Without a reachable source IP, tunnelmgrd cannot create the VTEP device, and no VXLAN encapsulation is possible. This is the most foundational VXLAN failure -- all other functions depend on a working VTEP.",
+      "symptoms": [
+        "'show vxlan interface' shows no VTEP or shows source IP as unconfigured/down",
+        "'show vxlan tunnel' shows no active tunnels",
+        "'ip link show type vxlan' shows the VXLAN device as DOWN",
+        "EVPN BGP may be ESTABLISHED but Type-3 IMET routes are not being generated",
+        "redis-cli -n 4 HGETALL 'VXLAN_TUNNEL|<name>' shows empty or missing src_ip field"
+      ],
+      "root_causes": [
+        "Loopback interface with VTEP source IP not configured: CONFIG_DB LOOPBACK_INTERFACE table missing the IP",
+        "VXLAN_TUNNEL CONFIG_DB entry created with wrong or missing src_ip",
+        "Loopback interface administratively down or link state down",
+        "tunnelmgrd crashed or not running, so CONFIG_DB VXLAN_TUNNEL entry was never processed",
+        "Source IP configured but not reachable by underlay routing (loopback not redistributed into underlay BGP/OSPF)",
+        "Docker container restart cleared the kernel VXLAN interface and tunnelmgrd has not re-created it"
+      ],
+      "resolution": [
+        "Verify loopback has the VTEP source IP: 'show interface Loopback0' and 'redis-cli -n 4 KEYS LOOPBACK*'",
+        "Check VXLAN_TUNNEL CONFIG_DB entry: 'redis-cli -n 4 HGETALL VXLAN_TUNNEL|<name>'",
+        "Verify tunnelmgrd is running: 'docker exec swss supervisorctl status tunnelmgrd'",
+        "Check tunnelmgrd logs: 'docker logs swss 2>&1 | grep -i tunnel | tail -50'",
+        "Ensure loopback IP is advertised into underlay: 'docker exec bgp vtysh -c show bgp ipv4 unicast' should show the loopback /32",
+        "If missing VXLAN_TUNNEL entry: 'config vxlan add <name> <src-ip>' to create it"
+      ],
+      "verify_commands": [
+        {
+          "command": "show vxlan interface",
+          "look_for": "VTEP source IP and operational state; should show the loopback IP as source",
+          "confirms_if": "Missing source IP or DOWN state confirms VTEP is not operational"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'VXLAN_TUNNEL|vtep'",
+          "look_for": "src_ip field present and matching the loopback IP",
+          "confirms_if": "Missing or wrong src_ip confirms CONFIG_DB VXLAN_TUNNEL misconfiguration"
+        },
+        {
+          "command": "ip link show type vxlan",
+          "look_for": "VXLAN interface operational state (UP/DOWN) and configured source IP",
+          "confirms_if": "Interface in DOWN state or absent confirms VTEP kernel device is not operational"
+        },
+        {
+          "command": "docker exec swss supervisorctl status tunnelmgrd",
+          "look_for": "tunnelmgrd should be RUNNING",
+          "confirms_if": "tunnelmgrd in STOPPED or FATAL state confirms tunnel programming daemon is not processing CONFIG_DB"
+        },
+        {
+          "command": "show interface Loopback0",
+          "look_for": "IP address configured, interface admin and oper state UP",
+          "confirms_if": "Missing IP or DOWN state on loopback confirms the VTEP source interface problem"
+        }
+      ]
+    },
+    {
+      "scenario": "VXLAN tunnel operationally down -- underlay connectivity issue or SAI tunnel creation failure",
+      "description": "The VTEP is configured and the source interface is up, but tunnels to specific remote VTEPs are operationally down. VXLAN-encapsulated packets toward those remote VTEPs are black-holed. The cause is either underlay IP reachability failure (the remote VTEP loopback is unreachable) or the ASIC SAI failed to create the tunnel object.",
+      "symptoms": [
+        "'show vxlan tunnel' shows specific remote VTEPs with status 'oper_down' or absent",
+        "Ping to remote VTEP loopback IP fails from SONiC host",
+        "VXLAN overlay traffic to hosts on the remote VTEP is dropped",
+        "orchagent logs show SAI errors for tunnel creation",
+        "STATE_DB VXLAN_TUNNEL_TABLE shows tunnel_state as 'down'"
+      ],
+      "root_causes": [
+        "Underlay BGP or OSPF session down -- remote VTEP loopback route withdrawn",
+        "Physical link failure in the underlay path between VTEPs",
+        "SAI VXLAN tunnel creation failed -- ASIC resource exhaustion or driver bug",
+        "Remote VTEP loopback not redistributed into underlay routing",
+        "ECMP underlay path asymmetry causing one-way VXLAN reachability",
+        "MTU too small in the underlay for VXLAN-encapsulated frames (need extra 50 bytes for VXLAN header)"
+      ],
+      "resolution": [
+        "Test underlay reachability: 'ping <remote-vtep-ip> -I <local-vtep-src-ip>'",
+        "Check underlay routing: 'show ip route <remote-vtep-ip>' -- should have a BGP or OSPF route",
+        "Verify remote VTEP is advertising its loopback: 'docker exec bgp vtysh -c show bgp ipv4 unicast <remote-vtep/32>'",
+        "Check orchagent for SAI tunnel errors: 'docker logs swss 2>&1 | grep -iE VXLAN|tunnel|SAI | tail -50'",
+        "Check MTU: underlay interfaces must support at least 1550 bytes (standard 1500 + 50 VXLAN overhead)",
+        "Verify STATE_DB tunnel state: 'redis-cli -n 6 HGETALL VXLAN_TUNNEL_TABLE|<name>|<remote-ip>'"
+      ],
+      "verify_commands": [
+        {
+          "command": "show vxlan tunnel",
+          "look_for": "Per-remote-VTEP operational state column; 'oper_down' or missing entries for remote VTEPs",
+          "confirms_if": "oper_down for specific remote VTEPs confirms tunnel-level failure to those endpoints"
+        },
+        {
+          "command": "ping <remote-vtep-ip> -I <local-vtep-src-ip> -c 5",
+          "look_for": "Packet loss to remote VTEP loopback IP from local VTEP source IP",
+          "confirms_if": "100% loss confirms underlay reachability failure -- the IP path between VTEPs is broken"
+        },
+        {
+          "command": "show ip route <remote-vtep-ip>",
+          "look_for": "Route to remote VTEP loopback IP; absence means underlay routing has not learned it",
+          "confirms_if": "No route to remote VTEP IP confirms underlay routing failure is the root cause"
+        },
+        {
+          "command": "docker logs swss 2>&1 | grep -iE 'VXLAN|tunnel' | tail -50",
+          "look_for": "SAI tunnel creation errors, SAI_STATUS_TABLE_FULL, or resource exhaustion messages",
+          "confirms_if": "SAI error messages confirm ASIC-level tunnel programming failure"
+        },
+        {
+          "command": "ip link show <underlay-interface>",
+          "look_for": "MTU value on underlay interfaces -- should be at least 1550 for standard VXLAN",
+          "confirms_if": "MTU of 1500 on underlay interface with no jumbo frames configured confirms MTU-related packet drops"
+        }
+      ]
+    },
+    {
+      "scenario": "Remote MAC not learned via EVPN Type-2 route -- BGP EVPN session down or route filtering",
+      "description": "A remote host's MAC address is not present in the local VTEP's FDB, so traffic to that host triggers unknown unicast flooding instead of direct VXLAN unicast encapsulation to the correct remote VTEP. The expected BGP EVPN Type-2 route for that MAC/IP has not been received, either because the EVPN BGP session is down, the route is filtered, or the remote VTEP has not generated the Type-2 advertisement.",
+      "symptoms": [
+        "'show vxlan remotemac all' does not show the expected remote host MAC",
+        "Traffic to remote host causes BUM flooding instead of direct unicast VXLAN forwarding",
+        "'docker exec bgp vtysh -c show bgp l2vpn evpn' shows no Type-2 routes from the remote VTEP",
+        "EVPN BGP session to route reflector or remote VTEP is not ESTABLISHED",
+        "FDB shows the MAC as 'dynamic' learned (data-plane) rather than 'static' from EVPN"
+      ],
+      "root_causes": [
+        "BGP EVPN session (L2VPN EVPN address family) not ESTABLISHED with route reflector or remote VTEP",
+        "L2VPN EVPN address family not activated for the BGP neighbor ('neighbor <ip> activate' missing under address-family l2vpn evpn)",
+        "Inbound route-map filtering Type-2 routes from the route reflector",
+        "Remote VTEP has not configured ARP suppression so no MAC/IP Type-2 routes are generated",
+        "VNI mismatch -- local and remote VTEPs use different VNI values for the same VLAN",
+        "Route target mismatch -- import RT on local VTEP does not match export RT on remote VTEP",
+        "Remote host's MAC never learned on the remote VTEP (host not yet active or sending traffic)"
+      ],
+      "resolution": [
+        "Check EVPN BGP session: 'docker exec bgp vtysh -c show bgp l2vpn evpn summary'",
+        "Check L2VPN EVPN address family activation: 'docker exec bgp vtysh -c show bgp neighbors <ip>' -- look for L2VPN EVPN in address families",
+        "Check Type-2 routes: 'docker exec bgp vtysh -c show bgp l2vpn evpn type macip'",
+        "Verify route targets match: 'docker exec bgp vtysh -c show bgp l2vpn evpn vni <vni>'",
+        "Verify VNI mapping: 'show vxlan vlanvnimap' -- confirm VLAN-to-VNI mapping matches remote",
+        "Check inbound policy: 'docker exec bgp vtysh -c show bgp neighbors <ip> policy'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp l2vpn evpn summary'",
+          "look_for": "EVPN neighbor states -- all should be ESTABLISHED; Up/Down column shows session uptime",
+          "confirms_if": "EVPN BGP session not ESTABLISHED confirms the control-plane path for MAC learning is broken"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp l2vpn evpn type macip'",
+          "look_for": "Type-2 route entries -- should show MAC addresses from all remote VTEPs; absent entries indicate missing advertisements",
+          "confirms_if": "No Type-2 routes for the expected remote VTEP confirms the MAC advertisement is not being received"
+        },
+        {
+          "command": "show vxlan remotemac all",
+          "look_for": "Remote MAC address entries with associated remote VTEP IP and VNI",
+          "confirms_if": "Missing MAC entry confirms FDB has not been populated from EVPN; check if issue is BGP control plane or orchagent programming"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp l2vpn evpn vni <vni>'",
+          "look_for": "VNI presence, Route Distinguisher, import/export Route Targets",
+          "confirms_if": "Missing VNI or mismatched route targets confirms RT configuration is preventing Type-2 route import"
+        },
+        {
+          "command": "show vxlan vlanvnimap",
+          "look_for": "VLAN to VNI mapping table -- verify VLAN and VNI numbers match expected values",
+          "confirms_if": "VNI mismatch confirms the VLAN is mapped to wrong VNI locally, preventing route matching with remote VTEP"
+        }
+      ]
+    },
+    {
+      "scenario": "ARP suppression not working -- unnecessary ARP flooding across VXLAN fabric",
+      "description": "ARP requests for remote hosts are being flooded across the VXLAN fabric as BUM traffic instead of being answered locally by the receiving VTEP. This defeats the scalability benefit of EVPN ARP suppression and causes excessive background traffic across all VTEPs in the VNI. The VTEP has EVPN Type-2 MAC/IP routes but is not using them to suppress ARP.",
+      "symptoms": [
+        "Excessive BUM traffic visible on VXLAN interfaces during normal operation",
+        "ARP requests reaching remote VTEPs even when Type-2 MAC/IP routes exist for the target IP",
+        "SUPPRESS_VLAN_NEIGH_ARP not set in CONFIG_DB for the VNI",
+        "'show vxlan arp-suppression-cache Vlan<x>' returns empty or missing entries",
+        "High packet rates on VXLAN underlay interfaces not matching unicast traffic patterns"
+      ],
+      "root_causes": [
+        "ARP suppression not enabled: SUPPRESS_VLAN_NEIGH_ARP missing from CONFIG_DB for the VLAN/VNI",
+        "EVPN Type-2 routes do not include the IP address (MAC-only Type-2 routes cannot enable ARP suppression)",
+        "orchagent has not programmed the neighbor suppression entry into the ASIC",
+        "Host IP not yet populated in Type-2 route (host not yet sent ARP reply that triggers MAC/IP advertisement)",
+        "FRR 'advertise-svi-ip' not configured -- local SVI MAC/IP not advertised to remote VTEPs",
+        "neigh-suppress kernel flag not set on the VXLAN interface for the affected bridge domain"
+      ],
+      "resolution": [
+        "Enable ARP suppression in CONFIG_DB: 'config neigh-suppress enable Vlan<x>' -- creates SUPPRESS_VLAN_NEIGH_ARP entry",
+        "Verify suppression config: 'redis-cli -n 4 KEYS SUPPRESS_VLAN_NEIGH_ARP*'",
+        "Check Type-2 routes include IP: 'docker exec bgp vtysh -c show bgp l2vpn evpn type macip' -- look for /32 IP entries",
+        "Verify kernel neigh-suppress: 'bridge link show' -- neigh_suppress flag should be 'on' for VXLAN-attached bridge ports",
+        "Check ARP suppression cache: 'show vxlan arp-suppression-cache Vlan<id>'",
+        "Confirm orchagent has programmed suppression: 'docker logs swss 2>&1 | grep -i suppress | tail -30'"
+      ],
+      "verify_commands": [
+        {
+          "command": "redis-cli -n 4 KEYS 'SUPPRESS_VLAN_NEIGH_ARP*'",
+          "look_for": "Entries for all VLANs where ARP suppression should be active",
+          "confirms_if": "Missing entries confirm ARP suppression is not configured for those VLANs"
+        },
+        {
+          "command": "show vxlan arp-suppression-cache Vlan<id>",
+          "look_for": "IP-to-MAC mappings in the local ARP suppression cache with their remote VTEP endpoints",
+          "confirms_if": "Empty cache despite EVPN Type-2 MAC/IP routes confirms orchagent is not populating the suppression table"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp l2vpn evpn type macip'",
+          "look_for": "Routes that include both MAC and IP (/32 or /128 entries); MAC-only entries cannot suppress ARP",
+          "confirms_if": "Only MAC-only Type-2 routes (no IP portion) confirms why ARP suppression cannot function"
+        },
+        {
+          "command": "bridge link show",
+          "look_for": "neigh_suppress on/off flag for bridge ports connected to VXLAN interfaces",
+          "confirms_if": "neigh_suppress off on the relevant bridge ports confirms kernel-level ARP suppression is not active"
+        }
+      ]
+    },
+    {
+      "scenario": "EVPN Type-5 prefix routes not installed -- IP prefix inter-VNI routing failure",
+      "description": "Inter-VNI IP routing (also called symmetric IRB or IP prefix routing) is not working. Hosts in different VNIs that should be able to communicate via a shared L3 VNI cannot reach each other. The expected BGP EVPN Type-5 IP prefix routes are not present in the local VTEP's routing table. This prevents IP routing between overlay segments.",
+      "symptoms": [
+        "Hosts in different VLANs/VNIs cannot ping each other despite correct VLAN configuration",
+        "'docker exec bgp vtysh -c show bgp l2vpn evpn type prefix' shows no Type-5 routes",
+        "'show ip route vrf <vrf-name>' is missing expected prefixes from remote VNIs",
+        "L3 VNI not configured or not associated with the VRF in CONFIG_DB",
+        "Remote hosts reachable within same VNI but not across VNI boundaries"
+      ],
+      "root_causes": [
+        "L3 VNI not configured in CONFIG_DB VRF table ('vni' field missing from VRF|<name>)",
+        "L3 VNI not mapped in VXLAN_TUNNEL_MAP for the L3 VRF VNI",
+        "FRR not configured to advertise Type-5 routes: 'advertise ipv4 unicast' missing under address-family l2vpn evpn in FRR",
+        "Route target mismatch between VRFs on different VTEPs -- import RT does not match export RT",
+        "Router MAC extended community missing or mismatched -- remote VTEP cannot do symmetric IRB decapsulation",
+        "SVI interface (IRB) for the VNI not created or no IP address assigned",
+        "VRF not imported into FRR BGP table: 'address-family ipv4 unicast' inside 'router bgp <asn> vrf <name>' not configured"
+      ],
+      "resolution": [
+        "Configure L3 VNI: 'config vrf add_vrf_vni_map <vrf-name> <l3-vni>'",
+        "Verify L3 VNI in CONFIG_DB: 'redis-cli -n 4 HGETALL VRF|<vrf-name>' -- vni field must be set",
+        "Verify FRR EVPN Type-5 advertisement: 'docker exec bgp vtysh -c show running-config' -- look for 'advertise ipv4 unicast' under l2vpn evpn",
+        "Check route targets: 'docker exec bgp vtysh -c show bgp l2vpn evpn vni <l3-vni>'",
+        "Verify SVI has IP: 'show interface Vlan<id>' -- SVI must have an IRB IP address",
+        "Check Type-5 routes: 'docker exec bgp vtysh -c show bgp l2vpn evpn type prefix'"
+      ],
+      "verify_commands": [
+        {
+          "command": "redis-cli -n 4 HGETALL 'VRF|<vrf-name>'",
+          "look_for": "vni field set to the L3 VNI value; missing vni field confirms L3 VNI not configured",
+          "confirms_if": "Missing or zero vni field in VRF CONFIG_DB entry confirms inter-VNI routing cannot work"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp l2vpn evpn type prefix'",
+          "look_for": "Type-5 IP prefix routes from remote VTEPs for expected subnets",
+          "confirms_if": "No Type-5 routes confirms the prefix advertisement or import is not working"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show evpn vni detail'",
+          "look_for": "L3 VNI entries with associated VRF names and SVI interfaces; Type-5 route counts",
+          "confirms_if": "Missing L3 VNI entries or zero Type-5 route counts confirm IRB is not configured correctly in FRR"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp vrf <vrf-name> ipv4 unicast'",
+          "look_for": "Prefix routes from remote VNIs that should be installed via EVPN Type-5 import",
+          "confirms_if": "Missing prefixes in the VRF routing table confirms Type-5 routes are not being imported"
+        },
+        {
+          "command": "show vxlan vlanvnimap",
+          "look_for": "L3 VNI mapped entry for the VRF in addition to L2 VNI entries",
+          "confirms_if": "Missing L3 VNI in the map confirms the VXLAN tunnel mapping for inter-VNI routing is absent"
+        }
+      ]
+    },
+    {
+      "scenario": "EVPN Type-3 IMET route missing -- BUM traffic not flooding correctly",
+      "description": "Broadcast, Unknown unicast, and Multicast (BUM) traffic is not being flooded correctly across the VXLAN fabric. Remote VTEPs are not receiving BUM frames because the local VTEP is missing Type-3 IMET (Inclusive Multicast Ethernet Tag) routes for the expected remote VTEPs. Without IMET routes, the head-end replication (ingress replication) BUM flood list is incomplete.",
+      "symptoms": [
+        "ARP broadcasts from local hosts do not reach remote VTEPs",
+        "New hosts in the fabric are not discovered by remote VTEPs even after VTEP comes up",
+        "'docker exec bgp vtysh -c show bgp l2vpn evpn type multicast' shows no entries for some VTEPs",
+        "show vxlan remotevtep shows incomplete list of remote VTEPs for a VNI",
+        "EVPN BGP session is up but remote VTEPs are not appearing in the flood list"
+      ],
+      "root_causes": [
+        "EVPN BGP session with route reflector or remote VTEP is not ESTABLISHED for L2VPN EVPN AFI",
+        "Remote VTEP has VNI configured but EVPN control plane is not generating Type-3 routes (FRR 'advertise-all-vni' not configured)",
+        "Inbound route-map filtering Type-3 multicast routes",
+        "VNI not activated on the remote VTEP at all -- remote VTEP does not host this VNI",
+        "Route target mismatch causing local VTEP to not import Type-3 routes for the VNI",
+        "FRR 'advertise-all-vni' command missing from EVPN BGP configuration on the remote VTEP"
+      ],
+      "resolution": [
+        "Check EVPN session: 'docker exec bgp vtysh -c show bgp l2vpn evpn summary'",
+        "Check Type-3 routes: 'docker exec bgp vtysh -c show bgp l2vpn evpn type multicast'",
+        "Verify 'advertise-all-vni' is configured: 'docker exec bgp vtysh -c show running-config' -- look for 'advertise-all-vni' under address-family l2vpn evpn",
+        "Check flood list per VNI: 'docker exec bgp vtysh -c show evpn vni <vni>'",
+        "Verify remote VTEP VNI list: 'show vxlan remotevtep' -- compare against expected VTEPs",
+        "Check for inbound filtering: 'docker exec bgp vtysh -c show bgp neighbors <ip> policy'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp l2vpn evpn type multicast'",
+          "look_for": "Type-3 IMET routes from all expected remote VTEPs; each VTEP should have one entry per VNI",
+          "confirms_if": "Missing Type-3 routes for specific remote VTEPs confirms BUM flood list is incomplete for those VTEPs"
+        },
+        {
+          "command": "show vxlan remotevtep",
+          "look_for": "List of remote VTEP IP addresses known for each VNI; should include all VTEPs hosting the VNI",
+          "confirms_if": "Incomplete remote VTEP list confirms missing IMET routes and broken BUM flooding"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show evpn vni <vni>'",
+          "look_for": "Remote VTEP flood list entry count; ingress replication list of remote VTEP IPs",
+          "confirms_if": "Empty or incomplete flood list confirms Type-3 IMET routes are not being imported for this VNI"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show running-config' | grep -A5 'address-family l2vpn evpn'",
+          "look_for": "'advertise-all-vni' command under l2vpn evpn address family",
+          "confirms_if": "Missing 'advertise-all-vni' confirms local VTEP is not generating Type-3 routes for its VNIs"
+        }
+      ]
+    },
+    {
+      "scenario": "Underlay BGP issues affecting VXLAN -- next-hop unreachable for VTEP peer, tunnel black-holing traffic",
+      "description": "The underlay BGP (or other underlay routing protocol) is failing to maintain reachable routes to one or more remote VTEP loopback addresses. VXLAN traffic is black-holed because the VTEP IP is not reachable. Unlike other BGP failures, this does not affect the EVPN control plane directly -- the EVPN BGP session (typically over a route reflector or separate peering) may stay up while data-plane VXLAN encapsulation silently drops packets.",
+      "symptoms": [
+        "EVPN BGP session is ESTABLISHED but VXLAN overlay traffic to specific remote VTEPs is dropped",
+        "Ping to remote VTEP loopback fails while BGP session to route reflector remains up",
+        "show ip route <remote-vtep-ip> returns no route or a stale route",
+        "Intermittent traffic loss with some overlay flows succeeding and others failing (ECMP path failure)",
+        "BFD session to remote VTEP (if configured) is DOWN"
+      ],
+      "root_causes": [
+        "Underlay BGP peering to spine or directly to remote VTEP has gone down, withdrawing the route to remote VTEP loopback",
+        "Physical link failure in the underlay fabric -- one or more spine uplinks are down",
+        "ECMP path failure with asymmetric routing -- traffic goes one way but returns via different path",
+        "Underlay route filtering: the remote VTEP loopback /32 is being filtered by an outbound or inbound policy",
+        "Recursive next-hop resolution failure: the BGP next-hop for the VTEP route is itself unreachable",
+        "MTU mismatch in the underlay causing VXLAN-sized packets to be dropped while small packets pass"
+      ],
+      "resolution": [
+        "Test VTEP-to-VTEP underlay reachability: 'ping <remote-vtep-ip> -I <local-vtep-loopback-ip>'",
+        "Check underlay routing table: 'show ip route <remote-vtep-ip>'",
+        "Check underlay BGP sessions: 'show bgp summary' -- all spine/underlay peers should be ESTABLISHED",
+        "Check BFD state if configured: 'show bfd peers' -- BFD DOWN on underlay peer confirms the path is broken",
+        "Run traceroute to identify where the path breaks: 'traceroute <remote-vtep-ip> -s <local-vtep-ip>'",
+        "Check physical links to spines: 'show interfaces status' -- verify all uplinks are up"
+      ],
+      "verify_commands": [
+        {
+          "command": "ping <remote-vtep-ip> -I <local-vtep-loopback> -c 5",
+          "look_for": "Packet loss -- any loss indicates underlay path failure between the two VTEP IPs",
+          "confirms_if": "Packet loss to remote VTEP IP while EVPN BGP session is up confirms underlay-only failure causing data-plane black-holing"
+        },
+        {
+          "command": "show ip route <remote-vtep-ip>",
+          "look_for": "Route to the remote VTEP loopback -- should be a BGP or OSPF route via underlay",
+          "confirms_if": "No route or gateway of last resort confirms underlay routing has lost the path to the remote VTEP"
+        },
+        {
+          "command": "show bgp summary",
+          "look_for": "Underlay BGP peer states -- spines or directly connected VTEP peers should be ESTABLISHED",
+          "confirms_if": "Down underlay BGP session to spine confirms the underlay topology change causing VTEP unreachability"
+        },
+        {
+          "command": "show bfd peers",
+          "look_for": "BFD session state for underlay peers; DOWN state indicates fast path failure detection",
+          "confirms_if": "BFD DOWN for an underlay peer confirms the direct path has failed -- faster detection than BGP hold timer"
+        },
+        {
+          "command": "show interfaces status",
+          "look_for": "Physical interface operational state -- any DOWN uplinks indicate fabric connectivity loss",
+          "confirms_if": "DOWN uplink interfaces confirm physical layer failure in the underlay affecting VTEP reachability"
+        }
+      ]
+    },
+    {
+      "scenario": "NVO table misconfiguration -- CONFIG_DB VXLAN_TUNNEL or VXLAN_TUNNEL_MAP entries incorrect",
+      "description": "The CONFIG_DB VXLAN_TUNNEL or VXLAN_TUNNEL_MAP tables have incorrect or missing entries, causing tunnelmgrd to program wrong VNI-to-VLAN mappings or no mappings at all. VXLAN traffic is either completely non-functional or VNI associations are wrong (frames decapsulated into wrong VLAN). This is a human configuration error that bypasses the EVPN control plane.",
+      "symptoms": [
+        "'show vxlan vlanvnimap' shows wrong VNI values or missing VLAN entries",
+        "VXLAN traffic received with a specific VNI is dropped (no matching local VNI mapping)",
+        "Hosts in VLAN X cannot communicate with remote hosts even though the EVPN session is up",
+        "redis-cli -n 4 KEYS VXLAN_TUNNEL_MAP* shows missing or incorrect mappings",
+        "'show vxlan interface' shows VTEP up but no VNIs mapped"
+      ],
+      "root_causes": [
+        "VXLAN_TUNNEL_MAP entry not created: VNI-to-VLAN mapping missing from CONFIG_DB",
+        "Wrong VNI value in VXLAN_TUNNEL_MAP -- VNI used locally does not match what remote VTEP expects",
+        "VLAN not created in CONFIG_DB VLAN table before VNI mapping was added",
+        "Operator directly edited CONFIG_DB with wrong key format (e.g., incorrect tunnel name reference)",
+        "VXLAN_TUNNEL entry deleted and recreated with different name, invalidating all VXLAN_TUNNEL_MAP entries that reference the old name",
+        "tunnelmgrd processed a delete+create out of order, leaving stale or no APPL_DB entries"
+      ],
+      "resolution": [
+        "Audit VNI-to-VLAN mappings: 'show vxlan vlanvnimap' and compare against intended design",
+        "Check CONFIG_DB: 'redis-cli -n 4 KEYS VXLAN_TUNNEL_MAP*' and 'redis-cli -n 4 HGETALL VXLAN_TUNNEL_MAP|<tunnel>|<vlan>'",
+        "Verify VLAN exists: 'redis-cli -n 4 KEYS VLAN*' -- VLAN must exist before VNI mapping",
+        "Add missing mapping: 'config vxlan map add <tunnel-name> <vlan-id> <vni>'",
+        "Remove incorrect mapping: 'config vxlan map del <tunnel-name> <vlan-id> <vni>' then re-add",
+        "Verify tunnelmgrd processed the change: 'redis-cli -n 0 KEYS VXLAN_TUNNEL_TABLE*' -- check APPL_DB"
+      ],
+      "verify_commands": [
+        {
+          "command": "show vxlan vlanvnimap",
+          "look_for": "All expected VLAN-to-VNI mappings; compare against intended network design document",
+          "confirms_if": "Missing or incorrect VNI-to-VLAN entries confirm CONFIG_DB misconfiguration"
+        },
+        {
+          "command": "redis-cli -n 4 KEYS 'VXLAN_TUNNEL_MAP*'",
+          "look_for": "VXLAN_TUNNEL_MAP entries for all expected VLAN/VNI pairs",
+          "confirms_if": "Missing VXLAN_TUNNEL_MAP keys confirm the VNI mapping was never configured in CONFIG_DB"
+        },
+        {
+          "command": "redis-cli -n 0 KEYS 'VXLAN_TUNNEL_TABLE*'",
+          "look_for": "APPL_DB VXLAN_TUNNEL_TABLE entries -- tunnelmgrd should have published mappings here",
+          "confirms_if": "Missing APPL_DB entries despite CONFIG_DB entries existing confirms tunnelmgrd has not processed the config"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'VXLAN_TUNNEL_MAP|<tunnel-name>|Vlan<id>'",
+          "look_for": "vni field value -- should match the intended VNI for this VLAN",
+          "confirms_if": "Wrong VNI value or missing entry confirms the VNI mapping misconfiguration"
+        }
+      ]
+    },
+    {
+      "scenario": "tunnelmgrd not programming VXLAN tunnels -- CONFIG_DB changes not reaching APPL_DB",
+      "description": "The operator has configured VXLAN tunnels and VNI mappings in CONFIG_DB, but tunnelmgrd has not programmed the corresponding entries into APPL_DB. orchagent never receives the tunnel configuration and the ASIC is not programmed. This is the VXLAN equivalent of bgpcfgd failing to sync BGP config to FRR -- a pipeline failure at the CONFIG_DB to APPL_DB stage.",
+      "symptoms": [
+        "VXLAN_TUNNEL and VXLAN_TUNNEL_MAP entries exist in CONFIG_DB but APPL_DB has no corresponding VXLAN_TUNNEL_TABLE entries",
+        "'show vxlan interface' shows no active VTEP despite CONFIG_DB having tunnel config",
+        "orchagent logs show no VXLAN-related activity",
+        "docker exec swss supervisorctl status shows tunnelmgrd as STOPPED or restarting",
+        "No SAI tunnel objects in ASIC_DB"
+      ],
+      "root_causes": [
+        "tunnelmgrd process crashed inside the swss container",
+        "tunnelmgrd lost its Redis subscription to CONFIG_DB -- changes are not being received",
+        "CONFIG_DB VXLAN_TUNNEL entry has a malformed key or missing required field causing tunnelmgrd to skip it",
+        "swss container restarted, clearing APPL_DB entries, and tunnelmgrd failed to re-sync",
+        "tunnelmgrd dependency on VLAN or interface table not satisfied -- VLAN does not exist in CONFIG_DB",
+        "SONiC version mismatch -- CONFIG_DB schema changed and tunnelmgrd cannot parse the new format"
+      ],
+      "resolution": [
+        "Check tunnelmgrd status: 'docker exec swss supervisorctl status tunnelmgrd'",
+        "Check tunnelmgrd logs: 'docker logs swss 2>&1 | grep -i tunnel | tail -50'",
+        "Verify CONFIG_DB has tunnel config: 'redis-cli -n 4 KEYS VXLAN*'",
+        "Check APPL_DB for tunnel tables: 'redis-cli -n 0 KEYS VXLAN*'",
+        "Restart tunnelmgrd (non-disruptive to running tunnels): 'docker exec swss supervisorctl restart tunnelmgrd'",
+        "If restart does not help, check swss container health: 'docker ps | grep swss' and 'docker inspect swss | grep RestartCount'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec swss supervisorctl status tunnelmgrd",
+          "look_for": "tunnelmgrd process state -- should be RUNNING",
+          "confirms_if": "STOPPED or FATAL state confirms tunnelmgrd is not processing CONFIG_DB tunnel configuration"
+        },
+        {
+          "command": "redis-cli -n 0 KEYS 'VXLAN_TUNNEL_TABLE*'",
+          "look_for": "APPL_DB VXLAN tunnel table entries; should be populated if tunnelmgrd is running and CONFIG_DB has entries",
+          "confirms_if": "Empty APPL_DB VXLAN tables despite CONFIG_DB having tunnel config confirms tunnelmgrd pipeline failure"
+        },
+        {
+          "command": "docker logs swss 2>&1 | grep -i 'tunnel' | tail -50",
+          "look_for": "Error messages from tunnelmgrd, Redis subscription failures, or missing dependency errors",
+          "confirms_if": "Error messages in swss logs confirm the specific reason tunnelmgrd is not processing CONFIG_DB"
+        },
+        {
+          "command": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_TUNNEL*'",
+          "look_for": "SAI tunnel objects in ASIC_DB; should exist if orchagent has processed APPL_DB tunnel entries",
+          "confirms_if": "No SAI tunnel objects in ASIC_DB confirms tunnel was never programmed into hardware"
+        },
+        {
+          "command": "docker inspect swss | grep -A2 RestartCount",
+          "look_for": "RestartCount value -- non-zero indicates swss container has restarted",
+          "confirms_if": "Non-zero RestartCount confirms swss container restarts, which could explain missing APPL_DB state"
+        }
+      ]
+    },
+    {
+      "scenario": "BUM flooding failures -- head-end replication not working, multicast traffic lost",
+      "description": "Broadcast, Unknown unicast, and Multicast (BUM) traffic is being lost or not delivered to all remote VTEPs. EVPN uses ingress replication (head-end replication) where the originating VTEP sends a copy of each BUM frame directly to each remote VTEP unicast via individual VXLAN encapsulated frames. If the replication list is incomplete or the flood list is not programmed in the ASIC, BUM traffic is silently dropped.",
+      "symptoms": [
+        "ARP broadcasts do not reach all hosts in the overlay network",
+        "New hosts are not discovered by some remote VTEPs (traffic black-holes until unicast is learned)",
+        "Layer 2 multicast applications (OSPF, PIM, mDNS) fail across the VXLAN fabric",
+        "DHCP discover/offer not reaching all segments",
+        "'docker exec bgp vtysh -c show evpn vni <vni>' shows incomplete or zero remote VTEPs in flood list",
+        "VXLAN BUM packet counters not incrementing on remote VTEPs"
+      ],
+      "root_causes": [
+        "Incomplete Type-3 IMET route exchange -- some remote VTEPs are not in the EVPN flood list (see Type-3 IMET failure mode above)",
+        "orchagent has not programmed the flood list into the ASIC VXLAN bridge table",
+        "SAI error when creating VXLAN flood list entries -- ASIC resource limit on flood list size",
+        "Ingress replication disabled at the FRR level -- no PMSI Tunnel attribute in Type-3 routes",
+        "Remote VTEP's BUM list programmed but ASIC flood table full (platform limit on flood entries per VNI)",
+        "VXLAN multicast group mode configured instead of ingress replication -- mismatch between VTEPs"
+      ],
+      "resolution": [
+        "Verify flood list completeness: 'docker exec bgp vtysh -c show evpn vni <vni>' -- check remote VTEP count",
+        "Check Type-3 IMET routes: 'docker exec bgp vtysh -c show bgp l2vpn evpn type multicast'",
+        "Verify ASIC flood table: 'redis-cli -n 1 KEYS ASIC_STATE:SAI_OBJECT_TYPE_L2MC*' or platform-specific command",
+        "Check orchagent for flood table programming: 'docker logs swss 2>&1 | grep -iE flood|BUM|multicast | tail -30'",
+        "Test BUM replication: 'arping -I Vlan<x> <broadcast-ip>' and capture on remote VTEP",
+        "Verify ingress replication configured: 'docker exec bgp vtysh -c show running-config' -- PMSI should be ingress-replication type"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show evpn vni <vni>'",
+          "look_for": "Remote VTEP list in the flood/replication section; count should match number of VTEPs hosting this VNI",
+          "confirms_if": "Incomplete remote VTEP list confirms BUM flood replication list is missing entries"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show bgp l2vpn evpn type multicast'",
+          "look_for": "Type-3 IMET routes from all expected remote VTEPs",
+          "confirms_if": "Missing Type-3 routes for some VTEPs confirms incomplete flood list root cause"
+        },
+        {
+          "command": "redis-cli -n 0 HGETALL 'VXLAN_FDB_TABLE:Vlan<id>:FF:FF:FF:FF:FF:FF'",
+          "look_for": "Broadcast FDB entry and associated remote VTEP list in APPL_DB",
+          "confirms_if": "Missing broadcast FDB entry confirms BUM flooding not programmed via APPL_DB"
+        },
+        {
+          "command": "docker logs swss 2>&1 | grep -iE 'flood|vxlan|BUM' | tail -30",
+          "look_for": "SAI errors when creating flood list entries; resource exhaustion messages",
+          "confirms_if": "SAI flood list creation errors confirm ASIC cannot accommodate the required BUM replication entries"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "type": "transport",
+      "name": "UDP port 4789 reachability in underlay",
+      "description": "VXLAN encapsulated frames are sent as UDP to destination port 4789. The underlay IP network must allow UDP/4789 between all VTEP source IPs. Any iptables/nftables rule blocking this port will silently drop all VXLAN overlay traffic while leaving the EVPN BGP control plane unaffected."
+    },
+    {
+      "type": "daemon",
+      "name": "tunnelmgrd (swss container)",
+      "description": "Translates CONFIG_DB VXLAN_TUNNEL and VXLAN_TUNNEL_MAP entries into APPL_DB entries. tunnelmgrd creates the VXLAN kernel device and programs VNI-to-VLAN mappings. Without tunnelmgrd, no VXLAN tunnel configuration reaches orchagent or the ASIC."
+    },
+    {
+      "type": "daemon",
+      "name": "orchagent (swss container)",
+      "description": "Consumes APPL_DB VXLAN tunnel entries and FDB entries, translates them into SAI API calls for ASIC programming. Responsible for creating SAI_OBJECT_TYPE_TUNNEL objects and programming the VXLAN FDB flood lists."
+    },
+    {
+      "type": "daemon",
+      "name": "syncd (syncd container)",
+      "description": "Receives SAI API calls from orchagent and programs the physical ASIC. Final stage in the VXLAN tunnel programming pipeline. VXLAN encapsulation/decapsulation only works in hardware after syncd successfully programs the SAI tunnel objects."
+    },
+    {
+      "type": "daemon",
+      "name": "FRR bgpd (bgp container)",
+      "description": "Runs the BGP EVPN control plane. Exchanges Type-2 (MAC/IP), Type-3 (IMET), and Type-5 (prefix) routes with remote VTEPs and route reflectors. Without bgpd running with L2VPN EVPN address family active, MAC learning and BUM flood list construction depend entirely on data-plane flooding."
+    },
+    {
+      "type": "daemon",
+      "name": "FRR zebra (bgp container)",
+      "description": "Maintains the kernel RIB. For VXLAN/EVPN, zebra handles ARP suppression neighbor entries and the L3 VNI routing table for symmetric IRB. FRR's EVPN module in zebra manages the VNI state, MAC/IP entries, and coordinates with bgpd for EVPN route generation."
+    },
+    {
+      "type": "database",
+      "name": "CONFIG_DB (Redis DB 4)",
+      "description": "Source of truth for VXLAN configuration: VXLAN_TUNNEL (VTEP source IP), VXLAN_TUNNEL_MAP (VNI-to-VLAN mappings), VRF (L3 VNI for inter-VNI routing), SUPPRESS_VLAN_NEIGH_ARP (ARP suppression per VLAN). tunnelmgrd reads from here."
+    },
+    {
+      "type": "database",
+      "name": "APPL_DB (Redis DB 0)",
+      "description": "VXLAN programming bus between tunnelmgrd and orchagent. Contains VXLAN_TUNNEL_TABLE (tunnel objects), VXLAN_FDB_TABLE (remote MAC-to-VTEP mappings), and flood list entries. orchagent subscribes to this DB to program the ASIC."
+    },
+    {
+      "type": "database",
+      "name": "ASIC_DB (Redis DB 1)",
+      "description": "SAI object representation of the programmed VXLAN state. Contains SAI_OBJECT_TYPE_TUNNEL, SAI_OBJECT_TYPE_FDB_ENTRY with VXLAN endpoints, and tunnel map entries. Populated by orchagent, consumed by syncd for actual ASIC programming."
+    },
+    {
+      "type": "database",
+      "name": "STATE_DB (Redis DB 6)",
+      "description": "Operational state of VXLAN tunnels. VXLAN_TUNNEL_TABLE in STATE_DB reflects the operational status (up/down) of each tunnel to remote VTEPs. 'show vxlan tunnel' reads from this DB."
+    },
+    {
+      "type": "protocol",
+      "name": "Underlay routing (BGP or OSPF)",
+      "description": "VXLAN requires IP reachability between VTEP loopback addresses through the underlay network. BGP (typically eBGP spine-leaf or iBGP with route reflectors) or OSPF must maintain routes to all remote VTEP loopback IPs. Underlay failure directly causes VXLAN data-plane black-holing."
+    },
+    {
+      "type": "protocol",
+      "name": "BFD (optional)",
+      "description": "Bidirectional Forwarding Detection can be used on underlay BGP sessions to accelerate detection of path failures that would cause VXLAN tunnel black-holing. Without BFD, underlay path failures may not be detected until BGP hold timer expiry (up to 180s), causing extended VXLAN forwarding failure."
+    }
+  ],
+  "config_db_tables": [
+    {
+      "table": "VXLAN_TUNNEL",
+      "key_pattern": "VXLAN_TUNNEL|<tunnel-name>",
+      "relevant_fields": [
+        "src_ip: VTEP source IP address (typically a loopback IP); required for tunnel creation",
+        "dst_ip: optional default destination IP (not used in EVPN mode; leave empty for dynamic EVPN)"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'VXLAN_TUNNEL|vtep'",
+      "redis_command": "redis-cli -n 4 KEYS 'VXLAN_TUNNEL*'"
+    },
+    {
+      "table": "VXLAN_TUNNEL_MAP",
+      "key_pattern": "VXLAN_TUNNEL_MAP|<tunnel-name>|Vlan<vlan-id>",
+      "relevant_fields": [
+        "vni: VNI (Virtual Network Identifier) value to map to this VLAN (24-bit, range 1-16777215)"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'VXLAN_TUNNEL_MAP|vtep|Vlan100'",
+      "redis_command": "redis-cli -n 4 KEYS 'VXLAN_TUNNEL_MAP*'"
+    },
+    {
+      "table": "SUPPRESS_VLAN_NEIGH_ARP",
+      "key_pattern": "SUPPRESS_VLAN_NEIGH_ARP|Vlan<vlan-id>",
+      "relevant_fields": [
+        "suppress: enabled/disabled (set to 'enabled' to activate ARP/ND suppression for this VLAN)"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'SUPPRESS_VLAN_NEIGH_ARP|Vlan100'",
+      "redis_command": "redis-cli -n 4 KEYS 'SUPPRESS_VLAN_NEIGH_ARP*'"
+    },
+    {
+      "table": "VRF (L3 VNI)",
+      "key_pattern": "VRF|<vrf-name>",
+      "relevant_fields": [
+        "vni: L3 VNI for this VRF; required for symmetric IRB (inter-VNI routing) via EVPN Type-5",
+        "mgmtVrfEnabled: true if this is the management VRF (separate from overlay VRFs)"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'VRF|Vrf_tenant1'",
+      "redis_command": "redis-cli -n 4 KEYS 'VRF*'"
+    },
+    {
+      "table": "VXLAN_FDB_TABLE (APPL_DB)",
+      "key_pattern": "VXLAN_FDB_TABLE:Vlan<vlan-id>:<mac-address>",
+      "relevant_fields": [
+        "remote_vtep: remote VTEP IP address where this MAC is located",
+        "type: static (EVPN-learned) or dynamic (data-plane learned)",
+        "vni: VNI associated with this FDB entry"
+      ],
+      "verify_command": "redis-cli -n 0 HGETALL 'VXLAN_FDB_TABLE:Vlan100:aa:bb:cc:dd:ee:ff'",
+      "redis_command": "redis-cli -n 0 KEYS 'VXLAN_FDB_TABLE:*' | wc -l"
+    },
+    {
+      "table": "VXLAN_TUNNEL_TABLE (APPL_DB)",
+      "key_pattern": "VXLAN_TUNNEL_TABLE|<tunnel-name>",
+      "relevant_fields": [
+        "src_ip: VTEP source IP address (mirrored from CONFIG_DB by tunnelmgrd)",
+        "dst_ip: remote VTEP IP (for static tunnels); absent in EVPN dynamic mode"
+      ],
+      "verify_command": "redis-cli -n 0 HGETALL 'VXLAN_TUNNEL_TABLE|vtep'",
+      "redis_command": "redis-cli -n 0 KEYS 'VXLAN_TUNNEL_TABLE*'"
+    }
+  ],
+  "sonic_notes": [
+    {
+      "note": "VXLAN in SONiC is split across two subsystems: the data-plane tunnel programming (tunnelmgrd in swss container programs ASIC via orchagent/syncd) and the EVPN control plane (bgpd in bgp container via FRR). These are independent -- the VTEP can have tunnels programmed without EVPN, and EVPN BGP sessions can be up while tunnel programming has failed. Always check both planes separately when debugging.",
+      "human_error_risk": "HIGH",
+      "source_ref": "sonic-buildimage:src/sonic-swss/cfgmgr/tunnelmgr.cpp and src/sonic-frr/frr/"
+    },
+    {
+      "note": "tunnelmgrd is the CONFIG_DB-to-APPL_DB translator for VXLAN, analogous to bgpcfgd for BGP. It runs inside the swss container. Direct manipulation of APPL_DB VXLAN tables (bypassing tunnelmgrd) is not supported and will be overwritten on tunnelmgrd restart. Always configure VXLAN via 'config vxlan' CLI commands or via CONFIG_DB.",
+      "human_error_risk": "HIGH",
+      "source_ref": "sonic-buildimage:src/sonic-swss/cfgmgr/tunnelmgr.cpp"
+    },
+    {
+      "note": "EVPN ARP suppression requires both BGP configuration ('advertise-svi-ip' or host MAC/IP redistribution in FRR) AND CONFIG_DB SUPPRESS_VLAN_NEIGH_ARP entries. Configuring only one side will result in ARP suppression not working. Additionally, the 'bridge' kernel subsystem neigh_suppress flag must be set on VXLAN-attached bridge ports -- SONiC handles this automatically when SUPPRESS_VLAN_NEIGH_ARP is configured.",
+      "human_error_risk": "HIGH",
+      "source_ref": "SONiC EVPN design document and sonic-buildimage:src/sonic-swss/orchagent/vxlanorch.cpp"
+    },
+    {
+      "note": "In SONiC, EVPN Type-5 (IP prefix) routing requires the VRF to have a configured L3 VNI (VRF|<name>: vni field) AND FRR must have 'advertise ipv4 unicast' under 'address-family l2vpn evpn'. Without both configured, inter-VNI routing silently fails. The L3 VNI must be different from all L2 VNIs in use on the device.",
+      "human_error_risk": "HIGH",
+      "source_ref": "SONiC EVPN Type-5 design and FRR EVPN documentation"
+    },
+    {
+      "note": "The VXLAN underlay MTU is a frequently missed operational requirement. Standard Ethernet frames are 1500 bytes. VXLAN adds 50 bytes of overhead (outer Ethernet 14B + outer IP 20B + outer UDP 8B + VXLAN header 8B). Underlay interfaces must be configured with MTU 1550 or higher (or jumbo frames 9100+ for consistent operation). An MTU of 1500 on underlay interfaces will cause VXLAN-encapsulated frames to be fragmented or dropped, often manifesting as intermittent large-packet drops while small packets work.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "RFC 7348 Section 6 and SONiC interface configuration guide"
+    },
+    {
+      "note": "SONiC FRR uses 'advertise-all-vni' under 'address-family l2vpn evpn' in bgpd configuration to automatically generate EVPN routes for all locally configured VNIs. Without this command, bgpd will not generate Type-2 or Type-3 EVPN routes even if VXLAN VNIs are correctly configured. This command must be present in FRR config (visible in 'docker exec bgp vtysh -c show running-config').",
+      "human_error_risk": "HIGH",
+      "source_ref": "FRR EVPN documentation and sonic-bgpcfgd EVPN templates"
+    },
+    {
+      "note": "VXLAN VNI values must be consistent across all VTEPs in the fabric -- the same VNI must be used for the same tenant VLAN on all participating VTEPs. A VNI mismatch between VTEPs causes decapsulated frames to arrive in the wrong VLAN or be dropped entirely. SONiC does not validate cross-VTEP VNI consistency -- this is a configuration management concern.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "RFC 7348 and SONiC VXLAN operations guide"
+    },
+    {
+      "note": "When debugging VXLAN forwarding, distinguish between control-plane state (EVPN BGP) and data-plane state (ASIC FDB/tunnel). 'show vxlan remotemac all' shows the FDB from orchagent/ASIC view. 'docker exec bgp vtysh -c show bgp l2vpn evpn type macip' shows the BGP EVPN table. Entries in BGP but not in the FDB indicate an orchagent programming failure. Entries in the FDB but not in BGP indicate data-plane MAC learning (acceptable but unexpected in pure EVPN mode).",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "SONiC EVPN design document"
+    }
+  ],
+  "sonic_frr_mapping": {
+    "frr_process": "bgpd + zebra (EVPN module)",
+    "frr_config_file": "/etc/frr/bgpd.conf (includes l2vpn evpn address family configuration; managed by bgpcfgd)",
+    "bgpcfgd_source": "sonic-buildimage:src/sonic-bgpcfgd/bgpcfgd/ (EVPN sections in bgpd.conf.j2 template)",
+    "config_managed_by": "tunnelmgrd (VXLAN tunnel/VNI CONFIG_DB to APPL_DB) and bgpcfgd (EVPN BGP config to FRR)",
+    "container": "swss (tunnelmgrd, orchagent) and bgp (bgpd, zebra with EVPN module)",
+    "frr_socket": "/var/run/frr/bgpd.vty",
+    "evpn_zebra_module": "FRR zebra EVPN module handles VNI state, MAC/IP table, ARP suppression coordination",
+    "vxlan_kernel_device": "Created by tunnelmgrd via netlink; device name typically 'vtep<n>' or as configured in VXLAN_TUNNEL",
+    "supervisor_config": "/etc/supervisor/conf.d/swss.conf (tunnelmgrd inside swss container)"
+  },
+  "key_commands": [
+    "show vxlan interface",
+    "show vxlan tunnel",
+    "show vxlan remotevtep",
+    "show vxlan vlanvnimap",
+    "show vxlan remotemac all",
+    "show vxlan arp-suppression-cache Vlan<id>",
+    "docker exec bgp vtysh -c 'show bgp l2vpn evpn summary'",
+    "docker exec bgp vtysh -c 'show bgp l2vpn evpn'",
+    "docker exec bgp vtysh -c 'show bgp l2vpn evpn type macip'",
+    "docker exec bgp vtysh -c 'show bgp l2vpn evpn type multicast'",
+    "docker exec bgp vtysh -c 'show bgp l2vpn evpn type prefix'",
+    "docker exec bgp vtysh -c 'show evpn vni detail'",
+    "docker exec bgp vtysh -c 'show evpn vni <vni>'",
+    "docker exec bgp vtysh -c 'show evpn mac vni all'",
+    "docker exec bgp vtysh -c 'show evpn arp-cache vni all'",
+    "docker exec swss supervisorctl status tunnelmgrd",
+    "redis-cli -n 4 KEYS 'VXLAN*'",
+    "redis-cli -n 4 HGETALL 'VXLAN_TUNNEL|vtep'",
+    "redis-cli -n 4 KEYS 'VXLAN_TUNNEL_MAP*'",
+    "redis-cli -n 4 KEYS 'SUPPRESS_VLAN_NEIGH_ARP*'",
+    "redis-cli -n 4 HGETALL 'VRF|<vrf-name>'",
+    "redis-cli -n 0 KEYS 'VXLAN_TUNNEL_TABLE*'",
+    "redis-cli -n 0 KEYS 'VXLAN_FDB_TABLE:*' | wc -l",
+    "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_TUNNEL*'",
+    "redis-cli -n 6 HGETALL 'VXLAN_TUNNEL_TABLE|<name>|<remote-ip>'",
+    "docker logs swss 2>&1 | grep -iE 'tunnel|VXLAN|SAI' | tail -50",
+    "docker logs syncd 2>&1 | grep -E 'ERROR|SAI_STATUS' | tail -30",
+    "ip link show type vxlan",
+    "bridge fdb show | grep <vni-or-vtep-ip>",
+    "ping <remote-vtep-ip> -I <local-vtep-src-ip> -c 5"
+  ],
+  "related_protocols": [
+    "bgp-4",
+    "bfd",
+    "stp"
+  ],
+  "tags": [
+    "overlay",
+    "vxlan",
+    "evpn",
+    "vtep",
+    "nvo",
+    "vni",
+    "type-2",
+    "type-3",
+    "type-5",
+    "frr"
+  ]
+}

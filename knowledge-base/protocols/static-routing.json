@@ -1,0 +1,724 @@
+{
+  "protocol_id": "static-routing",
+  "protocol_name": "Static Routing",
+  "protocol_family": "routing",
+  "standard": "N/A (operational practice)",
+  "category": "routing",
+  "purpose": "Manually configured routes for default gateways, stub networks, and policy routing",
+  "operates_at": "Layer 3",
+  "transport": "N/A (configured, not protocol-based)",
+  "def_refs": [
+    "daemon:staticd",
+    "daemon:zebra",
+    "daemon:fpmsyncd",
+    "daemon:orchagent",
+    "daemon:syncd",
+    "db:config_db",
+    "db:appl_db",
+    "db:asic_db",
+    "db:state_db"
+  ],
+  "states": [
+    {
+      "name": "CONFIGURED",
+      "description": "A static route entry exists in CONFIG_DB STATIC_ROUTE table or has been entered via 'ip route' in FRR vtysh. The route has been parsed and accepted by staticd but its operational status (whether it is actually installed in the RIB/FIB) has not yet been determined. This is the initial state after configuration.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "redis-cli -n 4 KEYS 'STATIC_ROUTE*'",
+        "redis-cli -n 4 HGETALL 'STATIC_ROUTE|<prefix>'",
+        "docker exec bgp vtysh -c 'show running-config' | grep 'ip route'"
+      ]
+    },
+    {
+      "name": "ACTIVE",
+      "description": "The static route is installed in the FRR RIB via zebra and has been propagated to the Linux kernel routing table. The next-hop is reachable (either directly connected or resolved via recursive lookup). The route is eligible for forwarding and has been published to APPL_DB ROUTE_TABLE by fpmsyncd. This is the normal operational steady state.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "show ip route static",
+        "docker exec bgp vtysh -c 'show ip route static'",
+        "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+        "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep <prefix>"
+      ]
+    },
+    {
+      "name": "INACTIVE (next-hop unreachable)",
+      "description": "The static route exists in the configuration but the next-hop IP address is not reachable -- the interface is down, ARP has not resolved, or recursive lookup fails. zebra does not install the route in the kernel RIB. The route does not appear in 'show ip route' even though it is configured. Traffic to the prefix is dropped.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "show ip route static",
+        "docker exec bgp vtysh -c 'show ip route static'",
+        "docker exec bgp vtysh -c 'show ip route <next-hop-ip>'",
+        "show arp | grep <next-hop-ip>"
+      ]
+    },
+    {
+      "name": "BLACKHOLE",
+      "description": "The static route is intentionally configured to null0 (blackhole/discard interface) to drop traffic matching the prefix. This is a deliberate administrative state used for traffic engineering, denial-of-service mitigation, or aggregate route summarization. The route IS installed in the RIB and ASIC but with a drop action. Not a failure state.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "docker exec bgp vtysh -c 'show ip route static'",
+        "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+        "redis-cli -n 1 HGETALL 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:{\"dest\":\"<prefix>\",\"switch_id\":\"<oid>\",\"vrf\":\"<oid>\"}'"
+      ]
+    },
+    {
+      "name": "PENDING ASIC PROGRAMMING",
+      "description": "The static route is installed in the kernel RIB and published to APPL_DB by fpmsyncd, but orchagent or syncd has not yet programmed it into the ASIC forwarding table. This is a transient state during normal operation, but if the route remains here for more than a few seconds it indicates a pipeline stall in orchagent or syncd.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+        "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep <prefix>",
+        "docker logs swss 2>&1 | grep -E 'ERROR|route' | tail -30"
+      ]
+    },
+    {
+      "name": "MISSING AFTER REBOOT",
+      "description": "The static route was operational before a system reboot but is absent after restart. The route was not persisted to /etc/sonic/config_db.json ('config save' was not run), or the CONFIG_DB STATIC_ROUTE entry is malformed and frrcfgd or staticd failed to load it on startup. This is a human error failure state.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "redis-cli -n 4 KEYS 'STATIC_ROUTE*'",
+        "cat /etc/sonic/config_db.json | python3 -m json.tool | grep -A10 'STATIC_ROUTE'",
+        "docker exec bgp vtysh -c 'show ip route static'"
+      ]
+    }
+  ],
+  "transitions": [
+    {
+      "from_state": "CONFIGURED",
+      "to_state": "ACTIVE",
+      "trigger": "Next-hop IP is reachable (ARP resolved and interface up, or recursive resolution succeeds); zebra installs route in kernel RIB; fpmsyncd publishes to APPL_DB; orchagent programs ASIC",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "CONFIGURED",
+      "to_state": "INACTIVE (next-hop unreachable)",
+      "trigger": "Next-hop interface is down, ARP for next-hop IP is not in table, or recursive resolution finds no path to next-hop",
+      "failure_if_stuck": "Interface remains down or ARP never resolves; check physical connectivity, interface admin state, and ARP table"
+    },
+    {
+      "from_state": "CONFIGURED",
+      "to_state": "BLACKHOLE",
+      "trigger": "Route is configured with 'nexthop-vrf' set to null or 'blackhole' keyword in the STATIC_ROUTE table, or 'ip route <prefix> blackhole' in FRR vtysh",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "INACTIVE (next-hop unreachable)",
+      "to_state": "ACTIVE",
+      "trigger": "Next-hop interface comes up and ARP resolves, or another route providing recursive resolution to the next-hop IP is installed in the RIB",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "ACTIVE",
+      "to_state": "INACTIVE (next-hop unreachable)",
+      "trigger": "Next-hop interface goes down, ARP entry ages out and cannot be refreshed, or the recursive resolution path is removed from the RIB",
+      "failure_if_stuck": "Persistent interface down or ARP failure; static route with a floating next-hop that never recovers"
+    },
+    {
+      "from_state": "ACTIVE",
+      "to_state": "PENDING ASIC PROGRAMMING",
+      "trigger": "orchagent or syncd becomes unresponsive; route update arrives in APPL_DB but SAI programming call blocks or returns error",
+      "failure_if_stuck": "orchagent crash, syncd crash, or SAI error (table full, resource exhaustion); check swss and syncd container logs"
+    },
+    {
+      "from_state": "PENDING ASIC PROGRAMMING",
+      "to_state": "ACTIVE",
+      "trigger": "orchagent processes the APPL_DB entry and syncd successfully programs the ASIC forwarding table",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "ACTIVE",
+      "to_state": "MISSING AFTER REBOOT",
+      "trigger": "System reboots and CONFIG_DB is loaded from /etc/sonic/config_db.json which does not contain the STATIC_ROUTE entry (operator did not run 'config save')",
+      "failure_if_stuck": "Route will remain missing until manually reconfigured and saved"
+    }
+  ],
+  "timers": [
+    {
+      "name": "ARP Cache Timeout",
+      "description": "Time before an ARP entry for a static route next-hop ages out of the kernel ARP table. When the ARP entry expires, zebra may mark the next-hop as unresolved and pull the static route from the RIB until ARP is refreshed. Relevant for static routes pointing to next-hops with no active traffic flow.",
+      "default": "Linux kernel default: 60s for reachable entries (gc_stale_time)",
+      "range": "Configurable via /proc/sys/net/ipv4/neigh/*/gc_stale_time",
+      "on_expiry": "ARP entry removed from kernel table; if zebra is tracking next-hop reachability, static route may be withdrawn from RIB",
+      "sonic_default": "Managed by neighsyncd and nbrmgrd; SONiC refreshes ARP for active neighbors",
+      "sonic_config_path": "Not directly configurable via CONFIG_DB for static routes; managed by kernel ARP subsystem and neighsyncd",
+      "sonic_frr_path": "zebra: nexthop tracking (nht) via netlink; FRR source: zebra/zebra_nhg.c",
+      "tuning_advice": "For static routes pointing to directly connected next-hops, ensure the next-hop device is actively responding to ARP. For floating static routes used as backup paths, expect brief outages when ARP ages out."
+    },
+    {
+      "name": "Recursive Next-hop Resolution Interval",
+      "description": "When a static route uses a recursive next-hop (next-hop IP is not directly connected), zebra must resolve the next-hop through another route in the RIB. If the resolving route disappears and reappears, zebra re-evaluates the static route's reachability. This is not a timer per se but the convergence latency of the recursive resolution update.",
+      "default": "Immediate (event-driven, not timer-based)",
+      "range": "N/A",
+      "on_expiry": "N/A -- triggered by RIB change events",
+      "sonic_default": "Event-driven via zebra next-hop tracking (NHT) notifications",
+      "sonic_config_path": "FRR vtysh: 'ip nht resolve-via-default' controls whether the default route can resolve recursive next-hops",
+      "sonic_frr_path": "zebra: nexthop tracking subsystem; FRR source: zebra/zebra_nht.c",
+      "tuning_advice": "For static routes used as policy routes with recursive next-hops, ensure the BGP or OSPF route providing the recursive resolution is stable. Avoid deeply nested recursion (static -> BGP -> OSPF) as convergence is additive."
+    },
+    {
+      "name": "CONFIG_DB Sync Delay",
+      "description": "After a static route is written to CONFIG_DB (via SONiC CLI 'ip route add' or config load), frrcfgd must detect the change via Redis pub/sub and issue the corresponding 'ip route' command to FRR via vtysh. In normal operation this is sub-second, but under load or after config reload it may take several seconds.",
+      "default": "Sub-second under normal load",
+      "range": "Typically < 1s; may reach 2-5s under heavy config load",
+      "on_expiry": "frrcfgd applies the STATIC_ROUTE CONFIG_DB entry to FRR staticd",
+      "sonic_default": "Event-driven via Redis keyspace notification subscription in frrcfgd",
+      "sonic_config_path": "CONFIG_DB STATIC_ROUTE table",
+      "sonic_frr_path": "frrcfgd subscribes to CONFIG_DB; FRR source: sonic-buildimage:src/sonic-frrcfgd/",
+      "tuning_advice": "If a static route is not appearing in FRR immediately after CLI config, wait 2-3 seconds and re-check. If still absent, check frrcfgd status inside the bgp container."
+    }
+  ],
+  "messages": [
+    {
+      "name": "CONFIG_DB STATIC_ROUTE write",
+      "description": "When an operator runs 'ip route add <prefix> <nexthop>' via SONiC CLI or writes directly to CONFIG_DB, a STATIC_ROUTE|<prefix> hash is created in Redis DB 4. This is the entry point for static route configuration in SONiC. frrcfgd subscribes to CONFIG_DB keyspace notifications and translates this entry into a vtysh 'ip route' command sent to FRR staticd.",
+      "when_sent": "On operator config action: 'ip route add', config load, or config reload",
+      "key_fields": [
+        "prefix: destination prefix in CIDR notation (key)",
+        "nexthop: next-hop IP address or interface name",
+        "ifname: egress interface (optional, for directly connected routes)",
+        "distance: administrative distance (default 1 for static)",
+        "nexthop-vrf: VRF name for inter-VRF route leak (optional)",
+        "blackhole: true/false for null route"
+      ]
+    },
+    {
+      "name": "FRR staticd -> zebra RIB update",
+      "description": "After staticd accepts a static route (from frrcfgd or direct vtysh config), it submits the route to zebra via the FRR inter-process Zserv socket. zebra evaluates next-hop reachability using its Next-Hop Tracking (NHT) subsystem and installs the route in the kernel RIB if the next-hop is reachable. If the next-hop is unreachable, the route is held in staticd's pending state.",
+      "when_sent": "Immediately after staticd processes a new or updated static route entry",
+      "key_fields": [
+        "Destination prefix (IPv4 or IPv6)",
+        "Next-hop address or interface",
+        "Administrative distance (default 1)",
+        "Tag value (optional, for policy routing)",
+        "VRF identifier",
+        "Blackhole flag"
+      ]
+    },
+    {
+      "name": "zebra -> kernel netlink route update",
+      "description": "Once zebra installs a static route in its RIB, it programs the Linux kernel routing table via a netlink RTM_NEWROUTE message. This makes the route visible in 'ip route show' and 'show ip route'. fpmsyncd monitors these netlink messages and mirrors them to APPL_DB ROUTE_TABLE.",
+      "when_sent": "After zebra determines next-hop is reachable and selects the static route as the best path for the prefix",
+      "key_fields": [
+        "RTM_NEWROUTE or RTM_DELROUTE message type",
+        "Destination prefix and prefix length",
+        "Next-hop IP address(es)",
+        "Output interface index",
+        "Route protocol (RTPROT_STATIC = 4)",
+        "Route type (RTN_UNICAST or RTN_BLACKHOLE)"
+      ]
+    },
+    {
+      "name": "fpmsyncd -> APPL_DB ROUTE_TABLE publish",
+      "description": "fpmsyncd receives netlink route events from zebra via the FPM socket (localhost:2620) and publishes route add/delete operations to APPL_DB ROUTE_TABLE. This is the handoff point from the FRR/kernel domain to the SONiC switching pipeline (orchagent -> ASIC_DB -> syncd).",
+      "when_sent": "On every netlink RTM_NEWROUTE or RTM_DELROUTE event for a static (or any protocol) route",
+      "key_fields": [
+        "Key: ROUTE_TABLE:<prefix/len>",
+        "nexthop: next-hop IP(s) for ECMP or single path",
+        "ifname: egress interface name(s)",
+        "nexthop-vrf: target VRF for inter-VRF leak routes"
+      ]
+    },
+    {
+      "name": "orchagent SAI route programming",
+      "description": "orchagent consumes ROUTE_TABLE entries from APPL_DB and translates them into SAI API calls (sai_route_api->create_route_entry) written to ASIC_DB. syncd reads ASIC_DB and calls the vendor SAI library to program the physical ASIC LPM/FIB table. A static route is only truly forwarding in hardware after this step completes successfully.",
+      "when_sent": "After orchagent dequeues a ROUTE_TABLE entry from APPL_DB; triggered by SubscriberStateTable notification",
+      "key_fields": [
+        "SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID: SAI OID of the next-hop or next-hop group",
+        "SAI_ROUTE_ENTRY_ATTR_PACKET_ACTION: SAI_PACKET_ACTION_FORWARD or SAI_PACKET_ACTION_DROP (blackhole)",
+        "Destination prefix in SAI route entry key",
+        "VRF OID in SAI route entry key"
+      ]
+    }
+  ],
+  "failure_modes": [
+    {
+      "scenario": "Static route not installed in ASIC -- route in RIB/FIB but not programmed in hardware",
+      "description": "The static route is visible in 'show ip route static' (kernel RIB) and in APPL_DB ROUTE_TABLE, but traffic is still dropped because the route was never programmed into the ASIC forwarding table. The failure is in the SONiC pipeline downstream of fpmsyncd: either orchagent failed to process the APPL_DB entry, syncd failed to call the vendor SAI library, or the SAI call returned an error (table full, resource exhaustion, invalid next-hop OID). This is the most SONiC-specific static routing failure mode and shares the pipeline with BGP route programming.",
+      "symptoms": [
+        "'show ip route static' shows the prefix in the kernel RIB with 'S' source code",
+        "Traffic to the prefix is dropped at the hardware level -- ping/traceroute fails even though the route is in the RIB",
+        "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>' shows the route in APPL_DB",
+        "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep <prefix> returns no match",
+        "docker logs swss shows SAI errors: 'Failed to create route entry' or 'SAI_STATUS_TABLE_FULL'",
+        "docker logs syncd shows SAI_STATUS_INSUFFICIENT_RESOURCES or similar ASIC error codes"
+      ],
+      "root_causes": [
+        "ASIC LPM/FIB table full -- TCAM or LPM resource exhaustion; SAI returns table-full error preventing new route installation",
+        "orchagent failed to resolve the next-hop to a SAI OID -- neighbor (ARP/ND) entry not yet in ASIC_DB when orchagent processed the route",
+        "syncd crashed or restarted while processing the route programming request",
+        "fpmsyncd published route to APPL_DB but orchagent missed the notification (rare, usually requires orchagent restart to recover)",
+        "ECMP nexthop group limit exceeded -- route uses multi-path but ASIC nexthop group table is full",
+        "SAI API version mismatch between orchagent and syncd vendor plugin"
+      ],
+      "resolution": [
+        "Check APPL_DB: 'redis-cli -n 0 HGETALL \"ROUTE_TABLE:<prefix/len>\"' -- if empty, fpmsyncd did not publish; if populated, failure is orchagent or downstream",
+        "Check ASIC_DB: 'redis-cli -n 1 KEYS \"ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*\" | grep <prefix>' -- absence confirms ASIC not programmed",
+        "Check orchagent logs: 'docker logs swss 2>&1 | grep -E \"ERROR|SAI|route\" | tail -50'",
+        "Check syncd logs: 'docker logs syncd 2>&1 | grep -E \"ERROR|SAI_STATUS\" | tail -30'",
+        "Check neighbor ARP entry is in ASIC_DB before retrying: 'redis-cli -n 1 KEYS \"ASIC_STATE:SAI_OBJECT_TYPE_NEIGHBOR_ENTRY*\" | grep <next-hop-ip>'",
+        "If table full: review route count and remove unused static routes; check platform FIB capacity limits",
+        "Restart orchagent if stuck (will trigger full APPL_DB resync): 'sudo systemctl restart swss' (disruptive -- causes brief traffic interruption)"
+      ],
+      "verify_commands": [
+        {
+          "command": "show ip route static",
+          "look_for": "Static route prefix with 'S' source code and correct next-hop; presence confirms kernel RIB installation",
+          "confirms_if": "Route visible in kernel RIB but absent from ASIC_DB confirms the pipeline failure is orchagent or syncd"
+        },
+        {
+          "command": "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+          "look_for": "nexthop and ifname fields populated; absence means fpmsyncd has not published the route",
+          "confirms_if": "Populated APPL_DB entry with absent ASIC_DB entry confirms orchagent is not processing the route"
+        },
+        {
+          "command": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep <prefix>",
+          "look_for": "Matching route entry key for the prefix; absence means route is not programmed in hardware",
+          "confirms_if": "Key absent in ASIC_DB confirms route was not programmed into ASIC forwarding table"
+        },
+        {
+          "command": "docker logs swss 2>&1 | grep -E 'ERROR|SAI_STATUS|Failed to create route' | tail -50",
+          "look_for": "SAI_STATUS_TABLE_FULL, SAI_STATUS_INSUFFICIENT_RESOURCES, 'Failed to create route entry', or nexthop OID resolution errors",
+          "confirms_if": "SAI error messages confirm ASIC programming failure; error code identifies whether cause is table full or nexthop resolution"
+        },
+        {
+          "command": "docker logs syncd 2>&1 | grep -E 'ERROR|SAI_STATUS' | tail -30",
+          "look_for": "SAI API call failures, vendor-specific error codes from the ASIC SAI library",
+          "confirms_if": "SAI errors in syncd logs confirm the ASIC rejected the programming call at the hardware interface layer"
+        },
+        {
+          "command": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_NEIGHBOR_ENTRY*' | grep <next-hop-ip>",
+          "look_for": "Neighbor entry for the next-hop IP in ASIC_DB; absence means orchagent cannot resolve next-hop to SAI OID",
+          "confirms_if": "Missing neighbor entry in ASIC_DB confirms orchagent is waiting for ARP resolution before programming the route"
+        }
+      ]
+    },
+    {
+      "scenario": "Blackhole route due to unreachable next-hop -- next-hop interface down or ARP not resolved",
+      "description": "A static route is configured but its next-hop IP address is not reachable: either the egress interface is administratively or operationally down, ARP has not resolved for the next-hop IP, or the next-hop IP is not on a directly connected subnet. zebra's Next-Hop Tracking (NHT) subsystem detects the next-hop is unresolvable and withholds the route from the kernel RIB. The route appears in staticd's config but not in 'show ip route', and traffic to the destination is dropped. This is distinct from an intentional blackhole route (null0) -- this is an unintended blackhole caused by a broken next-hop.",
+      "symptoms": [
+        "Static route appears in FRR running-config ('docker exec bgp vtysh -c show running-config | grep ip route') but NOT in 'show ip route static'",
+        "Destination prefix is unreachable -- ping fails with 'Network unreachable' or packets are dropped",
+        "ARP table ('show arp') does not have an entry for the configured next-hop IP",
+        "'show interface <ifname>' shows the interface is down or has no IP address",
+        "docker exec bgp vtysh -c 'show ip route <next-hop-ip>' returns no route to the next-hop subnet"
+      ],
+      "root_causes": [
+        "Egress interface is operationally down (physical link failure, SFP removed, or 'config interface shutdown')",
+        "ARP for the next-hop IP has not resolved -- next-hop host is down, unreachable, or in a different subnet",
+        "Static route next-hop IP is misconfigured -- typo in IP address putting it on a different subnet or pointing to a non-existent host",
+        "Interface was reconfigured or removed from the subnet that contains the next-hop IP",
+        "Next-hop is in a VRF but the route was configured in the default VRF (VRF mismatch -- see VRF failure mode)",
+        "zebra NHT is not tracking the next-hop because 'ip nht resolve-via-default' is not set and no specific route to the next-hop subnet exists"
+      ],
+      "resolution": [
+        "Verify interface state: 'show interface <egress-ifname>' -- must be operationally up",
+        "Check ARP: 'show arp | grep <next-hop-ip>' -- if missing, ping the next-hop to trigger ARP resolution",
+        "Verify next-hop subnet: 'show ip interface' -- confirm the next-hop IP is within a directly connected subnet on the switch",
+        "Check static route config: 'redis-cli -n 4 HGETALL \"STATIC_ROUTE|<vrf>|<prefix>\"' -- verify nexthop field is correct IP",
+        "If next-hop is wrong: delete and re-add via SONiC CLI with correct next-hop IP, then 'config save'",
+        "Check zebra NHT: 'docker exec bgp vtysh -c \"show ip nht\"' -- look for the next-hop and its resolution status"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show ip route static'",
+          "look_for": "Absence of the expected static route prefix; if route is configured but not shown here, next-hop is unreachable",
+          "confirms_if": "Route missing from 'show ip route static' despite being in running-config confirms next-hop is unresolvable"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip nht'",
+          "look_for": "Next-hop IP in the NHT table with resolution status; 'unresolved' or missing entry confirms NHT cannot find a path",
+          "confirms_if": "Unresolved NHT entry for the static route next-hop confirms zebra is withholding the route from the RIB"
+        },
+        {
+          "command": "show arp | grep <next-hop-ip>",
+          "look_for": "ARP entry for the next-hop IP with a MAC address; absence means ARP has not resolved",
+          "confirms_if": "Missing ARP entry for the next-hop IP confirms the layer 2 neighbor resolution is the blocking condition"
+        },
+        {
+          "command": "show interface <egress-ifname>",
+          "look_for": "Operational state: 'oper: up' vs 'oper: down'; also check IP address assignment on the interface",
+          "confirms_if": "Interface oper-down state confirms the egress path is unavailable at the physical/link layer"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show running-config' | grep 'ip route'",
+          "look_for": "Static route entries with their configured next-hop IPs; compare next-hop IPs against 'show ip interface' subnets",
+          "confirms_if": "Next-hop IP not matching any directly connected subnet confirms a misconfigured next-hop address"
+        }
+      ]
+    },
+    {
+      "scenario": "Recursive next-hop resolution failure -- next-hop IP not directly connected, zebra cannot resolve recursion",
+      "description": "A static route is configured with a next-hop IP that is not on a directly connected subnet. zebra must resolve this recursively -- it looks for another route in the RIB that covers the next-hop IP, then uses that route's interface and next-hop for forwarding. If the resolving route (typically a BGP or OSPF route) disappears or was never present, zebra cannot complete the recursive resolution and withholds the static route. This failure mode is particularly common in management plane static routes that depend on dynamic routing for their recursive resolution.",
+      "symptoms": [
+        "Static route with a non-directly-connected next-hop is absent from 'show ip route static'",
+        "'docker exec bgp vtysh -c show ip route <next-hop-ip>' returns no route to the next-hop",
+        "FRR running-config shows the static route correctly configured but zebra NHT shows it unresolved",
+        "Route was previously working but disappeared after a BGP or OSPF session reset",
+        "docker exec bgp vtysh -c 'show ip nht' shows the recursive next-hop with 'unresolved' status"
+      ],
+      "root_causes": [
+        "The dynamic route (BGP/OSPF) that was providing recursive resolution was withdrawn -- peer went down, prefix was filtered out, or metric changed",
+        "Static route configured for a next-hop IP that requires recursion but 'ip nht resolve-via-default' is not enabled and no specific covering route exists",
+        "Maximum recursion depth exceeded in zebra (default 5 levels) -- chain of static routes each resolving via another route",
+        "VRF isolation: the static route is in the default VRF but the resolving route is in a data VRF (or vice versa)",
+        "Race condition at startup: static routes loaded before dynamic routing protocols converge, leaving them temporarily unresolved"
+      ],
+      "resolution": [
+        "Check NHT for the recursive next-hop: 'docker exec bgp vtysh -c \"show ip nht\"'",
+        "Check if a route to the next-hop IP exists: 'docker exec bgp vtysh -c \"show ip route <next-hop-ip>\"'",
+        "If depending on BGP/OSPF for resolution: verify those protocols are up and have the covering route",
+        "Enable resolve-via-default if appropriate: 'docker exec bgp vtysh -c \"conf t\" then \"ip nht resolve-via-default\"' (use 'config' CLI for persistence)",
+        "Consider converting to a directly connected next-hop if the topology supports it",
+        "At startup convergence issues: add a brief startup delay or use 'wait-for-system-ready' mechanisms"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show ip nht'",
+          "look_for": "Recursive next-hop IP in the NHT table; 'unresolved' status means no covering route was found in the RIB",
+          "confirms_if": "Unresolved recursive next-hop in NHT table directly confirms recursive resolution failure as root cause"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip route <next-hop-ip>'",
+          "look_for": "Any route covering the next-hop IP subnet; absence means the resolving dynamic route is missing",
+          "confirms_if": "No RIB entry covering the next-hop IP confirms the recursive resolution path is broken"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip route static'",
+          "look_for": "Whether the static route with recursive next-hop appears; its absence while in running-config confirms resolution failure",
+          "confirms_if": "Static route absent from RIB despite correct configuration confirms zebra is withholding it due to NHT failure"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show running-config' | grep 'resolve-via-default'",
+          "look_for": "Presence of 'ip nht resolve-via-default' directive; absence means default route cannot be used for recursive resolution",
+          "confirms_if": "Missing resolve-via-default config combined with no specific covering route confirms the NHT resolution policy is blocking the route"
+        }
+      ]
+    },
+    {
+      "scenario": "VRF route leak issues -- static route in wrong VRF or inter-VRF leak not configured",
+      "description": "SONiC supports multiple VRFs, and static routes must be configured in the correct VRF context. Two sub-cases exist: (1) a static route is configured in the default VRF but should be in a named VRF (or vice versa), causing the route to be silently present but unreachable for traffic in the intended VRF; (2) an inter-VRF route leak is intended (traffic from VRF-A should be able to reach a prefix in VRF-B) but the nexthop-vrf field is missing or misconfigured in the STATIC_ROUTE CONFIG_DB entry. In both cases, the route may appear to exist but traffic in the intended VRF does not use it.",
+      "symptoms": [
+        "Static route appears in 'show ip route' for the wrong VRF context",
+        "Traffic in the intended VRF drops instead of using the static route",
+        "'docker exec bgp vtysh -c \"show ip route vrf <vrfname>\"' does not show the expected static route",
+        "STATIC_ROUTE CONFIG_DB key uses default VRF path while intended VRF is different",
+        "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>' shows route in APPL_DB without nexthop-vrf field (for intended VRF leak)"
+      ],
+      "root_causes": [
+        "Operator configured static route using CLI without specifying VRF -- route lands in default VRF instead of intended VRF",
+        "CONFIG_DB STATIC_ROUTE key format uses 'STATIC_ROUTE|<prefix>' (default VRF) instead of 'STATIC_ROUTE|<vrfname>|<prefix>'",
+        "Inter-VRF route leak intended but 'nexthop-vrf' field missing from STATIC_ROUTE CONFIG_DB entry",
+        "VRF not yet created when static route is loaded -- staticd/frrcfgd fails silently and route is dropped",
+        "Route leaked into VRF but next-hop interface is not a member of that VRF",
+        "config_db.json loaded from backup that predates the VRF configuration -- VRF routes loaded before VRF interfaces are up"
+      ],
+      "resolution": [
+        "Identify correct VRF: 'show vrf' to list all VRFs; 'show ip route vrf all' to see routes across all VRFs",
+        "Check CONFIG_DB key: 'redis-cli -n 4 KEYS \"STATIC_ROUTE*\"' -- verify key includes VRF name where needed",
+        "For default VRF route incorrectly placed: delete the wrong-VRF route and re-add with correct VRF: 'ip route add <prefix> <nexthop> vrf <vrfname>'",
+        "For inter-VRF leak: ensure STATIC_ROUTE CONFIG_DB entry has nexthop-vrf field set to the VRF containing the next-hop",
+        "Verify VRF membership: 'show ip interface' to confirm next-hop interface is in the correct VRF",
+        "After changes: 'config save' to persist corrections"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show ip route vrf all static'",
+          "look_for": "Static routes listed under each VRF name; verify the route appears under the intended VRF and not under an unintended one",
+          "confirms_if": "Route appearing under wrong VRF or absent from intended VRF confirms VRF misconfiguration"
+        },
+        {
+          "command": "redis-cli -n 4 KEYS 'STATIC_ROUTE*'",
+          "look_for": "Key format: 'STATIC_ROUTE|<vrfname>|<prefix>' vs 'STATIC_ROUTE|<prefix>' (default VRF); verify VRF name in key matches intended VRF",
+          "confirms_if": "Incorrect VRF name (or missing VRF name) in CONFIG_DB key confirms the route was configured in the wrong VRF context"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'STATIC_ROUTE|<vrfname>|<prefix>'",
+          "look_for": "nexthop-vrf field for inter-VRF leak routes; absence of nexthop-vrf means the route stays within one VRF and does not leak",
+          "confirms_if": "Missing nexthop-vrf field in CONFIG_DB entry confirms inter-VRF leak is not configured at the data plane level"
+        },
+        {
+          "command": "show vrf",
+          "look_for": "All configured VRFs and their associated interfaces; verify VRF exists and is operationally up",
+          "confirms_if": "Missing VRF in output means VRF was not created before static route was loaded -- route may have been silently dropped"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip route vrf <vrfname>'",
+          "look_for": "Static route prefix in the specific VRF routing table; absence confirms the route is not installed in this VRF",
+          "confirms_if": "Absent static route in the intended VRF's routing table confirms VRF mismatch or leak misconfiguration"
+        }
+      ]
+    },
+    {
+      "scenario": "Static route not surviving reboot -- config not saved or CONFIG_DB STATIC_ROUTE table entry malformed",
+      "description": "A static route was operational before a system reboot but does not return after restart. This typically happens because the operator configured the route via CLI or vtysh but never ran 'config save' to persist CONFIG_DB to /etc/sonic/config_db.json -- the on-disk startup config file. A second variant occurs when the STATIC_ROUTE entry in config_db.json is malformed (wrong key format, missing required field, invalid JSON) causing frrcfgd to silently skip it on startup. In either case the switch comes up without the static route and traffic dependent on it is lost.",
+      "symptoms": [
+        "Static route was present before reboot but absent after restart",
+        "'show ip route static' shows no static routes (or fewer than expected) after boot",
+        "redis-cli -n 4 KEYS 'STATIC_ROUTE*' returns empty or incomplete list",
+        "cat /etc/sonic/config_db.json | grep STATIC_ROUTE shows the entry is missing or malformed",
+        "docker exec bgp vtysh -c 'show running-config' does not contain the expected 'ip route' lines after boot",
+        "frrcfgd logs show a JSON parse error or key format error during startup config load"
+      ],
+      "root_causes": [
+        "Operator ran CLI commands to add a static route but never ran 'config save' -- route is in Redis (running) but not in /etc/sonic/config_db.json (startup)",
+        "Static route was added via 'docker exec bgp vtysh' directly (not via SONiC CLI) -- completely bypasses CONFIG_DB and will not survive frrcfgd restart or reboot",
+        "config_db.json STATIC_ROUTE entry has malformed key (e.g., missing VRF component, wrong separator character) causing JSON schema validation failure",
+        "config_db.json STATIC_ROUTE entry has an invalid or missing nexthop field value causing frrcfgd template rendering to fail",
+        "config_db.json was restored from an older backup that predates the static route addition",
+        "config reload was run after a separate change, loading from a saved config that did not include the static route"
+      ],
+      "resolution": [
+        "Check startup config: 'cat /etc/sonic/config_db.json | python3 -m json.tool | grep -A10 STATIC_ROUTE' -- verify entries are present and valid JSON",
+        "Check running CONFIG_DB: 'redis-cli -n 4 KEYS \"STATIC_ROUTE*\"' -- if present in Redis but not in JSON file, run 'config save' immediately",
+        "If route was added via vtysh: delete from vtysh and re-add via SONiC CLI to ensure CONFIG_DB persistence",
+        "Validate config_db.json format: 'python3 -c \"import json; json.load(open(\\\"/etc/sonic/config_db.json\\\"))\"' -- a parse error reveals the malformed entry",
+        "Fix malformed STATIC_ROUTE entry: correct key format is 'STATIC_ROUTE|<prefix>' for default VRF or 'STATIC_ROUTE|<vrfname>|<prefix>'",
+        "After fixing: 'config save' and verify: 'cat /etc/sonic/config_db.json | python3 -m json.tool | grep STATIC_ROUTE'"
+      ],
+      "verify_commands": [
+        {
+          "command": "redis-cli -n 4 KEYS 'STATIC_ROUTE*'",
+          "look_for": "Static route keys in the running CONFIG_DB; if present here but absent after reboot, config was not saved",
+          "confirms_if": "Routes in Redis but missing from /etc/sonic/config_db.json confirms 'config save' was never run"
+        },
+        {
+          "command": "cat /etc/sonic/config_db.json | python3 -m json.tool | grep -A10 'STATIC_ROUTE'",
+          "look_for": "STATIC_ROUTE section with well-formed key-value entries; absence means routes were never saved; malformed JSON means the file is corrupted",
+          "confirms_if": "Missing STATIC_ROUTE section in config_db.json confirms routes were not persisted to startup config"
+        },
+        {
+          "command": "docker logs bgp 2>&1 | grep -iE 'static|frrcfgd|error' | tail -50",
+          "look_for": "frrcfgd errors loading static routes at startup -- template rendering failures, invalid key format errors, or missing field warnings",
+          "confirms_if": "frrcfgd error messages at startup confirm a malformed STATIC_ROUTE CONFIG_DB entry prevented route installation"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show running-config' | grep 'ip route'",
+          "look_for": "Static 'ip route' lines in FRR running config; absence after reboot means frrcfgd did not apply the config",
+          "confirms_if": "No static routes in FRR running-config after reboot confirms frrcfgd did not successfully load them from CONFIG_DB"
+        },
+        {
+          "command": "python3 -c \"import json; d=json.load(open('/etc/sonic/config_db.json')); print(list(d.get('STATIC_ROUTE',{}).keys()))\"",
+          "look_for": "List of STATIC_ROUTE keys; a JSON parse exception means the config file is malformed",
+          "confirms_if": "JSON parse exception confirms the config_db.json file has a syntax error that prevented correct loading on reboot"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "type": "daemon",
+      "name": "staticd (FRR)",
+      "description": "FRR staticd process manages static route entries. In SONiC, staticd runs inside the 'bgp' Docker container alongside bgpd and zebra. frrcfgd translates CONFIG_DB STATIC_ROUTE entries into 'ip route' vtysh commands delivered to staticd. staticd submits accepted routes to zebra via the Zserv IPC socket."
+    },
+    {
+      "type": "daemon",
+      "name": "zebra (FRR)",
+      "description": "FRR zebra maintains the kernel RIB and programs Linux kernel routing table entries via netlink. zebra's Next-Hop Tracking (NHT) subsystem evaluates whether static route next-hops are reachable. Unreachable next-hops cause zebra to withhold the route from the RIB. zebra runs inside the 'bgp' Docker container."
+    },
+    {
+      "type": "daemon",
+      "name": "frrcfgd",
+      "description": "Translates CONFIG_DB STATIC_ROUTE, DEVICE_METADATA, and VRF table entries into FRR vtysh commands. Subscribes to CONFIG_DB keyspace notifications for incremental updates. If frrcfgd is down or crashes, CONFIG_DB changes are not applied to FRR staticd. Runs inside the 'bgp' Docker container."
+    },
+    {
+      "type": "daemon",
+      "name": "fpmsyncd",
+      "description": "Monitors Linux kernel netlink route events (from zebra) via the FPM socket (localhost:2620) and publishes route add/delete operations to APPL_DB ROUTE_TABLE. Without fpmsyncd, static routes in the kernel RIB never reach orchagent or the ASIC. Runs inside the 'bgp' Docker container."
+    },
+    {
+      "type": "daemon",
+      "name": "orchagent (swss container)",
+      "description": "Consumes APPL_DB ROUTE_TABLE entries and translates them into SAI API calls written to ASIC_DB. Static routes are not forwarded in hardware until orchagent successfully resolves the next-hop to a SAI OID and programs the ASIC_DB route entry."
+    },
+    {
+      "type": "daemon",
+      "name": "syncd (syncd container)",
+      "description": "Reads ASIC_DB route entries and calls the vendor SAI library to program the physical ASIC LPM/FIB table. The final step in the static route programming pipeline. SAI errors (table full, resource exhaustion) are surfaced here."
+    },
+    {
+      "type": "database",
+      "name": "CONFIG_DB (Redis DB 4)",
+      "description": "Source of truth for static route configuration: STATIC_ROUTE table with prefix keys and nexthop values. frrcfgd reads from here to drive FRR staticd configuration. Must be saved to /etc/sonic/config_db.json via 'config save' for routes to survive reboots."
+    },
+    {
+      "type": "database",
+      "name": "APPL_DB (Redis DB 0)",
+      "description": "Route publication bus between fpmsyncd and orchagent. Static routes must appear in ROUTE_TABLE here (published by fpmsyncd after zebra installs them in the kernel) before they can reach orchagent and be programmed into the ASIC."
+    },
+    {
+      "type": "database",
+      "name": "ASIC_DB (Redis DB 1)",
+      "description": "Holds SAI route objects programmed by orchagent and consumed by syncd for ASIC programming. A static route is only forwarding in hardware when a corresponding SAI_OBJECT_TYPE_ROUTE_ENTRY exists in ASIC_DB."
+    },
+    {
+      "type": "database",
+      "name": "STATE_DB (Redis DB 6)",
+      "description": "Holds operational state for interfaces, VRFs, and neighbors. orchagent checks STATE_DB for neighbor (ARP/ND) resolution status when programming route next-hops. Missing neighbor state can delay route programming."
+    },
+    {
+      "type": "protocol",
+      "name": "ARP/NDP",
+      "description": "Address Resolution Protocol (IPv4) and Neighbor Discovery Protocol (IPv6) resolve next-hop IP addresses to MAC addresses. If ARP has not resolved for the static route next-hop, zebra NHT marks the next-hop unreachable and withholds the route from the RIB. neighsyncd maintains the neighbor state in STATE_DB."
+    }
+  ],
+  "config_db_tables": [
+    {
+      "table": "STATIC_ROUTE",
+      "key_pattern": "STATIC_ROUTE|<prefix/len>  (default VRF)  or  STATIC_ROUTE|<vrfname>|<prefix/len>  (named VRF)",
+      "relevant_fields": [
+        "nexthop: next-hop IP address (comma-separated for ECMP); or 'blackhole' for null route",
+        "ifname: egress interface name (optional; used for directly connected static routes without next-hop IP)",
+        "distance: administrative distance (default 1; range 1-254)",
+        "nexthop-vrf: VRF name for inter-VRF route leak -- the VRF in which the next-hop is reachable",
+        "blackhole: true/false -- whether this is a null/discard route (maps to 'ip route <prefix> blackhole' in FRR)"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'STATIC_ROUTE|<prefix/len>'",
+      "redis_command": "redis-cli -n 4 KEYS 'STATIC_ROUTE*'"
+    },
+    {
+      "table": "ROUTE_TABLE (APPL_DB)",
+      "key_pattern": "ROUTE_TABLE:<prefix/len>",
+      "relevant_fields": [
+        "nexthop: comma-separated list of next-hop IPs published by fpmsyncd",
+        "ifname: egress interface name(s)",
+        "distance: administrative distance",
+        "nexthop-vrf: VRF for the nexthop (for VRF route leak)",
+        "blackhole: true/false for null route programming"
+      ],
+      "verify_command": "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+      "redis_command": "redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l"
+    },
+    {
+      "table": "DEVICE_METADATA",
+      "key_pattern": "DEVICE_METADATA|localhost",
+      "relevant_fields": [
+        "hostname: device hostname",
+        "type: device type (ToRRouter, SpineRouter, etc.)",
+        "default_bgp_status: controls whether BGP starts automatically",
+        "synchronous_mode: controls orchagent synchronous SAI programming mode"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'DEVICE_METADATA|localhost'",
+      "redis_command": "redis-cli -n 4 KEYS 'DEVICE_METADATA*'"
+    },
+    {
+      "table": "VRF",
+      "key_pattern": "VRF|<vrfname>",
+      "relevant_fields": [
+        "fallback: true/false -- whether VRF falls back to default VRF for unresolved routes",
+        "vni: VXLAN VNI associated with this VRF (for L3 EVPN)"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'VRF|<vrfname>'",
+      "redis_command": "redis-cli -n 4 KEYS 'VRF*'"
+    },
+    {
+      "table": "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY (ASIC_DB)",
+      "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:{\"dest\":\"<prefix>\",\"switch_id\":\"<oid>\",\"vrf\":\"<oid>\"}",
+      "relevant_fields": [
+        "SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID: OID of next-hop or next-hop group in ASIC",
+        "SAI_ROUTE_ENTRY_ATTR_PACKET_ACTION: SAI_PACKET_ACTION_FORWARD or SAI_PACKET_ACTION_DROP (blackhole)"
+      ],
+      "verify_command": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep <prefix>",
+      "redis_command": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | wc -l"
+    }
+  ],
+  "sonic_notes": [
+    {
+      "note": "Static routes in SONiC are configured via CONFIG_DB STATIC_ROUTE table, NOT by editing FRR config files or running vtysh directly. frrcfgd (inside the bgp container) translates STATIC_ROUTE CONFIG_DB entries into FRR 'ip route' vtysh commands. Any static route entered directly via 'docker exec bgp vtysh' will be lost on container restart or 'config reload'. Always use SONiC CLI ('ip route add') for persistent static routes.",
+      "human_error_risk": "HIGH",
+      "source_ref": "sonic-buildimage:src/sonic-frrcfgd/ and SONiC Configuration Management design doc"
+    },
+    {
+      "note": "After any static route addition or modification via CLI, always run 'config save' to persist the change to /etc/sonic/config_db.json. Without this step, the route exists in the running Redis CONFIG_DB but will be lost on the next reboot. This is the most common cause of 'route disappeared after reboot' incidents.",
+      "human_error_risk": "HIGH",
+      "source_ref": "SONiC Configuration Management: config save writes running CONFIG_DB to /etc/sonic/config_db.json"
+    },
+    {
+      "note": "The static route programming pipeline in SONiC is: frrcfgd (CONFIG_DB -> FRR vtysh) -> staticd (route config) -> zebra NHT (next-hop reachability check) -> kernel RIB (netlink) -> fpmsyncd (APPL_DB ROUTE_TABLE) -> orchagent (ASIC_DB SAI route) -> syncd (ASIC LPM/FIB). A failure at any stage stops the route from reaching hardware. When a static route is configured but traffic does not forward, check each stage systematically from left to right.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "sonic-buildimage:src/sonic-swss/orchagent/routeorch.cpp and src/sonic-frrcfgd/"
+    },
+    {
+      "note": "zebra Next-Hop Tracking (NHT) is responsible for evaluating whether a static route's next-hop is reachable before installing it in the RIB. If the next-hop IP is not on a directly connected subnet and 'ip nht resolve-via-default' is not configured, zebra requires a specific route covering the next-hop IP to be present. This can cause static routes to silently disappear when the covering dynamic route is withdrawn.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "FRR zebra NHT documentation and zebra/zebra_nht.c"
+    },
+    {
+      "note": "For inter-VRF static route leaks in SONiC, the STATIC_ROUTE CONFIG_DB entry must include a 'nexthop-vrf' field specifying the VRF where the next-hop is reachable. Without this field, the route stays within its own VRF and traffic cannot cross VRF boundaries. This is different from Cisco IOS 'ip route <prefix> <nexthop> <vrf>' syntax and often trips up engineers migrating from IOS.",
+      "human_error_risk": "HIGH",
+      "source_ref": "SONiC VRF design doc and sonic-buildimage:src/sonic-frrcfgd/frrcfgd/"
+    },
+    {
+      "note": "Blackhole (null) routes in SONiC are configured by setting 'blackhole: true' in the STATIC_ROUTE CONFIG_DB entry, or by using the 'blackhole' keyword in the SONiC CLI. These routes are intentionally programmed into the ASIC with SAI_PACKET_ACTION_DROP. They are used for traffic engineering (aggregate summarization with more-specific routes for real destinations) and DoS mitigation (RTBH -- Remote Triggered Black Hole). Do not confuse an intentional blackhole route with an unintentional one caused by a missing next-hop.",
+      "human_error_risk": "LOW",
+      "source_ref": "SONiC static route design and SAI route entry action attributes"
+    },
+    {
+      "note": "SONiC static routes support administrative distance (default 1, which is lower/preferred over most dynamic protocols). If a static route conflicts with a BGP or OSPF route for the same prefix, the static route wins by default due to lower distance. This can mask routing problems: a misconfigured static route may override a correct dynamic route. Use 'show ip route <prefix> longer-prefixes' to see all competing routes and their sources.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "FRR zebra administrative distance table and SONiC route preference design"
+    },
+    {
+      "note": "frrcfgd (not bgpcfgd) manages static route configuration in SONiC. bgpcfgd handles BGP-specific configuration. Both run inside the 'bgp' Docker container but are separate processes. When debugging static route configuration sync issues, check 'docker exec bgp supervisorctl status' and look specifically for frrcfgd, not bgpcfgd.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "sonic-buildimage:src/sonic-frrcfgd/ -- separate from src/sonic-bgpcfgd/"
+    }
+  ],
+  "sonic_frr_mapping": {
+    "frr_process": "staticd",
+    "frr_config_managed_by": "frrcfgd (reads CONFIG_DB STATIC_ROUTE table and applies via vtysh)",
+    "frrcfgd_source": "sonic-buildimage:src/sonic-frrcfgd/frrcfgd/",
+    "config_managed_by": "frrcfgd (translates CONFIG_DB STATIC_ROUTE entries into FRR 'ip route' commands)",
+    "container": "bgp",
+    "frr_socket": "/var/run/frr/staticd.vty",
+    "fpm_port": "localhost:2620 (zebra FPM module to fpmsyncd -- shared with BGP and other routing protocols)",
+    "supervisor_config": "/etc/supervisor/conf.d/staticd.conf (inside bgp container)"
+  },
+  "key_commands": [
+    "show ip route static",
+    "show ip route vrf all static",
+    "show ip route <prefix>",
+    "docker exec bgp vtysh -c 'show ip route static'",
+    "docker exec bgp vtysh -c 'show ip route vrf all'",
+    "docker exec bgp vtysh -c 'show ip nht'",
+    "docker exec bgp vtysh -c 'show running-config' | grep 'ip route'",
+    "docker exec bgp supervisorctl status",
+    "docker exec bgp supervisorctl status frrcfgd",
+    "docker exec bgp supervisorctl status staticd",
+    "docker exec bgp vtysh -c 'show zebra fpm stats'",
+    "redis-cli -n 4 KEYS 'STATIC_ROUTE*'",
+    "redis-cli -n 4 HGETALL 'STATIC_ROUTE|<prefix/len>'",
+    "redis-cli -n 4 HGETALL 'STATIC_ROUTE|<vrfname>|<prefix/len>'",
+    "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+    "redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l",
+    "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep <prefix>",
+    "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_NEIGHBOR_ENTRY*' | grep <next-hop-ip>",
+    "docker logs swss 2>&1 | grep -E 'ERROR|SAI|route' | tail -50",
+    "docker logs syncd 2>&1 | grep -E 'ERROR|SAI_STATUS' | tail -30",
+    "docker logs bgp 2>&1 | grep -iE 'static|frrcfgd|error' | tail -50",
+    "show arp",
+    "show vrf",
+    "show interface <ifname>",
+    "cat /etc/sonic/config_db.json | python3 -m json.tool | grep -A10 STATIC_ROUTE",
+    "config save"
+  ],
+  "related_protocols": [
+    "bgp-4",
+    "ospfv2",
+    "bfd"
+  ],
+  "tags": [
+    "routing",
+    "static",
+    "default-route",
+    "next-hop",
+    "frr",
+    "null-route",
+    "blackhole"
+  ]
+}

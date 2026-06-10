@@ -14,5 +14,17 @@
   "express-reboot-failure": {
     "display_name": "Express reboot failure",
     "entry_symptom": "Express reboot failed, aborted, or switch came up in degraded state"
+  },
+  "vlan-not-programming": {
+    "display_name": "VLAN not programming into ASIC",
+    "entry_symptom": "VLAN configured but traffic not forwarding on VLAN members"
+  },
+  "lag-not-forming": {
+    "display_name": "LAG/PortChannel not forming",
+    "entry_symptom": "PortChannel members not aggregating or LACP not negotiating"
+  },
+  "bfd-flapping": {
+    "display_name": "BFD session flapping",
+    "entry_symptom": "BFD session cycling between Up and Down states"
   }
 }

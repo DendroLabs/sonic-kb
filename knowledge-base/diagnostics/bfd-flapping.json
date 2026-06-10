@@ -1,0 +1,137 @@
+{
+  "tree_id": "bfd-flapping",
+  "display_name": "BFD session flapping",
+  "entry_symptom": "BFD session cycling between Up and Down states repeatedly",
+  "related_protocol": "bfd",
+  "related_errors": [],
+  "related_code_paths": [],
+
+  "nodes": [
+    {
+      "node_id": "n1",
+      "node_type": "branch",
+      "question": "How frequently is the BFD session flapping (check syslog for BFD state transitions)?",
+      "commands": [
+        "sudo grep -i 'bfd' /var/log/syslog | grep -i 'state\\|down\\|up' | tail -30",
+        "show bfd peers",
+        "docker exec bgp vtysh -c 'show bfd peers'"
+      ],
+      "branches": {
+        "very fast (sub-second cycles)": "n2",
+        "periodic (seconds to minutes)": "n4"
+      }
+    },
+    {
+      "node_id": "n2",
+      "node_type": "branch",
+      "question": "Is the control plane CPU overloaded? (bfdd is missing keepalives due to scheduling starvation)",
+      "commands": [
+        "top -bn1 | head -20",
+        "ps aux --sort=-%cpu | head -15",
+        "docker exec bgp top -bn1 | head -15",
+        "cat /proc/loadavg"
+      ],
+      "branches": {
+        "yes": "n3",
+        "no": "n9"
+      }
+    },
+    {
+      "node_id": "n3",
+      "node_type": "leaf",
+      "finding": "CPU starvation causing BFD keepalive misses",
+      "action": "bfdd is a software process sharing CPU with other control-plane daemons. Under high load it cannot send or process BFD control packets within the negotiated detect interval, causing the peer to declare the session Down. Remediation: (1) Identify the CPU consumer: ps aux --sort=-%cpu | head -10. (2) Reduce BFD aggressiveness: increase tx-interval (e.g. 300ms -> 1000ms) and/or increase detect-multiplier (3 -> 5) to give more tolerance. (3) If available on this platform, check whether hardware-offloaded BFD is supported (avoids control-plane scheduling entirely). (4) Consider isolating the BFD container or adjusting process priorities with nice/chrt if the offending process is low-priority. Verify recovery: watch 'show bfd peers' until state stays Up.",
+      "commands": [
+        "docker exec bgp vtysh -c 'show bfd peers counters'",
+        "docker exec bgp vtysh -c 'show running-config' | grep -A5 'bfd'",
+        "show bfd peers"
+      ]
+    },
+    {
+      "node_id": "n4",
+      "node_type": "branch",
+      "question": "Are the BFD timers asymmetric between the two peers (tx-interval, rx-interval, or detect-multiplier mismatch)?",
+      "commands": [
+        "docker exec bgp vtysh -c 'show bfd peers'",
+        "docker exec bgp vtysh -c 'show bfd peers json'",
+        "redis-cli -n 6 HGETALL 'BFD_SESSION_TABLE|default|default|<peer_ip>'"
+      ],
+      "branches": {
+        "yes": "n5",
+        "no": "n6"
+      }
+    },
+    {
+      "node_id": "n5",
+      "node_type": "leaf",
+      "finding": "BFD timer mismatch between peers causing detect timeout",
+      "action": "BFD negotiates the actual transmit interval as max(local-tx, remote-rx) and the detect timeout as negotiated-interval * detect-multiplier. If one peer has a very short detect-multiplier and a long tx-interval on the other side, the detection time becomes shorter than the transmission period and sessions flip. Fix: (1) Align tx-interval and detect-multiplier symmetrically on both peers. Recommended starting values: tx-interval 300, rx-interval 300, detect-multiplier 3 (900ms detection). (2) Apply on the SONiC side via: config bfd peer <peer_ip> interval <ms> min-rx <ms> multiplier <n>. (3) Verify negotiated values converge: docker exec bgp vtysh -c 'show bfd peers json' -- look at 'negotiated-transmission-interval' and 'remote-*' fields.",
+      "commands": [
+        "docker exec bgp vtysh -c 'show bfd peers json'",
+        "show bfd peers"
+      ]
+    },
+    {
+      "node_id": "n6",
+      "node_type": "branch",
+      "question": "Is there packet loss on the link (check interface error counters, CRC errors, or input drops)?",
+      "commands": [
+        "show interfaces counters errors",
+        "show interfaces counters",
+        "redis-cli -n 2 HGETALL 'COUNTERS:oid:<interface_oid>' | grep -E 'CRC|DROP|ERR'",
+        "show interface <interface>"
+      ],
+      "branches": {
+        "yes": "n7",
+        "no": "n8"
+      }
+    },
+    {
+      "node_id": "n7",
+      "node_type": "leaf",
+      "finding": "Physical link quality degradation causing BFD packet loss",
+      "action": "BFD is sensitive to packet loss -- even a single dropped control packet counts toward the detect-multiplier threshold. CRC errors, optical Rx power issues, or cable problems manifest as intermittent BFD drops before they trip interface errors. Remediation: (1) Check optical Rx/Tx power: show interfaces transceiver dom <port>. (2) Clean or replace SFP/DAC cable if Rx power is near the threshold. (3) Short-term mitigation: increase detect-multiplier to tolerate isolated drops (e.g. multiplier 5 instead of 3). (4) If errors persist, replace the physical medium. Verify: show interfaces counters errors -- CRC counter should stop incrementing after fix.",
+      "commands": [
+        "show interfaces transceiver dom <port>",
+        "show interfaces counters errors",
+        "show interfaces counters"
+      ]
+    },
+    {
+      "node_id": "n8",
+      "node_type": "branch",
+      "question": "Is BFD echo mode enabled on this session?",
+      "commands": [
+        "docker exec bgp vtysh -c 'show bfd peers json' | python3 -m json.tool | grep -i echo",
+        "docker exec bgp vtysh -c 'show running-config' | grep -A10 'bfd peer'"
+      ],
+      "branches": {
+        "yes": "n10",
+        "no": "n9"
+      }
+    },
+    {
+      "node_id": "n9",
+      "node_type": "leaf",
+      "finding": "CoPP policer rate-limiting BFD control packets or routing change disrupting multi-hop BFD reachability",
+      "action": "Two common causes reach this leaf: (1) CoPP rate-limiting: BFD packets are punted to the CPU and policed by the COPP_TABLE entry for BFD. If the policer rate is too low, BFD packets are dropped silently. Check: redis-cli -n 4 HGETALL 'COPP_TABLE|copp-system-bfd'. If cir/cbs is very small, increase it. Also check hardware counters: show dropcounters counts. (2) Multi-hop BFD reachability: if a routing change briefly removes the path to the BFD peer, the session drops even with healthy timers. Check: show ip route <peer_ip> and correlate BFD flap timestamps with route change timestamps in syslog. For multi-hop BFD, consider using a dedicated static route with a higher admin distance as a backup to prevent route flaps from triggering BFD drops.",
+      "commands": [
+        "redis-cli -n 4 HGETALL 'COPP_TABLE|copp-system-bfd'",
+        "show ip route <peer_ip>",
+        "sudo grep -i 'bfd\\|route' /var/log/syslog | tail -50",
+        "docker exec bgp vtysh -c 'show bfd peers counters'"
+      ]
+    },
+    {
+      "node_id": "n10",
+      "node_type": "leaf",
+      "finding": "BFD echo mode incompatibility -- peer not looping back echo packets correctly",
+      "action": "Echo mode requires the remote device to loop BFD echo packets back to the originator without processing them. Some platforms (particularly non-SONiC peers or older ASICs) do not correctly loop echo packets, causing the echo detect timer to fire and the session to go Down. Remediation: (1) Disable echo mode on SONiC: configure the BFD peer without echo-mode. In FRR config: 'no echo-mode' under the BFD peer. (2) Alternatively, verify the peer platform supports echo loopback per its vendor documentation. (3) After disabling echo mode, the session will use asynchronous mode only. Verify: docker exec bgp vtysh -c 'show bfd peers json' -- 'echo-mode' field should be false and session should stay Up.",
+      "commands": [
+        "docker exec bgp vtysh -c 'show bfd peers json'",
+        "docker exec bgp vtysh -c 'show running-config' | grep -A15 'bfd peer'",
+        "show bfd peers"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "error_id": "dpkg-force-install",
+  "display_name": "Force-installing Debian packages on SONiC, breaking the immutable image model",
+  "severity": "HIGH",
+  "category": "system-integrity",
+  "sonic_version": "202511",
+  "pattern": "Operator installs software directly on the SONiC host OS using 'apt-get install', 'dpkg -i', 'dpkg --force-all -i', or 'pip install' (including inside containers via 'docker exec'). Packages are written to the overlay filesystem or container writable layer, appear to work immediately, but are silently lost on the next image upgrade. Worse, dependency pulls or dpkg --force flags can corrupt the APT package database, replace SONiC system libraries, or overwrite Python packages that SONiC daemons depend on.",
+  "what_goes_wrong": "SONiC 202511 uses an immutable image model: the root filesystem is a SquashFS image (sonic.img) that is swapped wholesale during 'sonic-installer install'. The live filesystem is an overlay (OverlayFS) with the SquashFS as the lower read-only layer and a writable upper layer (stored in a persistent partition). Packages installed via apt/dpkg go into the overlay upper layer only. When 'sonic-installer' installs a new image, it creates a fresh SquashFS and a new empty upper layer, silently discarding all packages the operator installed. The operator's customizations survive reboots (because the upper layer persists across reboots on the same image) but vanish on any image upgrade, giving a false sense of persistence. Beyond data loss: dpkg --force flags (--force-depends, --force-overwrite, --force-all) override the package manager's dependency and conflict checks. On a SONiC system this can replace shared libraries (libpython3, libssl, libswsscommon) that SONiC daemons link against, break the Python3 environment that orchagent, syncd, and the swss container daemons rely on, or corrupt /var/lib/dpkg/status so that future apt operations fail. pip install on the host can overwrite modules in /usr/lib/python3/dist-packages that bgpcfgd, fpmsyncd, and other swsscommon-based daemons import at startup.",
+  "symptoms": [
+    "After image upgrade: a tool or library that was present is missing and 'which <tool>' or 'dpkg -l | grep <pkg>' shows it is not installed",
+    "SONiC daemon crashes with ImportError or ModuleNotFoundError after apt/pip install modified /usr/lib/python3/dist-packages",
+    "syncd or orchagent exits immediately after restart with 'error while loading shared libraries' if a shared library was overwritten by a force-installed package",
+    "'apt-get install' or 'apt-get update' fails with 'dpkg: error: parsing file /var/lib/dpkg/status' or 'Sub-process /usr/bin/dpkg returned an error code (1)' after a prior --force install corrupted the package database",
+    "Container health check fails or docker daemon logs show a container restart loop after a pip install replaced a module in a shared Python path",
+    "'show system status' reports one or more critical services as failed immediately after package installation",
+    "Redis-based daemons (orchagent, fpmsyncd) fail to connect to db:appl_db or db:asic_db because libswsscommon.so was replaced by an incompatible version",
+    "Operator reports 'I installed X before the maintenance window but it is gone after the upgrade'"
+  ],
+  "detection_commands": [
+    {
+      "command": "dpkg -l | awk '$1 != \"ii\" {print}' | head -40",
+      "purpose": "List all packages in a non-clean install state (half-installed, config-files-only, errors). A non-empty list after a force install indicates package database corruption."
+    },
+    {
+      "command": "dpkg --audit 2>&1",
+      "purpose": "Run dpkg's built-in consistency audit. Outputs packages with broken dependencies or missing required packages. Any output here indicates the overlay package database is in an inconsistent state that will cause apt and future dpkg operations to fail."
+    },
+    {
+      "command": "cat /var/lib/dpkg/status | grep -E '^(Package|Status|Version)' | paste - - - | grep -v 'install ok installed' | head -30",
+      "purpose": "Parse the dpkg status file directly to find packages not in the clean 'install ok installed' state. Useful when 'dpkg --audit' itself fails due to database corruption."
+    },
+    {
+      "command": "find /usr/lib/python3 /usr/lib/python3/dist-packages -newer /etc/sonic/sonic_version.yml -name '*.py' -o -newer /etc/sonic/sonic_version.yml -name '*.so' 2>/dev/null | head -30",
+      "purpose": "Find Python files or shared objects newer than the SONiC version file, which was written at image build time. Any hit indicates a post-install pip or dpkg operation modified system Python libraries."
+    },
+    {
+      "command": "ldd /usr/bin/orchagent 2>/dev/null | grep 'not found'; ldd $(find /usr/lib -name 'libswsscommon.so*' 2>/dev/null | head -1) 2>/dev/null | grep 'not found'",
+      "purpose": "Check whether orchagent or libswsscommon has broken shared library dependencies introduced by a force-installed package that replaced a library with an incompatible version."
+    },
+    {
+      "command": "journalctl -u sonic -b 0 2>&1 | grep -E '(ImportError|ModuleNotFoundError|error while loading|dpkg|apt-get|pip install)' | tail -40",
+      "purpose": "Scan the current-boot journal for Python import errors or shared library load failures that correlate with post-install library replacement."
+    },
+    {
+      "command": "cat /proc/mounts | grep -E '(overlay|squashfs)'; df -h / /host",
+      "purpose": "Confirm the OverlayFS mount is active and show the size of the upper layer (writable overlay). A large upper layer delta may indicate significant filesystem modifications outside the image."
+    },
+    {
+      "command": "docker exec bgp pip3 list 2>/dev/null | grep -vxFf <(cat /usr/share/sonic/docker-bgp.md5 2>/dev/null || echo ''); docker exec swss pip3 list 2>/dev/null | head -20",
+      "purpose": "List Python packages inside the bgp and swss containers to detect pip installs that were run inside the container filesystem (these are also lost on container image upgrade but can cause immediate daemon failures)."
+    },
+    {
+      "command": "find /var/lib/dpkg/info -name '*.list' -newer /etc/sonic/sonic_version.yml 2>/dev/null | head -20",
+      "purpose": "Identify package info files (file manifests) written after image build time. Each hit is a package that was installed post-boot, confirming dpkg/apt activity occurred after the image was laid down."
+    }
+  ],
+  "correct_procedure": "Do not install packages directly on the SONiC host or inside running containers. To add tools or libraries persistently, build a custom SONiC image using the sonic-buildimage pipeline and add the package to the platform-specific Dockerfile or the rules/config.mk package list. For temporary diagnostic use only (not production, and knowing the change is lost on upgrade): run 'sudo apt-get install --no-install-recommends <pkg>' without --force flags, and document the package in the change record so it can be added to the build pipeline. For Python tooling needed by operators, install into a virtualenv in /home/<user> so it cannot conflict with system Python packages. Never use dpkg --force-all, --force-overwrite, or --force-depends on a production SONiC system.",
+  "why_it_breaks": [
+    "SONiC's OverlayFS upper layer is per-image-slot, not persistent across image upgrades. 'sonic-installer install' provisions a new upper layer, and the old upper layer (containing dpkg-installed packages) is not migrated. The operator's packages vanish silently.",
+    "dpkg --force-overwrite allows a new package to replace files owned by an existing package. On SONiC this can replace libswsscommon.so, libsairedis.so, or libpython3.so with versions from a different package, breaking every daemon that links against them.",
+    "pip install --break-system-packages or unconstrained pip install writes .py and .so files into /usr/lib/python3/dist-packages. Daemons like bgpcfgd, fpmsyncd, and the swss Python helpers import from this path at startup. A version mismatch causes an immediate ImportError on the next daemon restart.",
+    "The APT/dpkg package database in /var/lib/dpkg/status lives in the overlay upper layer. Force installs that leave packages in a half-configured state corrupt this file, causing all subsequent apt-get and dpkg invocations to fail with a parsing error. This can block critical security patches from being applied.",
+    "Packages installed inside a container via 'docker exec ... apt-get install' write to the container's writable layer. When the container image is upgraded (e.g., 'sonic-installer' upgrades the entire SONiC image including container images), the writable layer is discarded and the container reverts to the base image state."
+  ],
+  "prevention": "Enforce a no-apt policy via sudoers: remove unrestricted sudo access and restrict 'sudo apt-get' to read-only subcommands ('apt-get --dry-run', 'apt-cache show'). Add a post-boot check in the monitoring stack that alerts when 'dpkg --audit' returns non-empty output or when /var/lib/dpkg/info contains files newer than /etc/sonic/sonic_version.yml. Document the custom-image build pipeline so engineers have a supported path for adding tools without violating the image model.",
+  "related_errors": ["direct-frr-vtysh", "manual-config-db-json-edit"],
+  "ref_daemons": ["daemon:orchagent", "daemon:syncd", "daemon:fpmsyncd", "daemon:bgpcfgd"],
+  "ref_dbs": ["db:appl_db", "db:asic_db", "db:config_db"],
+  "keywords": ["apt-get install", "dpkg -i", "dpkg --force", "pip install", "immutable image", "overlayfs", "squashfs", "sonic-installer", "package manager", "package database", "dpkg status", "force-overwrite", "force-all", "break-system-packages"],
+  "context_keywords": ["package", "install", "apt", "dpkg", "pip", "library", "overlay", "image upgrade", "lost after upgrade", "shared library", "ImportError", "dist-packages"]
+}

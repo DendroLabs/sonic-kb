@@ -1,0 +1,95 @@
+{
+  "error_id": "restart-swss-during-traffic",
+  "display_name": "Restarting swss container while production traffic is flowing",
+  "severity": "HIGH",
+  "category": "operational-error",
+  "sonic_version": "202511",
+  "pattern": "Operator runs 'systemctl restart swss' (or 'docker restart swss') on a production switch carrying live traffic -- often to apply a configuration change, recover from a perceived daemon hang, or follow a stale runbook -- without understanding that swss hosts orchagent, which is the sole writer to ASIC_DB and the sole source of SAI calls into syncd. Restarting swss terminates orchagent, which causes syncd to receive a SAI switch shutdown, clearing all programmed forwarding state from the ASIC hardware tables.",
+  "what_goes_wrong": "In SONiC 202511, orchagent (inside the swss container) is the central hub that consumes APPL_DB entries produced by all *syncd and *mgrd daemons and translates them into SAI API calls via syncd. When swss restarts: (1) orchagent sends a SAI switch finalize, which instructs syncd to flush all SAI objects -- routes, neighbors, FDB entries, ACL entries, VLAN members, port configs, LAG members, and tunnel objects are all removed from hardware. (2) The ASIC is now operating with no programmed forwarding tables: all transit traffic is dropped at hardware. (3) After swss comes back up, orchagent must cold-replay the entire APPL_DB from scratch: it re-reads every route from ROUTE_TABLE, every neighbor from NEIGH_TABLE, every VLAN from VLAN_TABLE, every ACL from ACL_TABLE, and re-issues SAI calls for each object one by one. (4) Full replay time depends on the number of programmed objects -- a switch with 100k IPv4 routes, 2k neighbors, 64 VLANs, and complex ACLs can take 60 seconds to over 3 minutes before forwarding is restored. Unlike warm reboot, there is no state snapshot, no SAI object ID preservation, and no hitless handoff. syncd itself continues running but is idle (no pending SAI calls) while orchagent is absent. portsyncd, neighsyncd, routesyncd, and all *mgrd daemons are co-located in swss and also restart simultaneously, further delaying the point at which APPL_DB is fully re-populated.",
+  "symptoms": [
+    "Immediate total traffic loss on all forwarding paths (L2 and L3) after 'systemctl restart swss' completes the stop phase -- typically within 2-5 seconds of issuing the command",
+    "BFD sessions on remote peers expire within one BFD detect interval (default 3x300ms = 900ms), triggering upstream BGP or OSPF peer withdrawals and route convergence events in the network",
+    "BGP peers with BFD detect the link failure and withdraw routes; BGP peers without BFD may hold their sessions open via keepalives but stop receiving traffic",
+    "'show ip route' and 'show ipv6 route' return empty or partial tables during the orchagent replay window",
+    "'show mac' returns no FDB entries; 'show arp' / 'show ndp' return empty neighbor tables",
+    "redis-cli -n 1 DBSIZE (ASIC_DB) drops to near-zero during the teardown phase and grows slowly back as orchagent replays",
+    "orchagent logs flood with 'SAI object created' entries for routes, neighbors, VLANs, and ACLs as replay proceeds",
+    "syncd logs show 'SAI_STATUS_SUCCESS' for a large burst of create operations immediately after orchagent reconnects",
+    "Remote monitoring shows interface counters drop to zero for all ports on the switch during the outage window",
+    "'show platform summary' and 'show interfaces status' continue to report interfaces UP throughout -- hardware link state is unaffected, only forwarding tables are cleared",
+    "CPU spikes to near 100% on the swss container during the SAI replay burst as orchagent processes the full APPL_DB backlog"
+  ],
+  "detection_commands": [
+    {
+      "command": "docker inspect swss --format '{{.State.StartedAt}}' && journalctl -u swss --since '30 minutes ago' | grep -E '(Started|Stopped|Restarting|restart)' | tail -10",
+      "purpose": "Determine the exact time swss was last restarted. The StartedAt timestamp is the point at which forwarding state was cleared; the gap between that time and now (or until 'show ip route' shows full tables again) is the outage window."
+    },
+    {
+      "command": "redis-cli -n 1 DBSIZE",
+      "purpose": "Check the current size of ASIC_DB. A value near zero indicates orchagent has not yet replayed forwarding state. Watch this value grow over 30-60 seconds as orchagent re-programs the ASIC. A fully-populated ASIC_DB for a typical switch should be in the tens of thousands of keys."
+    },
+    {
+      "command": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:*' | wc -l",
+      "purpose": "Count the number of route entries currently programmed in ASIC_DB. Compare against 'show ip route summary' expected count. During the replay window this count will be lower than the APPL_DB ROUTE_TABLE count, confirming orchagent is still catching up."
+    },
+    {
+      "command": "redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l",
+      "purpose": "Count routes present in APPL_DB ROUTE_TABLE (database 0). This is the target count that orchagent must replay into ASIC_DB. If ASIC_DB route count is significantly lower than this, orchagent replay is still in progress and traffic loss will continue."
+    },
+    {
+      "command": "docker logs swss --since 10m 2>&1 | grep -E '(orchagent|SAI|replay|syncd|COrchAgent|doTask|WARN|ERROR)' | tail -50",
+      "purpose": "Inspect orchagent startup and replay logs. Look for the 'COrchAgent' initialization messages followed by the burst of doTask/SAI create calls. The time between container start and the last SAI object creation log is the replay duration."
+    },
+    {
+      "command": "docker logs syncd --since 10m 2>&1 | grep -E '(SAI_STATUS|removeSwitch|initSwitch|WARN|ERROR|sai_)' | tail -30",
+      "purpose": "Check syncd for SAI switch teardown and re-initialization events. 'removeSwitch' or equivalent SAI finalize messages confirm that the ASIC forwarding tables were cleared when swss stopped."
+    },
+    {
+      "command": "show ip route summary && show ipv6 route summary",
+      "purpose": "Compare current routing table sizes against expected baselines. Fewer routes than baseline during the post-restart window confirms orchagent replay is incomplete and L3 forwarding is partially or fully broken."
+    },
+    {
+      "command": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_NEIGHBOR_ENTRY:*' | wc -l && redis-cli -n 0 KEYS 'NEIGH_TABLE:*' | wc -l",
+      "purpose": "Compare neighbor entry counts between ASIC_DB and APPL_DB. A gap confirms that neighbor programming is still in progress and L3 forwarding to directly-connected hosts is incomplete."
+    },
+    {
+      "command": "journalctl --since '1 hour ago' | grep -E '(systemctl.*swss|docker.*restart.*swss|swss.*restart)' | head -20",
+      "purpose": "Audit the system journal for the operator action that triggered the restart. Captures both 'systemctl restart swss' and 'docker restart swss' invocations, along with the user context if audit logging is enabled."
+    },
+    {
+      "command": "show warm_restart config && show warm_restart state",
+      "purpose": "Confirm whether warm restart was enabled for swss at the time of the restart. If warm restart is enabled, orchagent performs a hitless handoff and this procedure is not disruptive. If disabled (the default), the full cold replay and traffic outage occurred."
+    }
+  ],
+  "correct_procedure": "Before restarting swss on a production switch: (1) Confirm whether the intended change can be applied without restarting swss -- most CONFIG_DB changes (IP addresses, BGP config, ACLs, VLANs) are picked up by the relevant *mgrd or *syncd daemon inside swss without requiring a container restart. (2) If a restart is genuinely required (e.g., to pick up a new binary or recover from a confirmed orchagent crash), first enable warm restart: 'config warm_restart enable swss' and verify with 'show warm_restart config'. With warm restart enabled, orchagent will checkpoint its SAI object ID state before exiting and restore it on startup, avoiding the SAI flush. (3) If warm restart is not available or not appropriate, schedule a maintenance window, notify the NOC, and coordinate with upstream peers to pre-converge traffic away from this switch before issuing the restart. (4) After restart, monitor 'redis-cli -n 1 DBSIZE' and 'show ip route summary' until counts match pre-restart baselines before declaring the switch operational.",
+  "why_it_breaks": [
+    "orchagent is the sole owner of all SAI object lifecycle. When orchagent exits, it calls SAI switch finalize, which instructs the SAI adapter (via syncd) to remove all programmed objects from ASIC hardware. This is by design: SAI does not allow orphaned objects to persist across orchagent sessions without warm restart state preservation.",
+    "swss contains not just orchagent but also portsyncd, neighsyncd, and all *mgrd daemons (portmgrd, intfmgrd, vlanmgrd, teammgrd, buffermgrd, coppmgrd, tunnelmgrd). All of these daemons restart simultaneously. Until each daemon has re-subscribed to its CONFIG_DB tables and re-driven its APPL_DB entries, orchagent has an incomplete view of the desired forwarding state and cannot finish its replay.",
+    "Without warm restart, there is no checkpoint of orchagent's internal SAI object ID map (the oid-to-rid translation tables). On cold restart, orchagent must discover the current ASIC object IDs by re-creating every object from scratch, which involves round-trips through syncd for every route, neighbor, VLAN, ACL entry, and port object.",
+    "During the replay window, syncd is alive and the ASIC is running, but ASIC forwarding tables are empty. The hardware will process ARP and LLDP frames that match the CPU trap ACL, but all other traffic -- including IP forwarding and L2 switching -- is dropped because no FIB or FDB entries exist.",
+    "BFD sessions terminate within one detection interval (as low as 300ms at default timers) because BFD control packets cannot be forwarded while the hardware tables are empty. This causes rapid upstream reconvergence that may take longer to recover than the swss restart itself."
+  ],
+  "prevention": "Enable warm restart for swss in non-emergency scenarios: add 'WARM_RESTART|swss: enable: true' to CONFIG_DB or use 'config warm_restart enable swss'. Add a pre-restart checklist to the runbook: require NOC approval, traffic migration, and warm restart confirmation before any swss restart on a production device. Instrument alerts on ASIC_DB DBSIZE drops -- a sudden drop toward zero is a reliable signal that orchagent has exited unexpectedly or been restarted. Gate swss restarts in automation scripts behind a warm restart check.",
+  "related_errors": ["restart-bgp-during-traffic", "direct-redis-write", "config-reload-during-traffic"],
+  "ref_daemons": [
+    "daemon:orchagent",
+    "daemon:syncd",
+    "daemon:portsyncd",
+    "daemon:neighsyncd",
+    "daemon:portmgrd",
+    "daemon:intfmgrd",
+    "daemon:vlanmgrd",
+    "daemon:teammgrd",
+    "daemon:buffermgrd",
+    "daemon:coppmgrd",
+    "daemon:tunnelmgrd"
+  ],
+  "ref_dbs": [
+    "db:appl_db",
+    "db:asic_db",
+    "db:config_db",
+    "db:state_db"
+  ],
+  "keywords": ["systemctl restart swss", "docker restart swss", "orchagent restart", "swss container", "traffic loss", "forwarding interruption", "SAI flush", "ASIC clear", "cold restart", "warm restart"],
+  "context_keywords": ["swss", "orchagent", "restart", "traffic", "forwarding", "SAI", "ASIC_DB", "outage", "production", "replay"]
+}

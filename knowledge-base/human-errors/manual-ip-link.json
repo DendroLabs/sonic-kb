@@ -1,0 +1,67 @@
+{
+  "error_id": "manual-ip-link",
+  "display_name": "Using ip link/ip addr commands directly instead of SONiC config CLI",
+  "severity": "MEDIUM",
+  "category": "config-integrity",
+  "sonic_version": "202511",
+  "pattern": "Operator uses Linux kernel networking commands (ip link set, ip addr add, ip addr del, ip route add, ifconfig) directly on the SONiC host OS to configure interfaces, addresses, or routes instead of using the SONiC config CLI ('config interface', 'config route') or editing CONFIG_DB. Changes take effect immediately in the kernel but are not written to CONFIG_DB and are invisible to SONiC management daemons.",
+  "what_goes_wrong": "In SONiC 202511, interface state and IP address configuration are owned by portmgrd and intfmgrd. portmgrd watches CONFIG_DB PORT table entries and calls netlink/iproute2 to set kernel interface state (admin up/down, MTU, speed). intfmgrd watches INTERFACE and VLAN_INTERFACE tables and configures IP addresses via netlink. portsyncd listens to kernel netlink events and writes interface carrier/oper-state back into APPL_DB PORT_TABLE. When an operator runs 'ip link set Ethernet0 down' or 'ip addr add 10.0.0.1/31 dev Ethernet0' directly, the change lands in the kernel but CONFIG_DB is never updated. portsyncd may then propagate the kernel-observed state change into APPL_DB, which can trigger orchagent to act on a state it believes is authoritative but which actually contradicts CONFIG_DB. On the next 'config reload', container restart, or any portmgrd/intfmgrd table re-sync, the daemon will re-apply CONFIG_DB state to the kernel, silently reverting the manual change. If portmgrd detects a difference between kernel state and its CONFIG_DB view mid-session, it may issue a corrective netlink call immediately, creating a race condition where the operator's manual change fights the daemon.",
+  "symptoms": [
+    "Interface admin state or IP address reverts after 'config reload' or container restart with no config CLI change made",
+    "'show interface status' (reads CONFIG_DB/APPL_DB) disagrees with 'ip link show' or 'ip addr show' on the host",
+    "IP address added via 'ip addr add' is present in kernel ('ip addr show') but absent from 'show ip interfaces' and CONFIG_DB INTERFACE table",
+    "Interface brought down with 'ip link set Ethernet0 down' comes back up within seconds as portmgrd re-applies CONFIG_DB admin_status=up",
+    "Route added via 'ip route add' appears in 'ip route show' but not in 'show ip route' and is not programmed into ASIC_DB via orchagent",
+    "portmgrd or intfmgrd logs show repeated 'set admin_status' or 'set ip address' events with no corresponding CONFIG_DB change -- daemon is fighting a manual kernel modification",
+    "BGP or BFD sessions flap because an IP address removed via 'ip addr del' is still present in CONFIG_DB and intfmgrd re-adds it, but there is a window where the address is absent",
+    "Operator reports 'the interface keeps coming back up' or 'my route disappeared' after a seemingly unrelated event"
+  ],
+  "detection_commands": [
+    {
+      "command": "diff <(redis-cli -n 4 HGETALL 'PORT|Ethernet0' | grep -A1 'admin_status' | tail -1) <(ip link show Ethernet0 | grep -oE 'state (UP|DOWN)' | awk '{print $2}')",
+      "purpose": "Compare CONFIG_DB admin_status for Ethernet0 against the kernel's operational link state. A mismatch indicates either a manual 'ip link set' change or a portmgrd sync lag. Repeat for each suspect interface."
+    },
+    {
+      "command": "for iface in $(ip link show | grep -oE 'Ethernet[0-9]+|PortChannel[0-9]+' | sort -u); do cfg=$(redis-cli -n 4 HGET \"PORT|$iface\" admin_status 2>/dev/null); kern=$(cat /sys/class/net/$iface/operstate 2>/dev/null); echo \"$iface: config_db=$cfg kernel=$kern\"; done",
+      "purpose": "Bulk comparison of CONFIG_DB admin_status vs. kernel operstate for all Ethernet and PortChannel interfaces. Any line where config_db=up but kernel=down (or vice versa) without a corresponding config change is a sign of direct ip link manipulation."
+    },
+    {
+      "command": "ip addr show | grep 'inet ' | awk '{print $2, $NF}' | sort > /tmp/kern_addrs.txt && redis-cli -n 4 KEYS 'INTERFACE|*' | grep -v '|$' | while IFS='|' read _ iface addr; do echo \"$addr $iface\"; done | sort > /tmp/db_addrs.txt && diff /tmp/kern_addrs.txt /tmp/db_addrs.txt",
+      "purpose": "Diff kernel IP address assignments against CONFIG_DB INTERFACE table entries. Addresses present in the kernel but absent from CONFIG_DB (lines starting with '<') were added manually and will be lost on reload. Addresses in CONFIG_DB but absent from the kernel may indicate intfmgrd has not yet applied them or they were manually deleted."
+    },
+    {
+      "command": "docker exec -it swss grep -E '(intfmgrd|portmgrd)' /var/log/swss/swss.log 2>/dev/null | grep -E '(set|add|del|admin_status|ip_prefix)' | tail -40",
+      "purpose": "Inspect swss container logs for repeated intfmgrd/portmgrd set operations. A burst of 'set admin_status' or 'add ip_prefix' entries without a preceding CONFIG_DB change event indicates the daemon is fighting a manual kernel modification."
+    },
+    {
+      "command": "redis-cli -n 0 KEYS 'PORT_TABLE|*' | head -5 | xargs -I{} redis-cli -n 0 HGETALL {}",
+      "purpose": "Read APPL_DB PORT_TABLE entries to see what portsyncd has written based on observed kernel netlink events. Compare oper_status here against CONFIG_DB to understand if portsyncd is propagating a manually-induced state change up the stack."
+    },
+    {
+      "command": "ip route show table all | grep -vE '^(default|local|broadcast|multicast)' | sort > /tmp/kern_routes.txt && redis-cli -n 0 KEYS 'ROUTE_TABLE|*' | while read k; do echo \"${k#ROUTE_TABLE|}\"; done | sort > /tmp/db_routes.txt && diff /tmp/kern_routes.txt /tmp/db_routes.txt | head -40",
+      "purpose": "Diff kernel routing table against APPL_DB ROUTE_TABLE. Routes present in kernel but absent from APPL_DB were likely added with 'ip route add' and are not programmed into the ASIC. They will vanish on reload."
+    },
+    {
+      "command": "journalctl --since '2 hours ago' | grep -E '(ip link|ip addr|ip route|ifconfig)' | head -20",
+      "purpose": "Audit system journal for direct iproute2 or ifconfig invocations. Captures commands logged by auditd or shell history forwarding. Not exhaustive but can confirm manual intervention."
+    },
+    {
+      "command": "docker exec swss cat /var/log/swss/swss.log 2>/dev/null | grep -E 'portmgrd.*Ethernet' | tail -20",
+      "purpose": "Check portmgrd log lines referencing specific interfaces. Repeated 'Setting admin_status' for the same interface in a short window indicates the daemon is continuously re-applying CONFIG_DB state to counter a manual kernel change."
+    }
+  ],
+  "correct_procedure": "Use the SONiC config CLI for all interface and address configuration. To bring an interface up or down: 'config interface startup Ethernet0' / 'config interface shutdown Ethernet0'. To add or remove an IP address: 'config interface ip add Ethernet0 10.0.0.1/31' / 'config interface ip remove Ethernet0 10.0.0.1/31'. To set MTU: 'config interface mtu Ethernet0 9100'. For static routes: 'config route add prefix 192.168.1.0/24 nexthop 10.0.0.2'. After any configuration change, run 'config save' to persist to /etc/sonic/config_db.json. Use 'ip link show' and 'ip addr show' in read-only mode for diagnostic inspection only -- never issue set/add/del variants.",
+  "why_it_breaks": [
+    "portmgrd and intfmgrd are the authoritative kernel-state writers for SONiC. They continuously watch CONFIG_DB and will re-apply their view of the world whenever a table event fires. A manual 'ip link set' change can be overwritten within seconds if any other CONFIG_DB event triggers portmgrd to re-evaluate the interface.",
+    "CONFIG_DB is the single source of truth for 'config save' and 'config reload'. Any state not in CONFIG_DB is not persisted. On reload, the system initializes kernel state from CONFIG_DB, wiping all manual changes.",
+    "portsyncd observes kernel netlink events and writes observed interface state into APPL_DB PORT_TABLE. A manual 'ip link set Ethernet0 down' causes portsyncd to write oper_status=down into APPL_DB, which may trigger orchagent or other consumers to act as if the port is down -- even though CONFIG_DB still says admin_status=up, creating an inconsistent view across DB layers.",
+    "Routes added with 'ip route add' are injected into the kernel routing table but bypass APPL_DB ROUTE_TABLE entirely. orchagent never sees these routes and they are never programmed into the ASIC via ASIC_DB. Traffic that should follow those routes will be forwarded by the CPU (if at all) rather than hardware-switched, causing unexpected packet loss or severe throughput degradation.",
+    "IP addresses added via 'ip addr add' are not in CONFIG_DB INTERFACE table, so intfmgrd does not know about them and will not re-add them after a reload. Worse, if the same prefix is later added via config CLI, intfmgrd will attempt to add it and may get a kernel error if the manual addition is still present, leading to a confusing error state."
+  ],
+  "prevention": "Restrict iproute2 write access in production: use sudoers to allow only read-only variants (ip link show, ip addr show, ip route show) for non-admin operators. Add a periodic reconciliation check to the monitoring stack: alert when 'ip addr show' or 'ip route show' diverges from the CONFIG_DB/APPL_DB view. Consider enabling Linux audit rules (auditctl) to log executions of ip, ifconfig, and route binaries for post-incident forensics.",
+  "related_errors": ["direct-frr-vtysh", "direct-redis-write", "manual-config-db-json-edit"],
+  "ref_daemons": ["daemon:portmgrd", "daemon:intfmgrd", "daemon:portsyncd", "daemon:orchagent"],
+  "ref_dbs": ["db:config_db", "db:appl_db", "db:asic_db"],
+  "keywords": ["ip link set", "ip addr add", "ip addr del", "ip route add", "ifconfig", "manual kernel", "netlink", "iproute2", "direct interface config"],
+  "context_keywords": ["interface", "ip address", "admin status", "shutdown", "startup", "route", "kernel", "netlink", "portmgrd", "intfmgrd"]
+}

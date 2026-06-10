@@ -1,4 +1,952 @@
 {
+  "CONFIG_DB:BFD_PEER_SINGLE_HOP": {
+    "table": "BFD_PEER_SINGLE_HOP",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "bfd"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "BFD_PEER_SINGLE_HOP|<vrfname>|<interface>|<peer-ip>",
+    "relevant_fields": [
+      "local_addr: source IP address for BFD packets (must match interface IP)",
+      "txinterval: desired min TX interval in milliseconds",
+      "rxinterval: required min RX interval in milliseconds",
+      "multiplier: detection time multiplier (default 3)",
+      "multihop: false for single-hop",
+      "echo_active: enable echo mode (true/false)",
+      "echo_transmit_interval: echo TX interval in milliseconds",
+      "shutdown: administratively disable the session (true/false)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'BFD_PEER_SINGLE_HOP|default|<ifname>|<peer-ip>'",
+    "redis_command": "redis-cli -n 4 KEYS 'BFD_PEER_SINGLE_HOP*'"
+  },
+  "CONFIG_DB:BFD_PEER_MULTI_HOP": {
+    "table": "BFD_PEER_MULTI_HOP",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "bfd"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "BFD_PEER_MULTI_HOP|<vrfname>|<peer-ip>|<local-ip>",
+    "relevant_fields": [
+      "local_addr: source loopback IP address for multi-hop BFD",
+      "txinterval: desired min TX interval in milliseconds",
+      "rxinterval: required min RX interval in milliseconds",
+      "multiplier: detection time multiplier",
+      "multihop: true",
+      "shutdown: administratively disable"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'BFD_PEER_MULTI_HOP|default|<peer-ip>|<local-ip>'",
+    "redis_command": "redis-cli -n 4 KEYS 'BFD_PEER_MULTI_HOP*'"
+  },
+  "CONFIG_DB:BFD_SESSION_TABLE (STATE_DB)": {
+    "table": "BFD_SESSION_TABLE (STATE_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "bfd"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "express-reboot-wrong-platform",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "BFD_SESSION_TABLE|<vrfname>|<interface>|<peer-ip>",
+    "relevant_fields": [
+      "state: current BFD session state (Up/Down/Init/AdminDown)",
+      "type: single_hop or multi_hop",
+      "local_addr: local IP address used for this session",
+      "peer_addr: remote peer IP address",
+      "local_discriminator: locally assigned BFD discriminator",
+      "remote_discriminator: peer's discriminator",
+      "local_diagnostic: diagnostic code for last state change",
+      "remote_diagnostic: peer's diagnostic code",
+      "local_state: local state as seen from this end",
+      "remote_state: peer's state as reported in last received packet",
+      "negotiated_transmit_interval: negotiated TX interval in microseconds",
+      "negotiated_receive_interval: negotiated RX interval in microseconds"
+    ],
+    "verify_command": "redis-cli -n 6 HGETALL 'BFD_SESSION_TABLE|default|default|<peer-ip>'",
+    "redis_command": "redis-cli -n 6 KEYS 'BFD_SESSION_TABLE*'"
+  },
+  "CONFIG_DB:DEVICE_METADATA": {
+    "table": "DEVICE_METADATA",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "ospfv2",
+      "lldp",
+      "static-routing"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "DEVICE_METADATA|localhost",
+    "relevant_fields": [
+      "hostname: device hostname, used as reference for OSPF router identity",
+      "mac: system MAC address",
+      "type: device type (LeafRouter, SpineRouter, etc.)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'DEVICE_METADATA|localhost'",
+    "redis_command": "redis-cli -n 4 KEYS 'DEVICE_METADATA*'"
+  },
+  "CONFIG_DB:INTERFACE": {
+    "table": "INTERFACE",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "ospfv2"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "INTERFACE|<ifname>  or  INTERFACE|<ifname>|<ip/prefix>",
+    "relevant_fields": [
+      "NULL: presence indicates interface is managed by SONiC",
+      "ip: IP address and prefix length assigned to interface",
+      "vrf_name: VRF assignment for the interface"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'INTERFACE|<ifname>|<ip/prefix>'",
+    "redis_command": "redis-cli -n 4 KEYS 'INTERFACE|*'"
+  },
+  "CONFIG_DB:LOOPBACK_INTERFACE": {
+    "table": "LOOPBACK_INTERFACE",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "ospfv2"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "LOOPBACK_INTERFACE|<loopback>|<ip/prefix>",
+    "relevant_fields": [
+      "NULL: presence indicates loopback is managed",
+      "ip: loopback IP used as OSPF router-id if it is the highest configured loopback"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'LOOPBACK_INTERFACE|Loopback0|<ip/prefix>'",
+    "redis_command": "redis-cli -n 4 KEYS 'LOOPBACK_INTERFACE*'"
+  },
+  "CONFIG_DB:ROUTE_TABLE (APPL_DB)": {
+    "table": "ROUTE_TABLE (APPL_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "ospfv2",
+      "bgp-4",
+      "static-routing"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "ROUTE_TABLE:<prefix/len>",
+    "relevant_fields": [
+      "nexthop: comma-separated list of next-hop IPs",
+      "ifname: egress interface name(s)",
+      "distance: administrative distance (OSPF intra=110, inter=110, external=150)",
+      "metric: route metric",
+      "nexthop-vrf: VRF for the nexthop"
+    ],
+    "verify_command": "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+    "redis_command": "redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l"
+  },
+  "CONFIG_DB:PORT": {
+    "table": "PORT",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "lldp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "PORT|<ifname>",
+    "relevant_fields": [
+      "description: port description string -- advertised as LLDP Port Description TLV to neighbors",
+      "admin_status: up/down -- LLDP only operates on admin-up ports",
+      "alias: human-readable port alias -- may be used in Port ID TLV depending on lldpd configuration",
+      "mtu: MTU -- included in IEEE 802.3 Maximum Frame Size TLV",
+      "speed: interface speed -- included in IEEE 802.3 MAC/PHY Configuration TLV"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'PORT|<ifname>'",
+    "redis_command": "redis-cli -n 4 KEYS 'PORT|Ethernet*'"
+  },
+  "CONFIG_DB:LLDP_ENTRY_TABLE (STATE_DB)": {
+    "table": "LLDP_ENTRY_TABLE (STATE_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "lldp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "express-reboot-wrong-platform",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "LLDP_ENTRY_TABLE|<ifname>",
+    "relevant_fields": [
+      "lldp_rem_chassis_id: neighbor chassis ID (typically neighbor MAC or system ID)",
+      "lldp_rem_chassis_id_subtype: chassis ID encoding (1=component, 4=MAC, 5=network address, 7=locally assigned)",
+      "lldp_rem_port_id: neighbor port identifier (interface name or MAC)",
+      "lldp_rem_port_id_subtype: port ID encoding",
+      "lldp_rem_sys_name: neighbor hostname (System Name TLV)",
+      "lldp_rem_sys_desc: neighbor system description (OS version, platform)",
+      "lldp_rem_port_desc: neighbor port description",
+      "lldp_rem_man_addr: neighbor management address",
+      "lldp_rem_sys_cap_supported: bitmask of neighbor capabilities",
+      "lldp_rem_sys_cap_enabled: bitmask of neighbor enabled capabilities"
+    ],
+    "verify_command": "redis-cli -n 6 HGETALL 'LLDP_ENTRY_TABLE|<ifname>'",
+    "redis_command": "redis-cli -n 6 KEYS 'LLDP_ENTRY_TABLE|*'"
+  },
+  "CONFIG_DB:COPP_TABLE (APPL_DB)": {
+    "table": "COPP_TABLE (APPL_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "lldp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "COPP_TABLE:trap.group.lldp  or  COPP_TABLE:trap.group.l2",
+    "relevant_fields": [
+      "trap_ids: lldp -- specifies which trap type this policer applies to",
+      "trap_action: trap -- forward to CPU; copy -- copy to CPU and forward in hardware",
+      "cir: committed information rate in pps -- LLDP frames exceeding this rate are dropped",
+      "cbs: committed burst size -- burst allowance above the CIR",
+      "meter_type: packets -- rate measured in packets per second for L2 traps",
+      "mode: sr_tcm or tr_tcm -- policing mode"
+    ],
+    "verify_command": "redis-cli -n 0 HGETALL 'COPP_TABLE:trap.group.lldp'",
+    "redis_command": "redis-cli -n 0 KEYS 'COPP_TABLE*lldp*'"
+  },
+  "CONFIG_DB:MGMT_INTERFACE": {
+    "table": "MGMT_INTERFACE",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "lldp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "MGMT_INTERFACE|eth0|<ip/prefix>",
+    "relevant_fields": [
+      "gwaddr: management gateway -- used when lldpmgrd constructs the management address TLV",
+      "(key contains the IP/prefix): management IP address advertised in LLDP Management Address TLV"
+    ],
+    "verify_command": "redis-cli -n 4 KEYS 'MGMT_INTERFACE*'",
+    "redis_command": "redis-cli -n 4 KEYS 'MGMT_INTERFACE*'"
+  },
+  "CONFIG_DB:STP": {
+    "table": "STP",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "stp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "STP|GLOBAL",
+    "relevant_fields": [
+      "mode: stp, rstp, pvst, rpvst -- spanning tree mode",
+      "rootguard_timeout: errdisable recovery timer for Root Guard violations (seconds)",
+      "forward_delay: global forward delay in seconds (4-30)",
+      "hello_time: global hello interval in seconds (1-10)",
+      "max_age: global max age in seconds (6-40)",
+      "priority: global bridge priority (0-61440, multiples of 4096)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'STP|GLOBAL'",
+    "redis_command": "redis-cli -n 4 KEYS 'STP*'"
+  },
+  "CONFIG_DB:STP_VLAN": {
+    "table": "STP_VLAN",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "stp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "STP_VLAN|Vlan<vlan-id>",
+    "relevant_fields": [
+      "enabled: whether STP is enabled for this VLAN (true/false)",
+      "priority: per-VLAN bridge priority override",
+      "hello_time: per-VLAN hello interval override",
+      "max_age: per-VLAN max age override",
+      "forward_delay: per-VLAN forward delay override"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'STP_VLAN|Vlan<id>'",
+    "redis_command": "redis-cli -n 4 KEYS 'STP_VLAN*'"
+  },
+  "CONFIG_DB:STP_VLAN_PORT": {
+    "table": "STP_VLAN_PORT",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "stp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "STP_VLAN_PORT|Vlan<vlan-id>|<ifname>",
+    "relevant_fields": [
+      "path_cost: per-port-per-VLAN STP path cost override (1-200000000)",
+      "priority: per-port-per-VLAN port priority (0-240, multiples of 16)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'STP_VLAN_PORT|Vlan<id>|<ifname>'",
+    "redis_command": "redis-cli -n 4 KEYS 'STP_VLAN_PORT*'"
+  },
+  "CONFIG_DB:STP_PORT": {
+    "table": "STP_PORT",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "stp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "STP_PORT|<ifname>",
+    "relevant_fields": [
+      "enabled: STP enabled on this port (true/false)",
+      "root_guard: Root Guard enabled (true/false) -- rejects superior BPDUs",
+      "bpdu_guard: BPDU Guard enabled (true/false) -- disables port on BPDU receipt",
+      "bpdu_filter: BPDU Filter enabled (true/false) -- suppresses BPDU TX/RX",
+      "portfast: PortFast enabled (true/false) -- immediate Forwarding, suppresses TCN",
+      "path_cost: port path cost override",
+      "priority: port priority override",
+      "uplink_fast: UplinkFast enabled for faster root port failover",
+      "bpdu_guard_do_disable: whether BPDU Guard violation shuts down the port"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'STP_PORT|<ifname>'",
+    "redis_command": "redis-cli -n 4 KEYS 'STP_PORT*'"
+  },
+  "CONFIG_DB:STP_VLAN_TABLE (STATE_DB)": {
+    "table": "STP_VLAN_TABLE (STATE_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "stp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "express-reboot-wrong-platform",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "STP_VLAN_TABLE|Vlan<vlan-id>",
+    "relevant_fields": [
+      "bridge_id: local bridge ID for this VLAN instance",
+      "root_bridge_id: current root bridge ID",
+      "root_path_cost: cumulative path cost to root",
+      "root_port: interface name of the root port",
+      "topology_change: whether topology change is active (0/1)",
+      "topology_change_count: total TC count since startup",
+      "topology_change_time: time of last topology change"
+    ],
+    "verify_command": "redis-cli -n 6 HGETALL 'STP_VLAN_TABLE|Vlan<id>'",
+    "redis_command": "redis-cli -n 6 KEYS 'STP_VLAN_TABLE*'"
+  },
+  "CONFIG_DB:STP_PORT_TABLE (STATE_DB)": {
+    "table": "STP_PORT_TABLE (STATE_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "stp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "express-reboot-wrong-platform",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "STP_PORT_TABLE|<ifname>",
+    "relevant_fields": [
+      "port_state: current STP state (FORWARDING, BLOCKING, LEARNING, LISTENING, DISABLED, BROKEN)",
+      "port_role: STP port role (ROOT, DESIGNATED, ALTERNATE, BACKUP)",
+      "path_cost: effective path cost for this port",
+      "port_priority: effective port priority",
+      "bpdu_guard_err: whether port is in BPDU Guard error state",
+      "root_guard_err: whether port is in Root Guard inconsistent state"
+    ],
+    "verify_command": "redis-cli -n 6 HGETALL 'STP_PORT_TABLE|<ifname>'",
+    "redis_command": "redis-cli -n 6 KEYS 'STP_PORT_TABLE*'"
+  },
+  "CONFIG_DB:VXLAN_TUNNEL": {
+    "table": "VXLAN_TUNNEL",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "vxlan-evpn"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "VXLAN_TUNNEL|<tunnel-name>",
+    "relevant_fields": [
+      "src_ip: VTEP source IP address (typically a loopback IP); required for tunnel creation",
+      "dst_ip: optional default destination IP (not used in EVPN mode; leave empty for dynamic EVPN)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'VXLAN_TUNNEL|vtep'",
+    "redis_command": "redis-cli -n 4 KEYS 'VXLAN_TUNNEL*'"
+  },
+  "CONFIG_DB:VXLAN_TUNNEL_MAP": {
+    "table": "VXLAN_TUNNEL_MAP",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "vxlan-evpn"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "VXLAN_TUNNEL_MAP|<tunnel-name>|Vlan<vlan-id>",
+    "relevant_fields": [
+      "vni: VNI (Virtual Network Identifier) value to map to this VLAN (24-bit, range 1-16777215)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'VXLAN_TUNNEL_MAP|vtep|Vlan100'",
+    "redis_command": "redis-cli -n 4 KEYS 'VXLAN_TUNNEL_MAP*'"
+  },
+  "CONFIG_DB:SUPPRESS_VLAN_NEIGH_ARP": {
+    "table": "SUPPRESS_VLAN_NEIGH_ARP",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "vxlan-evpn"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "SUPPRESS_VLAN_NEIGH_ARP|Vlan<vlan-id>",
+    "relevant_fields": [
+      "suppress: enabled/disabled (set to 'enabled' to activate ARP/ND suppression for this VLAN)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'SUPPRESS_VLAN_NEIGH_ARP|Vlan100'",
+    "redis_command": "redis-cli -n 4 KEYS 'SUPPRESS_VLAN_NEIGH_ARP*'"
+  },
+  "CONFIG_DB:VRF (L3 VNI)": {
+    "table": "VRF (L3 VNI)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "vxlan-evpn"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "VRF|<vrf-name>",
+    "relevant_fields": [
+      "vni: L3 VNI for this VRF; required for symmetric IRB (inter-VNI routing) via EVPN Type-5",
+      "mgmtVrfEnabled: true if this is the management VRF (separate from overlay VRFs)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'VRF|Vrf_tenant1'",
+    "redis_command": "redis-cli -n 4 KEYS 'VRF*'"
+  },
+  "CONFIG_DB:VXLAN_FDB_TABLE (APPL_DB)": {
+    "table": "VXLAN_FDB_TABLE (APPL_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "vxlan-evpn"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "VXLAN_FDB_TABLE:Vlan<vlan-id>:<mac-address>",
+    "relevant_fields": [
+      "remote_vtep: remote VTEP IP address where this MAC is located",
+      "type: static (EVPN-learned) or dynamic (data-plane learned)",
+      "vni: VNI associated with this FDB entry"
+    ],
+    "verify_command": "redis-cli -n 0 HGETALL 'VXLAN_FDB_TABLE:Vlan100:aa:bb:cc:dd:ee:ff'",
+    "redis_command": "redis-cli -n 0 KEYS 'VXLAN_FDB_TABLE:*' | wc -l"
+  },
+  "CONFIG_DB:VXLAN_TUNNEL_TABLE (APPL_DB)": {
+    "table": "VXLAN_TUNNEL_TABLE (APPL_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "vxlan-evpn"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "VXLAN_TUNNEL_TABLE|<tunnel-name>",
+    "relevant_fields": [
+      "src_ip: VTEP source IP address (mirrored from CONFIG_DB by tunnelmgrd)",
+      "dst_ip: remote VTEP IP (for static tunnels); absent in EVPN dynamic mode"
+    ],
+    "verify_command": "redis-cli -n 0 HGETALL 'VXLAN_TUNNEL_TABLE|vtep'",
+    "redis_command": "redis-cli -n 0 KEYS 'VXLAN_TUNNEL_TABLE*'"
+  },
+  "CONFIG_DB:PORTCHANNEL": {
+    "table": "PORTCHANNEL",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "lacp",
+      "mclag"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "PORTCHANNEL|<PortChannelName>",
+    "relevant_fields": [
+      "admin_status: up/down administrative state",
+      "min_links: minimum number of active member links for PortChannel to be operationally up",
+      "mtu: MTU for the PortChannel logical interface",
+      "fast_rate: true/false -- enables fast LACP rate (1s PDU interval, 3s timeout)",
+      "lacp_key: optional explicit LACP aggregation key override",
+      "tpid: optional TPID for QinQ configurations",
+      "mc_lag_id: MCLAG domain ID if this PortChannel is part of an MCLAG",
+      "system_mac: optional LACP system MAC override (required for MCLAG)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'PORTCHANNEL|PortChannel<id>'",
+    "redis_command": "redis-cli -n 4 KEYS 'PORTCHANNEL|*'"
+  },
+  "CONFIG_DB:PORTCHANNEL_MEMBER": {
+    "table": "PORTCHANNEL_MEMBER",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "lacp",
+      "mclag"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "PORTCHANNEL_MEMBER|<PortChannelName>|<member-port>",
+    "relevant_fields": [
+      "(key presence indicates membership -- no additional fields required for basic membership)"
+    ],
+    "verify_command": "redis-cli -n 4 KEYS 'PORTCHANNEL_MEMBER|PortChannel<id>|*'",
+    "redis_command": "redis-cli -n 4 KEYS 'PORTCHANNEL_MEMBER|*'"
+  },
+  "CONFIG_DB:LAG_TABLE (APPL_DB)": {
+    "table": "LAG_TABLE (APPL_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "lacp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "LAG_TABLE:<PortChannelName>",
+    "relevant_fields": [
+      "admin_status: administrative state",
+      "oper_status: operational state (up/down)",
+      "mtu: operational MTU",
+      "min_links: minimum links setting",
+      "learn_mode: MAC learning mode on the LAG"
+    ],
+    "verify_command": "redis-cli -n 0 HGETALL 'LAG_TABLE:PortChannel<id>'",
+    "redis_command": "redis-cli -n 0 KEYS 'LAG_TABLE:*'"
+  },
+  "CONFIG_DB:LAG_MEMBER_TABLE (APPL_DB)": {
+    "table": "LAG_MEMBER_TABLE (APPL_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "lacp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "LAG_MEMBER_TABLE:<PortChannelName>:<member-port>",
+    "relevant_fields": [
+      "status: enabled/disabled -- reflects whether teamd has this port in active distributing state"
+    ],
+    "verify_command": "redis-cli -n 0 HGETALL 'LAG_MEMBER_TABLE:PortChannel<id>:<member-port>'",
+    "redis_command": "redis-cli -n 0 KEYS 'LAG_MEMBER_TABLE:PortChannel<id>:*'"
+  },
+  "CONFIG_DB:LAG_TABLE (STATE_DB)": {
+    "table": "LAG_TABLE (STATE_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "lacp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "express-reboot-wrong-platform",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "LAG_TABLE|<PortChannelName>",
+    "relevant_fields": [
+      "oper_status: current operational status",
+      "admin_status: administrative status"
+    ],
+    "verify_command": "redis-cli -n 6 HGETALL 'LAG_TABLE|PortChannel<id>'",
+    "redis_command": "redis-cli -n 6 KEYS 'LAG_TABLE|*'"
+  },
+  "CONFIG_DB:LAG_MEMBER_TABLE (STATE_DB)": {
+    "table": "LAG_MEMBER_TABLE (STATE_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "lacp"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "express-reboot-wrong-platform",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "LAG_MEMBER_TABLE|<PortChannelName>|<member-port>",
+    "relevant_fields": [
+      "status: active/inactive LACP member state as maintained by teamsyncd"
+    ],
+    "verify_command": "redis-cli -n 6 HGETALL 'LAG_MEMBER_TABLE|PortChannel<id>|<member-port>'",
+    "redis_command": "redis-cli -n 6 KEYS 'LAG_MEMBER_TABLE|PortChannel<id>|*'"
+  },
+  "CONFIG_DB:MCLAG_DOMAIN": {
+    "table": "MCLAG_DOMAIN",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "mclag"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "MCLAG_DOMAIN|<domain-id>",
+    "relevant_fields": [
+      "source_ip: local IP address for the ICCP session (must be reachable from peer over keepalive link)",
+      "peer_ip: remote peer IP address for the ICCP session",
+      "peer_link: portchannel interface name used as the peer link (e.g., PortChannel1)",
+      "keepalive_interval: ICCP keepalive send interval in seconds (default 1)",
+      "session_timeout: ICCP session timeout in seconds (default 15; must be > keepalive_interval)",
+      "mclag_system_mac: common LACP system MAC address used on all MC-LAG portchannels (must match on both peers)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'MCLAG_DOMAIN|<domain-id>'",
+    "redis_command": "redis-cli -n 4 KEYS 'MCLAG_DOMAIN*'"
+  },
+  "CONFIG_DB:MCLAG_INTERFACE": {
+    "table": "MCLAG_INTERFACE",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "mclag"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "MCLAG_INTERFACE|<domain-id>|<portchannel-name>",
+    "relevant_fields": [
+      "if_name: portchannel interface name participating in this MCLAG domain (e.g., PortChannel10)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'MCLAG_INTERFACE|<domain-id>|<portchannel>'",
+    "redis_command": "redis-cli -n 4 KEYS 'MCLAG_INTERFACE*'"
+  },
+  "CONFIG_DB:MCLAG_TABLE (STATE_DB)": {
+    "table": "MCLAG_TABLE (STATE_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "mclag"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "express-reboot-wrong-platform",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "MCLAG_TABLE|<domain-id>",
+    "relevant_fields": [
+      "oper_status: MCLAG domain operational state (up/down)",
+      "peer_link_if: peer link portchannel interface name",
+      "peer_link_oper_status: operational status of the peer link (up/down)",
+      "keepalive_oper_status: operational status of the keepalive link (up/down)",
+      "local_role: this peer's elected role (active/standby or primary/secondary)",
+      "system_mac: the LACP system MAC in use",
+      "peer_session_status: status of the ICCP session (established/down)"
+    ],
+    "verify_command": "redis-cli -n 6 HGETALL 'MCLAG_TABLE|<domain-id>'",
+    "redis_command": "redis-cli -n 6 KEYS 'MCLAG_TABLE*'"
+  },
+  "CONFIG_DB:MCLAG_REMOTE_INTF_TABLE (STATE_DB)": {
+    "table": "MCLAG_REMOTE_INTF_TABLE (STATE_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "mclag"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "express-reboot-wrong-platform",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "MCLAG_REMOTE_INTF_TABLE|<domain-id>|<portchannel-name>",
+    "relevant_fields": [
+      "oper_status: operational status of this portchannel on the remote peer (up/down)",
+      "isolate_with_peer_link: whether this portchannel is isolated due to peer link being down (true/false)"
+    ],
+    "verify_command": "redis-cli -n 6 HGETALL 'MCLAG_REMOTE_INTF_TABLE|<domain-id>|<portchannel>'",
+    "redis_command": "redis-cli -n 6 KEYS 'MCLAG_REMOTE_INTF_TABLE*'"
+  },
   "CONFIG_DB:BGP_NEIGHBOR": {
     "table": "BGP_NEIGHBOR",
     "db": "CONFIG_DB",
@@ -7,8 +955,13 @@
     ],
     "daemons": [],
     "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
       "stale-warmboot-files",
       "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
       "manual-config-db-json-edit",
       "direct-frr-vtysh"
     ],
@@ -36,8 +989,13 @@
     ],
     "daemons": [],
     "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
       "stale-warmboot-files",
       "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
       "manual-config-db-json-edit",
       "direct-frr-vtysh"
     ],
@@ -62,8 +1020,13 @@
     ],
     "daemons": [],
     "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
       "stale-warmboot-files",
       "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
       "manual-config-db-json-edit",
       "direct-frr-vtysh"
     ],
@@ -76,31 +1039,6 @@
     "verify_command": "redis-cli -n 4 HGETALL 'BGP_PEER_RANGE|default|<group>'",
     "redis_command": "redis-cli -n 4 KEYS 'BGP_PEER_RANGE*'"
   },
-  "CONFIG_DB:ROUTE_TABLE (APPL_DB)": {
-    "table": "ROUTE_TABLE (APPL_DB)",
-    "db": "CONFIG_DB",
-    "protocols": [
-      "bgp-4"
-    ],
-    "daemons": [],
-    "human_errors": [
-      "stale-warmboot-files",
-      "direct-redis-write",
-      "manual-config-db-json-edit",
-      "direct-frr-vtysh"
-    ],
-    "key_pattern": "ROUTE_TABLE:<prefix/len>",
-    "relevant_fields": [
-      "nexthop: comma-separated list of next-hop IPs (ECMP)",
-      "ifname: egress interface name(s)",
-      "distance: administrative distance",
-      "metric: route metric",
-      "weight: ECMP weight",
-      "nexthop-vrf: VRF for the nexthop (for VRF route leak)"
-    ],
-    "verify_command": "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
-    "redis_command": "redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l"
-  },
   "CONFIG_DB:BGP_MONITORS": {
     "table": "BGP_MONITORS",
     "db": "CONFIG_DB",
@@ -109,8 +1047,13 @@
     ],
     "daemons": [],
     "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
       "stale-warmboot-files",
       "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
       "manual-config-db-json-edit",
       "direct-frr-vtysh"
     ],
@@ -122,5 +1065,86 @@
     ],
     "verify_command": "redis-cli -n 4 HGETALL 'BGP_MONITORS|<ip>'",
     "redis_command": "redis-cli -n 4 KEYS 'BGP_MONITORS*'"
+  },
+  "CONFIG_DB:STATIC_ROUTE": {
+    "table": "STATIC_ROUTE",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "static-routing"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "STATIC_ROUTE|<prefix/len>  (default VRF)  or  STATIC_ROUTE|<vrfname>|<prefix/len>  (named VRF)",
+    "relevant_fields": [
+      "nexthop: next-hop IP address (comma-separated for ECMP); or 'blackhole' for null route",
+      "ifname: egress interface name (optional; used for directly connected static routes without next-hop IP)",
+      "distance: administrative distance (default 1; range 1-254)",
+      "nexthop-vrf: VRF name for inter-VRF route leak -- the VRF in which the next-hop is reachable",
+      "blackhole: true/false -- whether this is a null/discard route (maps to 'ip route <prefix> blackhole' in FRR)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'STATIC_ROUTE|<prefix/len>'",
+    "redis_command": "redis-cli -n 4 KEYS 'STATIC_ROUTE*'"
+  },
+  "CONFIG_DB:VRF": {
+    "table": "VRF",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "static-routing"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "VRF|<vrfname>",
+    "relevant_fields": [
+      "fallback: true/false -- whether VRF falls back to default VRF for unresolved routes",
+      "vni: VXLAN VNI associated with this VRF (for L3 EVPN)"
+    ],
+    "verify_command": "redis-cli -n 4 HGETALL 'VRF|<vrfname>'",
+    "redis_command": "redis-cli -n 4 KEYS 'VRF*'"
+  },
+  "CONFIG_DB:ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY (ASIC_DB)": {
+    "table": "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY (ASIC_DB)",
+    "db": "CONFIG_DB",
+    "protocols": [
+      "static-routing"
+    ],
+    "daemons": [],
+    "human_errors": [
+      "wrong-reload-order",
+      "manual-ip-link",
+      "stale-warmboot-files",
+      "direct-redis-write",
+      "dpkg-force-install",
+      "wrong-frr-restart",
+      "restart-swss-during-traffic",
+      "manual-config-db-json-edit",
+      "direct-frr-vtysh"
+    ],
+    "key_pattern": "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:{\"dest\":\"<prefix>\",\"switch_id\":\"<oid>\",\"vrf\":\"<oid>\"}",
+    "relevant_fields": [
+      "SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID: OID of next-hop or next-hop group in ASIC",
+      "SAI_ROUTE_ENTRY_ATTR_PACKET_ACTION: SAI_PACKET_ACTION_FORWARD or SAI_PACKET_ACTION_DROP (blackhole)"
+    ],
+    "verify_command": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep <prefix>",
+    "redis_command": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | wc -l"
   }
 }

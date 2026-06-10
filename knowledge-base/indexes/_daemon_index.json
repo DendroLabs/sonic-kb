@@ -382,5 +382,105 @@
       "frr:zebra (ZAPI)"
     ],
     "purpose": "FRR BFD daemon. Implements Bidirectional Forwarding Detection for sub-second failure detection."
+  },
+  "psud": {
+    "def_id": "daemon:psud",
+    "process_name": "psud",
+    "container": "pmon",
+    "subscribes_to": [
+      "platform:psu_api"
+    ],
+    "writes_to": [
+      "db:state_db"
+    ],
+    "purpose": "Power Supply Unit daemon. Monitors PSU presence, status (OK/NOT OK), input/output voltage, current, and power via the platform PSU API. Publishes PSU operational data to STATE_DB:PSU_INFO table. Triggers syslog alerts on PSU insertion, removal, or failure events."
+  },
+  "thermalctld": {
+    "def_id": "daemon:thermalctld",
+    "process_name": "thermalctld",
+    "container": "pmon",
+    "subscribes_to": [
+      "platform:thermal_api",
+      "platform:fan_api"
+    ],
+    "writes_to": [
+      "db:state_db"
+    ],
+    "purpose": "Thermal control daemon. Reads temperature sensors from the platform thermal API and adjusts fan speeds to maintain safe operating temperatures. Publishes thermal data to STATE_DB:TEMPERATURE_INFO and fan data to STATE_DB:FAN_INFO. Implements thermal policies: if temperature exceeds critical thresholds, triggers shutdown to prevent hardware damage."
+  },
+  "syseepromd": {
+    "def_id": "daemon:syseepromd",
+    "process_name": "syseepromd",
+    "container": "pmon",
+    "subscribes_to": [
+      "platform:eeprom_api"
+    ],
+    "writes_to": [
+      "db:state_db"
+    ],
+    "purpose": "System EEPROM daemon. Reads the chassis EEPROM (TlvInfo format per ONIE specification) at startup and publishes hardware identity data (serial number, MAC address base, platform name, manufacturer) to STATE_DB:EEPROM_INFO table. Runs once at boot; does not poll continuously."
+  },
+  "iccpd": {
+    "def_id": "daemon:iccpd",
+    "process_name": "iccpd",
+    "container": "iccpd",
+    "subscribes_to": [
+      "db:config_db",
+      "db:appl_db",
+      "db:state_db"
+    ],
+    "writes_to": [
+      "db:appl_db",
+      "db:state_db"
+    ],
+    "purpose": "Inter-Chassis Communication Protocol daemon. Implements ICCP (RFC 7275) for MC-LAG: establishes a TCP session between MC-LAG peers, synchronizes MAC addresses, ARP/NDP entries, and LAG membership state. Detects peer failures via keepalive mechanism and triggers failover to ensure traffic continuity on orphan ports."
+  },
+  "mclagsyncd": {
+    "def_id": "daemon:mclagsyncd",
+    "process_name": "mclagsyncd",
+    "container": "iccpd",
+    "subscribes_to": [
+      "daemon:iccpd (internal IPC)"
+    ],
+    "writes_to": [
+      "db:appl_db"
+    ],
+    "purpose": "MC-LAG synchronization daemon. Receives synchronized MAC, ARP, and port-channel state from iccpd and writes it to APPL_DB so orchagent can program the ASIC with peer-learned entries. Bridges the ICCP control plane and the SONiC forwarding pipeline."
+  },
+  "stpmgrd": {
+    "def_id": "daemon:stpmgrd",
+    "process_name": "stpmgrd",
+    "container": "stp",
+    "subscribes_to": [
+      "db:config_db",
+      "db:state_db"
+    ],
+    "writes_to": [
+      "db:appl_db",
+      "db:state_db"
+    ],
+    "purpose": "STP manager daemon. Implements STP/RSTP/PVST+ state machines. Subscribes to CONFIG_DB:STP tables for bridge priority, port cost, and global STP parameters. Sends and receives BPDUs via raw sockets. Writes port forwarding state (Forwarding/Blocking/Disabled) to APPL_DB:STP_PORT_TABLE for orchagent to program ASIC port state accordingly."
+  },
+  "gbsyncd": {
+    "def_id": "daemon:gbsyncd",
+    "process_name": "gbsyncd",
+    "container": "syncd",
+    "subscribes_to": [
+      "db:gb_asic_db",
+      "db:gb_flex_counter_db"
+    ],
+    "writes_to": [
+      "db:gb_counters_db",
+      "db:state_db"
+    ],
+    "purpose": "Gearbox synchronization daemon. Manages SAI objects for external PHY/retimer (Gearbox) ASICs. Reads from GB_ASIC_DB and calls the Gearbox SAI implementation to program the external PHY. Only present on platforms with external retimer/PHY devices (e.g., certain Memory-port or 400G platforms)."
+  },
+  "redis-server": {
+    "def_id": "daemon:redis-server",
+    "process_name": "redis-server",
+    "container": "database",
+    "subscribes_to": [],
+    "writes_to": [],
+    "purpose": "Redis database engine. Hosts all 15 SONiC Redis databases (DB 0-14) in a single Redis instance with logical database separation. Provides the pub/sub notification mechanism that all SONiC daemons use for inter-process communication. The database container is the first to start and the last to stop; all other containers depend on it."
   }
 }

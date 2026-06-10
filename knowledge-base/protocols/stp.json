@@ -1,0 +1,867 @@
+{
+  "protocol_id": "stp",
+  "protocol_name": "STP/RSTP",
+  "protocol_family": "switching",
+  "standard": "IEEE 802.1D (STP), IEEE 802.1w (RSTP)",
+  "category": "switching",
+  "purpose": "Spanning Tree Protocol for loop prevention in Layer 2 networks",
+  "operates_at": "Layer 2",
+  "transport": "Ethernet (multicast 01:80:C2:00:00:00, LLC/SNAP)",
+  "def_refs": [
+    "daemon:stpmgrd",
+    "daemon:orchagent",
+    "daemon:vlanmgrd",
+    "timer:stp-hello",
+    "timer:stp-forward-delay",
+    "timer:stp-max-age",
+    "db:config_db",
+    "db:appl_db",
+    "db:state_db"
+  ],
+  "states": [
+    {
+      "name": "DISABLED",
+      "description": "Port is administratively shut down or STP is not enabled on the port. No BPDUs are sent or processed. The port does not participate in the spanning tree topology. In SONiC this state also covers ports on which STP is explicitly disabled via 'no spanning-tree' in the port configuration.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "show spanning_tree",
+        "show spanning_tree interface <ifname>",
+        "redis-cli -n 6 HGETALL 'STP_PORT_TABLE|<ifname>'"
+      ]
+    },
+    {
+      "name": "BLOCKING",
+      "description": "Port is receiving BPDUs and participating in topology calculation but is not forwarding data frames to prevent loops. The port has lost the port role election (Designated or Root) and is placed in Blocking to break the loop. In RSTP this is called the Discarding state. A port remains in Blocking when a superior BPDU is being received from another bridge.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "show spanning_tree",
+        "show spanning_tree interface <ifname>",
+        "redis-cli -n 6 HGETALL 'STP_PORT_TABLE|<ifname>'"
+      ]
+    },
+    {
+      "name": "LISTENING",
+      "description": "Transitional state (STP only, not RSTP). Port has been selected to move toward Forwarding and is now listening for BPDUs to ensure no loops exist. MAC addresses are not yet learned. Duration equals forward-delay timer (default 15s). RSTP skips this state by using the proposal/agreement handshake mechanism.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "show spanning_tree",
+        "show spanning_tree interface <ifname>"
+      ]
+    },
+    {
+      "name": "LEARNING",
+      "description": "Port is learning MAC addresses from frames but still not forwarding data traffic. Duration equals forward-delay timer (default 15s). Both STP and RSTP pass through this state before Forwarding. In RSTP, a port can skip directly from Discarding to Learning via rapid transition on edge ports or after proposal/agreement.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "show spanning_tree",
+        "show spanning_tree interface <ifname>"
+      ]
+    },
+    {
+      "name": "FORWARDING",
+      "description": "Port is fully operational: sending and receiving data frames, learning MAC addresses, and processing BPDUs. This is the only steady-state operational state for active ports. Root port and Designated ports end up here. RSTP can reach Forwarding in under 1 second on point-to-point links via the rapid transition mechanism.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "show spanning_tree",
+        "show spanning_tree interface <ifname>",
+        "redis-cli -n 6 HGETALL 'STP_PORT_TABLE|<ifname>'"
+      ]
+    },
+    {
+      "name": "BROKEN",
+      "description": "Port has been placed in a broken/error-disabled state by STP due to a detected violation. The most common cause is BPDU Guard: an edge port configured with PortFast/BPDU Guard received a BPDU, indicating a switch was connected where only an end host should be. The port is shutdown by stpmgrd and must be manually re-enabled or auto-recovery must be configured.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "show spanning_tree",
+        "show spanning_tree interface <ifname>",
+        "show interfaces status <ifname>",
+        "redis-cli -n 6 HGETALL 'STP_PORT_TABLE|<ifname>'"
+      ]
+    }
+  ],
+  "transitions": [
+    {
+      "from_state": "DISABLED",
+      "to_state": "BLOCKING",
+      "trigger": "STP enabled on port or port administratively brought up; port begins receiving BPDUs and enters topology election",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "BLOCKING",
+      "to_state": "LISTENING",
+      "trigger": "(STP only) Port selected as Root port or Designated port; forward-delay timer starts",
+      "failure_if_stuck": "If port stays Blocking permanently, a superior BPDU is being received continuously -- check root bridge identity and port cost/priority"
+    },
+    {
+      "from_state": "BLOCKING",
+      "to_state": "LEARNING",
+      "trigger": "(RSTP) Rapid transition via proposal/agreement handshake on point-to-point link, or edge port direct transition",
+      "failure_if_stuck": "Link may not be point-to-point (half-duplex or shared segment); check duplex settings"
+    },
+    {
+      "from_state": "LISTENING",
+      "to_state": "LEARNING",
+      "trigger": "Forward-delay timer expires (15s default) and no superior BPDU received during Listening; port advances to MAC learning phase",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "LISTENING",
+      "to_state": "BLOCKING",
+      "trigger": "Superior BPDU received during Listening state; port loses Designated port election and returns to Blocking",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "LEARNING",
+      "to_state": "FORWARDING",
+      "trigger": "Forward-delay timer expires (15s default) while in Learning; no superior BPDU received; port becomes Forwarding",
+      "failure_if_stuck": "If stuck in Learning, check for topology change storms generating continuous BPDUs that reset the forward-delay timer"
+    },
+    {
+      "from_state": "LEARNING",
+      "to_state": "BLOCKING",
+      "trigger": "Superior BPDU received during Learning; port loses election and returns to Blocking to prevent loop",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "FORWARDING",
+      "to_state": "BLOCKING",
+      "trigger": "Superior BPDU received from a better bridge; topology change causes this port to become Alternate/Backup port",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "FORWARDING",
+      "to_state": "BROKEN",
+      "trigger": "BPDU Guard violation: BPDU received on PortFast-enabled edge port; stpmgrd disables the port immediately",
+      "failure_if_stuck": "Port remains Broken/errdisable until manually re-enabled via 'config interface startup <ifname>' or errdisable recovery timer expires"
+    },
+    {
+      "from_state": "BLOCKING",
+      "to_state": "BROKEN",
+      "trigger": "BPDU Guard violation on a port that was Blocking; stpmgrd disables the port",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "BROKEN",
+      "to_state": "BLOCKING",
+      "trigger": "Operator manually re-enables port via 'config interface startup <ifname>' or errdisable auto-recovery timer fires",
+      "failure_if_stuck": "If port immediately re-enters Broken after recovery, the connected device is still sending BPDUs -- remove the switch or disable BPDU Guard on that port"
+    }
+  ],
+  "timers": [
+    {
+      "name": "Hello Timer",
+      "description": "Interval at which the root bridge sends Configuration BPDUs out all Designated ports. Non-root bridges relay these BPDUs on their Designated ports. If a non-root bridge does not receive a BPDU within max-age, it assumes the root is gone and begins a new election. In RSTP the Hello Timer also governs periodic BPDU transmission on all ports.",
+      "default": "2s",
+      "range": "1-10s",
+      "on_expiry": "Root bridge sends Configuration BPDU; all bridges relay toward leaf ports",
+      "sonic_default": "2s",
+      "sonic_config_path": "CONFIG_DB STP|GLOBAL: hello_time field; per-VLAN in STP_VLAN|Vlan<id>: hello_time",
+      "sonic_frr_path": "N/A (stpmgrd, not FRR)",
+      "tuning_advice": "Lower values (1s) increase topology change detection speed but increase CPU and BPDU flooding overhead. Default of 2s is appropriate for most deployments."
+    },
+    {
+      "name": "Forward Delay Timer",
+      "description": "Time a port spends in each of the Listening and Learning states before transitioning to Forwarding (STP). Repeated twice: once for Listening, once for Learning. Total convergence time from Blocking to Forwarding is 2x forward-delay (30s at default). RSTP bypasses this on point-to-point links using the rapid transition mechanism, making it mostly irrelevant for edge ports.",
+      "default": "15s",
+      "range": "4-30s",
+      "on_expiry": "Port advances from Listening to Learning, or from Learning to Forwarding",
+      "sonic_default": "15s",
+      "sonic_config_path": "CONFIG_DB STP|GLOBAL: forward_delay field; per-VLAN in STP_VLAN|Vlan<id>: forward_delay",
+      "sonic_frr_path": "N/A (stpmgrd, not FRR)",
+      "tuning_advice": "Reducing below 10s requires careful tuning of hello and max-age per IEEE 802.1D formula: 2*(forward_delay-1) >= max_age >= 2*(hello+1). RSTP makes this less critical for most port types."
+    },
+    {
+      "name": "Max Age Timer",
+      "description": "Maximum time a bridge stores a BPDU before considering the topology information stale. If a non-root bridge does not receive a BPDU from the root within max-age seconds, it declares the root lost and initiates a new root election. Controls how quickly topology changes are detected when BPDUs stop.",
+      "default": "20s",
+      "range": "6-40s",
+      "on_expiry": "Stored BPDU information is discarded; bridge initiates root election if no new BPDU arrives",
+      "sonic_default": "20s",
+      "sonic_config_path": "CONFIG_DB STP|GLOBAL: max_age field; per-VLAN in STP_VLAN|Vlan<id>: max_age",
+      "sonic_frr_path": "N/A (stpmgrd, not FRR)",
+      "tuning_advice": "IEEE 802.1D constraint: max_age >= 2*(hello+1) and 2*(forward_delay-1) >= max_age. Do not reduce independently of hello and forward-delay. Default is appropriate for most deployments."
+    }
+  ],
+  "messages": [
+    {
+      "name": "Configuration BPDU",
+      "description": "The primary STP control message. Sent by the root bridge every hello-interval and relayed by Designated ports on all bridges toward leaf segments. Contains the root bridge ID, path cost to root, sender bridge ID, port ID, and timer values. Non-root bridges forward the BPDU with updated path costs. Used for root election and topology maintenance.",
+      "when_sent": "Every hello-interval by root bridge on all Designated ports; relayed by all other Designated ports toward leaves",
+      "key_fields": [
+        "Protocol ID (0x0000 for STP/RSTP)",
+        "Protocol Version (0=STP, 2=RSTP)",
+        "BPDU Type (0x00=Configuration, 0x80=TCN, 0x02=RST/MST)",
+        "Flags: Topology Change (TC), Topology Change Acknowledgment (TCA), Proposal, Port Role, Learning, Forwarding, Agreement",
+        "Root Bridge ID: priority (4 bits) + system-id-extension (12 bits, VLAN ID for PVST) + MAC address (6 bytes)",
+        "Root Path Cost: accumulated cost from sender to root",
+        "Bridge ID: sending bridge priority + MAC address",
+        "Port ID: sending port priority + port number",
+        "Message Age: hops from root (incremented at each bridge)",
+        "Max Age, Hello Time, Forward Delay (root bridge timers)"
+      ]
+    },
+    {
+      "name": "Topology Change Notification (TCN) BPDU",
+      "description": "Sent by a non-root bridge toward the root when a port transitions to Forwarding or when a Forwarding/Learning port goes down. The TCN propagates hop-by-hop to the root, which then sets the TC flag in its Configuration BPDUs for a period of (forward-delay + max-age). During TC, all bridges flush their MAC tables on each hello interval to prevent stale MAC entries after topology changes.",
+      "when_sent": "Non-root bridge sends TCN out its Root port when a topology change is detected (port goes up to Forwarding or Forwarding port goes down)",
+      "key_fields": [
+        "BPDU Type: 0x80 (TCN)",
+        "(No payload -- 4 bytes total including header)"
+      ]
+    },
+    {
+      "name": "RST BPDU (RSTP)",
+      "description": "The RSTP equivalent of the Configuration BPDU. Encodes all the same topology information but with additional flag bits for the proposal/agreement rapid transition mechanism. RST BPDUs also carry topology change information directly (no separate TCN message in RSTP). Every RSTP bridge generates its own RST BPDUs rather than relaying the root's; a bridge that does not receive an RST BPDU for 3x hello intervals considers the neighbor gone.",
+      "when_sent": "Every hello-interval by ALL RSTP bridges on all Designated and Root ports (not just root bridge relay as in STP)",
+      "key_fields": [
+        "Version: 2 (RSTP)",
+        "BPDU Type: 0x02 (RST BPDU)",
+        "Flags: Proposal, Port Role (bits 2-3: Unknown/Alternate/Root/Designated), Learning, Forwarding, Agreement, Topology Change",
+        "Root Bridge ID, Root Path Cost, Bridge ID, Port ID (same as Configuration BPDU)",
+        "Timers: Max Age, Hello Time, Forward Delay"
+      ]
+    }
+  ],
+  "failure_modes": [
+    {
+      "scenario": "Unexpected root bridge election -- wrong switch becomes root",
+      "description": "A switch other than the intended root bridge wins the root election because its Bridge ID (priority + MAC) is numerically lower than the configured root. In SONiC environments, the default bridge priority of 32768 means the switch with the lowest MAC address wins by default. Any newly added switch with a lower MAC or misconfigured priority can silently steal root bridge role, causing suboptimal traffic paths or complete Layer 2 outages if the new root is a low-capacity edge switch.",
+      "symptoms": [
+        "'show spanning_tree' shows an unexpected switch as root bridge",
+        "Traffic paths are suboptimal -- crossing via edge or access switches",
+        "High CPU on the unintended root bridge (it is now generating BPDUs for all VLANs)",
+        "Periodic topology changes logged in syslog as the topology reconverges around the new root",
+        "Access ports that should be Forwarding are now Blocking and vice versa"
+      ],
+      "root_causes": [
+        "Default bridge priority (32768) configured on all switches -- lowest MAC wins root election",
+        "Newly added switch has a lower MAC address than the intended root",
+        "Bridge priority manually misconfigured -- intended root has higher (worse) priority than a downstream switch",
+        "VLAN-specific STP instances (PVST+/RPVST+) have inconsistent priorities per VLAN",
+        "Root bridge rebooted and came back with a different priority or lost its configuration"
+      ],
+      "resolution": [
+        "Set bridge priority on the intended root: 'config spanning_tree priority <0-61440 in multiples of 4096>'",
+        "Set secondary root priority: 'config spanning_tree priority 4096' on primary root, '8192' on secondary",
+        "Verify current root: 'show spanning_tree' -- check Root Bridge ID and compare to local Bridge ID",
+        "For PVST+ per-VLAN: 'config spanning_tree vlan <id> priority <value>'",
+        "Consider enabling Root Guard on uplinks to prevent downstream switches from becoming root"
+      ],
+      "verify_commands": [
+        {
+          "command": "show spanning_tree",
+          "look_for": "Root Bridge ID section -- compare root MAC and priority against the intended root switch MAC",
+          "confirms_if": "Root Bridge ID does not match the intended root switch confirms unexpected root election"
+        },
+        {
+          "command": "show spanning_tree vlan <vlan-id>",
+          "look_for": "Root bridge ID, local bridge ID, and whether 'This bridge is the root' appears",
+          "confirms_if": "Expected root bridge is shown as root; if a different bridge is shown, root theft has occurred"
+        },
+        {
+          "command": "redis-cli -n 6 HGETALL 'STP_VLAN_TABLE|Vlan<id>'",
+          "look_for": "root_bridge_id, bridge_id, root_path_cost fields in STATE_DB STP tables",
+          "confirms_if": "root_bridge_id not matching the intended root bridge MAC confirms the wrong root was elected"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'STP_VLAN|Vlan<id>'",
+          "look_for": "priority field in CONFIG_DB -- confirms what priority is configured for this VLAN",
+          "confirms_if": "Default priority (32768) on all switches confirms no explicit root has been designated"
+        }
+      ]
+    },
+    {
+      "scenario": "BPDU Guard violation -- edge port receiving BPDUs and disabled",
+      "description": "A port configured with PortFast and BPDU Guard (intended for end hosts only) received a BPDU from a connected switch. stpmgrd immediately disables the port to prevent loops. This is the correct protective behavior, but it causes an outage on that port until it is re-enabled. In SONiC, the port moves to error-disabled state and requires manual intervention or an errdisable recovery timer.",
+      "symptoms": [
+        "Port is down and 'show spanning_tree interface <ifname>' shows BPDU Guard error or Broken state",
+        "syslog shows 'BPDU Guard: BPDU received on port <ifname>, disabling port'",
+        "Connected device loses network access abruptly",
+        "'show interfaces status <ifname>' shows ErrDisabled or down state",
+        "stpmgrd logs show BPDU Guard violation event for the port"
+      ],
+      "root_causes": [
+        "A switch or hub was connected to a port configured as PortFast/BPDU Guard (intended for workstations/servers)",
+        "IP phone with an integrated switch is sending its own BPDUs on a PortFast access port",
+        "Misconfigured PortFast on a port that connects to another switch (should be a trunk/uplink port)",
+        "New device connected by user without notifying network team -- rogue switch",
+        "Virtual machine with bridging enabled (e.g., Linux bridge inside VM) sending STP BPDUs"
+      ],
+      "resolution": [
+        "Identify the BPDU source: inspect the port and the connected device",
+        "If a switch is legitimately connected: disable PortFast/BPDU Guard on this port -- it is not an edge port",
+        "If rogue device: remove the unauthorized switch and re-enable the port",
+        "Re-enable port after removing the BPDU source: 'config interface startup <ifname>'",
+        "For VM BPDU leaking: disable STP/bridging in the hypervisor or VM configuration",
+        "Consider enabling errdisable auto-recovery: 'config spanning_tree bpduguard recovery-interval <seconds>'"
+      ],
+      "verify_commands": [
+        {
+          "command": "show spanning_tree interface <ifname>",
+          "look_for": "BPDU Guard status, port state (Broken/ErrDisable), and whether PortFast is enabled",
+          "confirms_if": "BPDU Guard errdisable state confirms a BPDU was received on this PortFast port"
+        },
+        {
+          "command": "sudo journalctl -u stpmgrd --since '1 hour ago' | grep -i 'bpdu guard'",
+          "look_for": "BPDU Guard violation log entries with port name and timestamp",
+          "confirms_if": "Log entry for BPDU Guard violation confirms the port was disabled due to unexpected BPDU"
+        },
+        {
+          "command": "redis-cli -n 6 HGETALL 'STP_PORT_TABLE|<ifname>'",
+          "look_for": "port_state field showing err-disabled or broken; bpdu_guard_err field",
+          "confirms_if": "err-disabled state in STATE_DB confirms BPDU Guard triggered the port shutdown"
+        },
+        {
+          "command": "show interfaces status <ifname>",
+          "look_for": "ErrDisabled in the Oper column indicating the port was disabled by a protection mechanism",
+          "confirms_if": "ErrDisabled status confirms port was shut down by stpmgrd BPDU Guard enforcement"
+        },
+        {
+          "command": "sudo tcpdump -i <ifname> -c 20 ether dst 01:80:c2:00:00:00",
+          "look_for": "STP BPDUs arriving on the interface after it is temporarily re-enabled for diagnosis",
+          "confirms_if": "Incoming BPDUs on the port confirm a switch or bridge is still connected and sending STP frames"
+        }
+      ]
+    },
+    {
+      "scenario": "Layer 2 loop detected -- broadcast storm from STP failure",
+      "description": "STP has failed to block a redundant path and a Layer 2 loop exists in the network. Broadcast frames circulate indefinitely and are amplified at each loop iteration. CPU utilization on all switches in the loop spikes to 100%. Traffic throughput collapses. This is one of the most disruptive Layer 2 failure modes and can take down an entire network segment within seconds.",
+      "symptoms": [
+        "Broadcast or multicast traffic rate on interfaces spikes to line rate",
+        "CPU utilization on affected switches reaches 100% -- stpmgrd and kernel network stack overwhelmed",
+        "Packet loss on all traffic including management plane (SSH disconnects)",
+        "'show interfaces counters' shows extremely high TX/RX rates on multiple ports simultaneously",
+        "MAC address table instability -- same MAC learned on multiple ports in rapid succession",
+        "syslog may show stpmgrd crashes or watchdog resets if CPU is fully saturated"
+      ],
+      "root_causes": [
+        "stpmgrd process crashed or was not running -- STP topology is frozen at last known state; new link creates loop",
+        "STP disabled on a VLAN that has a redundant physical path",
+        "Two ports both in Forwarding state on a segment that should have one Blocking port -- race condition or stpmgrd bug",
+        "BPDU filtering enabled on both ends of a redundant link -- BPDUs not exchanged, both sides Forwarding",
+        "Unmanaged switch inserted in the topology that does not run STP and creates a physical loop",
+        "Misconfigured access port carrying the wrong VLAN bypassing STP per-VLAN topology"
+      ],
+      "resolution": [
+        "IMMEDIATE: Physically disconnect or shut down the redundant link causing the loop: 'config interface shutdown <ifname>'",
+        "Identify the loop: 'show interfaces counters' to find ports with matching high TX and RX rates",
+        "Check stpmgrd status: 'docker ps | grep swss' and 'sudo systemctl status stpmgrd'",
+        "Check STP state on affected ports: 'show spanning_tree' -- both ports should not be Forwarding on same segment",
+        "After loop is broken, restart stpmgrd if it crashed: 'sudo systemctl restart stpmgrd'",
+        "Verify STP is enabled on all VLANs with redundant paths: 'show spanning_tree vlan <id>'"
+      ],
+      "verify_commands": [
+        {
+          "command": "show interfaces counters",
+          "look_for": "Ports with very high and matching RX and TX rates (line rate); same rate on multiple ports indicates loop",
+          "confirms_if": "Multiple ports at line rate simultaneously confirms a broadcast storm from a Layer 2 loop"
+        },
+        {
+          "command": "show mac address-table",
+          "look_for": "Same MAC address appearing on multiple ports -- MAC flapping is a classic loop indicator",
+          "confirms_if": "Same MAC address on multiple ports in the MAC table confirms frames are arriving via multiple paths (loop)"
+        },
+        {
+          "command": "sudo systemctl status stpmgrd",
+          "look_for": "stpmgrd active/inactive status; recent crash or restart timestamps",
+          "confirms_if": "stpmgrd inactive or recently crashed confirms STP was not enforcing topology during the loop event"
+        },
+        {
+          "command": "show spanning_tree",
+          "look_for": "Any VLAN or port missing from spanning tree output (STP not running on those VLANs)",
+          "confirms_if": "Missing VLAN STP instance confirms STP is not active for that VLAN, allowing loops"
+        },
+        {
+          "command": "show interfaces counters errors",
+          "look_for": "High input error counts or CRC errors on flooded ports",
+          "confirms_if": "Error spikes alongside high traffic rates confirm storm-level flooding consistent with a loop"
+        }
+      ]
+    },
+    {
+      "scenario": "RSTP not converging rapidly -- falling back to legacy STP timers",
+      "description": "RSTP is configured but convergence takes 30 seconds (2x forward-delay) instead of sub-second as expected. The rapid transition mechanism is not operating because the link is not treated as point-to-point, or the remote end is running legacy STP (802.1D). RSTP degrades gracefully to STP timer-based behavior when interoperating with STP bridges, which is correct but unexpected if all switches should be running RSTP.",
+      "symptoms": [
+        "Port takes 30 seconds to reach Forwarding after link comes up",
+        "'show spanning_tree' shows port in Listening then Learning states for 15 seconds each",
+        "After failover, traffic blackholed for 30 seconds before recovering",
+        "RSTP is configured but convergence behavior is identical to legacy STP",
+        "Half-duplex link or shared segment not qualifying for rapid transition"
+      ],
+      "root_causes": [
+        "Connected switch is running legacy STP (802.1D) -- RSTP degrades to STP timer mode on that port",
+        "Link is half-duplex or detected as shared segment -- RSTP rapid transition only works on full-duplex point-to-point links",
+        "Port is not configured as edge/PortFast -- non-edge ports require proposal/agreement which takes longer on some implementations",
+        "Interoperability issue: partner switch vendor implementation sends incorrect BPDU version causing fallback",
+        "RSTP not actually configured in SONiC -- 'show spanning_tree' confirms mode as STP not RSTP"
+      ],
+      "resolution": [
+        "Verify RSTP is configured: 'show spanning_tree' -- mode should show RSTP not STP",
+        "Configure RSTP: 'config spanning_tree mode rstp'",
+        "Check link duplex: 'show interfaces <ifname>' -- must be full-duplex for rapid transition",
+        "Check remote switch STP mode -- upgrade or configure RSTP if possible",
+        "For edge ports (workstations, servers): enable PortFast: 'config spanning_tree interface portfast <ifname>'",
+        "Force point-to-point link type if auto-detection is wrong: check stpmgrd link-type configuration"
+      ],
+      "verify_commands": [
+        {
+          "command": "show spanning_tree",
+          "look_for": "Mode field at top -- should show RSTP; port type showing P2P (point-to-point) or Shared",
+          "confirms_if": "Mode shows STP (not RSTP) confirms RSTP is not configured; Shared port type confirms rapid transition is disabled on that link"
+        },
+        {
+          "command": "show spanning_tree interface <ifname>",
+          "look_for": "Port type (P2P/Shared/Edge), RSTP role, and whether rapid transition occurred",
+          "confirms_if": "Shared link type on a port confirms RSTP rapid transition is not eligible and STP timers will be used"
+        },
+        {
+          "command": "show interfaces <ifname>",
+          "look_for": "Duplex field -- Full-duplex required for RSTP rapid P2P transition; half-duplex will force Shared mode",
+          "confirms_if": "Half-duplex interface confirms RSTP rapid transition is disabled per IEEE 802.1w specification"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'STP|GLOBAL'",
+          "look_for": "mode field in CONFIG_DB STP global config -- should be 'rstp'",
+          "confirms_if": "mode=stp confirms legacy STP is configured despite operator intention to run RSTP"
+        },
+        {
+          "command": "sudo journalctl -u stpmgrd --since '10 minutes ago' | grep -i 'stp mode\\|legacy\\|interop'",
+          "look_for": "Log entries indicating STP interoperability mode triggered by a legacy peer",
+          "confirms_if": "Legacy STP interop log entry confirms the remote switch is running 802.1D causing RSTP degradation"
+        }
+      ]
+    },
+    {
+      "scenario": "Topology Change notification storm -- frequent TC events causing MAC table flushes",
+      "description": "The network is experiencing a topology change notification storm: TCN BPDUs are being generated at a high rate, causing all bridges to flush their MAC address tables at every hello interval during the TC period (forward-delay + max-age = 35s at defaults). Each MAC flush forces all frames to be flooded until MACs are relearned. This causes excessive CPU load on all switches, high broadcast flooding rates, and degraded performance without a complete loop.",
+      "symptoms": [
+        "High CPU on multiple switches from MAC table flush and relearning",
+        "Periodic traffic flooding bursts -- traffic that should be unicast is being flooded",
+        "'show spanning_tree' shows high topology change count incrementing rapidly",
+        "Excessive MAC address table churn visible in logs",
+        "Intermittent packet loss or latency spikes correlated with TC events"
+      ],
+      "root_causes": [
+        "Flapping port (connected to an unstable link or device) repeatedly transitions Forwarding/down, generating TCNs",
+        "PortFast not configured on edge ports -- when workstations boot, the port transition to Forwarding generates TCN",
+        "LACP or physical link instability on a trunk port that carries many VLANs -- each flap causes TC on all VLANs",
+        "Network device (IP phone, printer) that power-cycles frequently on a non-PortFast port",
+        "stpmgrd generating spurious topology changes due to a software bug or race condition"
+      ],
+      "resolution": [
+        "Identify the source of TCs: 'show spanning_tree detail' or check stpmgrd logs for which port is generating TCs",
+        "Enable PortFast on all access ports (end-host ports): 'config spanning_tree interface portfast <ifname>'",
+        "PortFast suppresses TCN generation when the port transitions -- prevents edge port flaps from triggering network-wide MAC flushes",
+        "Investigate flapping uplinks: 'show interfaces <ifname>' for link flap count",
+        "Consider TC Guard (TC Filter) on uplinks if available in the SONiC STP implementation",
+        "Fix the underlying link instability causing the port to flap"
+      ],
+      "verify_commands": [
+        {
+          "command": "show spanning_tree",
+          "look_for": "Topology changes count and time since last topology change -- rapidly incrementing count indicates a storm",
+          "confirms_if": "TC count incrementing every few seconds confirms a topology change storm is active"
+        },
+        {
+          "command": "show spanning_tree vlan <vlan-id>",
+          "look_for": "Topology change count, time since last topology change, which port originated the last TC",
+          "confirms_if": "Same port repeatedly shown as TC originator pinpoints the flapping port causing the storm"
+        },
+        {
+          "command": "redis-cli -n 6 HGETALL 'STP_VLAN_TABLE|Vlan<id>'",
+          "look_for": "topology_change_count field incrementing rapidly in STATE_DB",
+          "confirms_if": "High and incrementing topology_change_count confirms TC storm is in progress"
+        },
+        {
+          "command": "sudo journalctl -u stpmgrd --since '10 minutes ago' | grep -i 'topology change' | wc -l",
+          "look_for": "Count of topology change log entries -- more than a few per minute indicates a storm",
+          "confirms_if": "High count of topology change events in stpmgrd logs confirms the TC storm rate"
+        },
+        {
+          "command": "show interfaces counters",
+          "look_for": "Ports with high and increasing packet counts that include broadcast/multicast traffic from MAC flush flooding",
+          "confirms_if": "Rising flood counters correlated with TC events confirms MAC table flush storm is causing traffic flooding"
+        }
+      ]
+    },
+    {
+      "scenario": "PVST+/RPVST+ interoperability issues -- VLAN-aware STP mismatch with partner switches",
+      "description": "SONiC is configured with PVST+ (Per-VLAN Spanning Tree) but connects to a switch running a different STP variant (MSTP, RSTP without per-VLAN awareness, or standard 802.1D). PVST+ encodes the VLAN ID in the BPDU (using the System ID Extension field in the Bridge ID and a different multicast address for non-native VLANs). A non-PVST-aware switch ignores or misinterprets these BPDUs, causing inconsistent topology calculations and possible loops.",
+      "symptoms": [
+        "Ports connecting to non-Cisco/non-PVST partner switches showing Inconsistent or Broken state",
+        "Different STP root bridge on each side of the interop link",
+        "BPDUs arriving on trunk ports destined to PVST multicast (01:00:0C:CC:CC:CD) being flooded by the partner",
+        "STP topology appears correct on SONiC side but partner shows a different view",
+        "Loops on specific VLANs where PVST and standard STP disagree on blocking port"
+      ],
+      "root_causes": [
+        "Partner switch running MSTP (IEEE 802.1s) which maps all VLANs to instances differently than PVST+ per-VLAN instances",
+        "Partner running standard RSTP (802.1w) without per-VLAN awareness -- ignores PVST-specific BPDU format",
+        "VLAN ID mismatch in BPDU: SONiC PVST+ encodes VLAN in Bridge ID System Extension, partner does not understand this",
+        "Native VLAN mismatch on trunk link -- IEEE STP BPDUs only run on native VLAN; PVST+ BPDUs for non-native VLANs are tagged",
+        "SONiC PVST+ mode configured but partner is in MSTP region with different instance-to-VLAN mapping"
+      ],
+      "resolution": [
+        "Align STP mode between SONiC and partner: use the same STP variant on both ends",
+        "For MSTP interop: configure MSTP on SONiC if the partner is MSTP ('config spanning_tree mode mst' if supported)",
+        "For PVST+/standard RSTP boundary: use a Boundary port approach -- ensure the boundary port topology is deterministic",
+        "Verify BPDU types on the interop link: 'sudo tcpdump -i <ifname> -c 20 ether dst 01:80:c2:00:00:00 or ether dst 01:00:0c:cc:cc:cd'",
+        "Check native VLAN matches on both ends of the trunk: 'show interfaces trunk'"
+      ],
+      "verify_commands": [
+        {
+          "command": "sudo tcpdump -i <ifname> -c 20 -e ether dst 01:00:0c:cc:cc:cd",
+          "look_for": "PVST+ BPDUs (Cisco multicast 01:00:0C:CC:CC:CD) on the trunk link",
+          "confirms_if": "PVST+ BPDUs present confirms PVST+ mode is active; absence on expected VLAN indicates BPDU not reaching partner"
+        },
+        {
+          "command": "sudo tcpdump -i <ifname> -c 20 -e ether dst 01:80:c2:00:00:00",
+          "look_for": "IEEE standard STP/RSTP BPDUs (802.1D multicast); compare with expected STP mode",
+          "confirms_if": "Only standard BPDUs present when PVST+ is configured suggests VLAN-tagged PVST BPDUs are being dropped"
+        },
+        {
+          "command": "show spanning_tree",
+          "look_for": "Per-VLAN topology instances and whether per-VLAN roots differ unexpectedly",
+          "confirms_if": "Different root bridges per VLAN or inconsistent port states on interop trunk confirm PVST+/STP mismatch"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'STP|GLOBAL'",
+          "look_for": "mode field -- pvst, rpvst, or rstp indicating which STP variant is configured in SONiC",
+          "confirms_if": "mode=pvst confirms PVST+ is active; if partner is not PVST-aware, interop issues are expected"
+        }
+      ]
+    },
+    {
+      "scenario": "Port stuck in Blocking state -- port should be Forwarding but STP keeps it Blocking",
+      "description": "A port that should logically be Forwarding (e.g., the only uplink to the core network) is stuck in Blocking state. This causes a network segment to be completely isolated or forces traffic via a suboptimal path. The root cause is that STP has elected a different port as the Root or Designated port, leaving this one as Alternate/Backup in Blocking.",
+      "symptoms": [
+        "Hosts on a segment have no network connectivity despite physical link being up",
+        "'show spanning_tree interface <ifname>' shows port in Blocking state",
+        "Port cost or priority makes this port lose the port election to a port on a different switch",
+        "Intended uplink port shows as Alternate port in 'show spanning_tree'",
+        "No traffic visible on the port but link LED is green"
+      ],
+      "root_causes": [
+        "Port path cost too high -- the competing path has a lower cumulative cost to root, winning the election",
+        "Port priority unfavorable -- the competing port on the same bridge has a lower (better) priority",
+        "Root Guard configured on this port when it is the legitimate uplink to the real root bridge",
+        "Incorrect STP topology design -- both paths have equal cost but wrong port wins due to bridge ID tiebreak",
+        "VLAN-specific STP instance has different root or topology than expected (PVST+ per-VLAN configuration drift)",
+        "stpmgrd has stale state -- bug causing port to remain Blocking after the condition that caused Blocking was resolved"
+      ],
+      "resolution": [
+        "Check why port is Blocking: 'show spanning_tree interface <ifname>' -- note the port role (Alternate/Backup)",
+        "Compare path costs: 'show spanning_tree' -- the Blocking port has a higher root path cost than the Forwarding port",
+        "Lower the port cost to make this port preferred: 'config spanning_tree interface cost <ifname> <value>'",
+        "Lower the port priority: 'config spanning_tree interface priority <ifname> <value>'",
+        "Check Root Guard: if Root Guard is on this port and this switch IS the root, remove Root Guard",
+        "For stale stpmgrd state: 'sudo systemctl restart stpmgrd' (disruptive -- causes brief STP reconvergence)"
+      ],
+      "verify_commands": [
+        {
+          "command": "show spanning_tree interface <ifname>",
+          "look_for": "Port role (Root/Designated/Alternate/Backup), port state, path cost, port priority",
+          "confirms_if": "Alternate or Backup port role confirms the port is correctly (from STP's perspective) in Blocking due to a better path existing"
+        },
+        {
+          "command": "show spanning_tree vlan <vlan-id>",
+          "look_for": "All ports and their states for this VLAN -- identify which port is the Root port and why it was elected",
+          "confirms_if": "Shows the full topology view including which port won root port election and why this port lost"
+        },
+        {
+          "command": "redis-cli -n 6 HGETALL 'STP_PORT_TABLE|<ifname>'",
+          "look_for": "port_state, port_role, path_cost, port_priority fields in STATE_DB",
+          "confirms_if": "path_cost or priority values confirm why this port lost the election to the Forwarding port"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'STP_VLAN_PORT|Vlan<id>|<ifname>'",
+          "look_for": "path_cost and priority configured in CONFIG_DB for this VLAN+port combination",
+          "confirms_if": "High path_cost in CONFIG_DB confirms the port was configured with a value that causes it to lose the election"
+        }
+      ]
+    },
+    {
+      "scenario": "STP and LACP interaction issues -- PortChannel members not correctly participating in STP",
+      "description": "STP treats a PortChannel (LACP LAG) as a single logical port. However, if individual member links have inconsistent STP port cost or if stpmgrd and teammgrd are not synchronized, STP may act on individual member ports instead of the PortChannel, causing incorrect topology. Additionally, when STP blocks a PortChannel, all member links are blocked -- if only some members block, this indicates a configuration or synchronization issue.",
+      "symptoms": [
+        "PortChannel shows Blocking but individual member links show different states",
+        "STP topology appears inconsistent after LACP PortChannel formation or member addition",
+        "'show spanning_tree interface PortChannel<id>' shows unexpected state or is missing",
+        "Traffic asymmetry across PortChannel members despite LACP being up",
+        "Topology changes triggered when LACP adds/removes members from a PortChannel"
+      ],
+      "root_causes": [
+        "stpmgrd not updated when PortChannel membership changes -- STP running on individual member interfaces instead of the LAG",
+        "STP configured on individual member ports instead of the PortChannel interface",
+        "teammgrd and stpmgrd state out of sync -- PortChannel exists in LACP but stpmgrd has not been notified",
+        "PortChannel not recognized by stpmgrd because it was created after STP initialization",
+        "Different port costs configured on individual LACP member ports causing inconsistent STP behavior after LAG forms",
+        "LACP PortChannel flapping (member joining/leaving) causing repeated STP topology changes"
+      ],
+      "resolution": [
+        "Configure STP on the PortChannel interface, not on individual member ports",
+        "Verify STP recognizes the PortChannel: 'show spanning_tree interface PortChannel<id>'",
+        "Check PortChannel state: 'show portchannel summary' -- ensure PortChannel is up and all expected members are active",
+        "If stpmgrd state is stale: 'sudo systemctl restart stpmgrd' to force re-sync with current PortChannel topology",
+        "Verify teammgrd and APPL_DB are consistent: 'redis-cli -n 0 HGETALL \"LAG_TABLE|PortChannel<id>\"'",
+        "Check for LACP instability causing repeated STP TCs: 'show portchannel <id>'"
+      ],
+      "verify_commands": [
+        {
+          "command": "show spanning_tree interface PortChannel<id>",
+          "look_for": "PortChannel treated as single STP port with its own cost, priority, and state",
+          "confirms_if": "Missing PortChannel in STP output confirms stpmgrd does not recognize the LAG as a single STP port"
+        },
+        {
+          "command": "show portchannel summary",
+          "look_for": "PortChannel status (U=Up, D=Down) and active member count",
+          "confirms_if": "PortChannel Down or partial members confirms LACP instability that may be causing STP topology changes"
+        },
+        {
+          "command": "redis-cli -n 0 HGETALL 'LAG_TABLE|PortChannel<id>'",
+          "look_for": "admin_status, oper_status, and member port list in APPL_DB",
+          "confirms_if": "PortChannel present in APPL_DB confirms teammgrd has programmed it; absence suggests state sync issue with stpmgrd"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'STP_PORT|PortChannel<id>'",
+          "look_for": "STP configuration for the PortChannel in CONFIG_DB -- path_cost, priority, portfast settings",
+          "confirms_if": "Missing CONFIG_DB entry for PortChannel confirms STP was not explicitly configured on the LAG interface"
+        },
+        {
+          "command": "sudo journalctl -u stpmgrd --since '30 minutes ago' | grep -i 'portchannel\\|lag\\|topology'",
+          "look_for": "stpmgrd log entries showing PortChannel state changes and topology updates",
+          "confirms_if": "Repeated PortChannel-related topology change events confirm LACP instability is generating STP TCs"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "type": "daemon",
+      "name": "stpmgrd",
+      "description": "SONiC STP manager daemon. Implements STP/RSTP state machine, processes BPDUs, manages port states, and programs forwarding/blocking decisions. Runs on the host (not in a Docker container). Subscribes to CONFIG_DB for STP configuration and writes port states to STATE_DB. Sends port state changes to orchagent via APPL_DB."
+    },
+    {
+      "type": "daemon",
+      "name": "orchagent (swss container)",
+      "description": "Receives STP port state updates from APPL_DB STP tables and programs the ASIC forwarding behavior (hardware port blocking/forwarding). Required for STP port state to take effect in the hardware forwarding plane."
+    },
+    {
+      "type": "daemon",
+      "name": "vlanmgrd (swss container)",
+      "description": "Manages VLAN creation and membership. STP per-VLAN instances (PVST+) depend on vlanmgrd to have the VLANs and their port memberships correctly programmed before stpmgrd can run per-VLAN STP."
+    },
+    {
+      "type": "daemon",
+      "name": "teammgrd (teamd container)",
+      "description": "Manages LACP PortChannels. STP treats PortChannels as single logical ports. teammgrd must notify stpmgrd of PortChannel membership changes so STP topology is calculated on the LAG, not individual member ports."
+    },
+    {
+      "type": "database",
+      "name": "CONFIG_DB (Redis DB 4)",
+      "description": "Source of truth for STP configuration: STP|GLOBAL for global mode and timers, STP_VLAN|Vlan<id> for per-VLAN settings, STP_VLAN_PORT|Vlan<id>|<ifname> for per-port-per-VLAN overrides. stpmgrd reads from here on startup and subscribes to changes."
+    },
+    {
+      "type": "database",
+      "name": "APPL_DB (Redis DB 0)",
+      "description": "STP publishes port state updates (Forwarding/Blocking) to APPL_DB STP_TABLE entries. orchagent reads these to program ASIC port blocking state. Also used for PortChannel state sync from teammgrd."
+    },
+    {
+      "type": "database",
+      "name": "STATE_DB (Redis DB 6)",
+      "description": "Runtime STP state: STP_VLAN_TABLE and STP_PORT_TABLE containing current root bridge, port roles, port states, topology change counts. Read by 'show spanning_tree' CLI commands."
+    },
+    {
+      "type": "transport",
+      "name": "Ethernet multicast (01:80:C2:00:00:00)",
+      "description": "IEEE STP/RSTP BPDUs are sent to the well-known STP multicast MAC address. For PVST+, non-native VLAN BPDUs use the Cisco multicast 01:00:0C:CC:CC:CD. These frames are processed by stpmgrd and must not be blocked by ACLs or filtered by the ASIC CoPP policy."
+    }
+  ],
+  "config_db_tables": [
+    {
+      "table": "STP",
+      "key_pattern": "STP|GLOBAL",
+      "relevant_fields": [
+        "mode: stp, rstp, pvst, rpvst -- spanning tree mode",
+        "rootguard_timeout: errdisable recovery timer for Root Guard violations (seconds)",
+        "forward_delay: global forward delay in seconds (4-30)",
+        "hello_time: global hello interval in seconds (1-10)",
+        "max_age: global max age in seconds (6-40)",
+        "priority: global bridge priority (0-61440, multiples of 4096)"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'STP|GLOBAL'",
+      "redis_command": "redis-cli -n 4 KEYS 'STP*'"
+    },
+    {
+      "table": "STP_VLAN",
+      "key_pattern": "STP_VLAN|Vlan<vlan-id>",
+      "relevant_fields": [
+        "enabled: whether STP is enabled for this VLAN (true/false)",
+        "priority: per-VLAN bridge priority override",
+        "hello_time: per-VLAN hello interval override",
+        "max_age: per-VLAN max age override",
+        "forward_delay: per-VLAN forward delay override"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'STP_VLAN|Vlan<id>'",
+      "redis_command": "redis-cli -n 4 KEYS 'STP_VLAN*'"
+    },
+    {
+      "table": "STP_VLAN_PORT",
+      "key_pattern": "STP_VLAN_PORT|Vlan<vlan-id>|<ifname>",
+      "relevant_fields": [
+        "path_cost: per-port-per-VLAN STP path cost override (1-200000000)",
+        "priority: per-port-per-VLAN port priority (0-240, multiples of 16)"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'STP_VLAN_PORT|Vlan<id>|<ifname>'",
+      "redis_command": "redis-cli -n 4 KEYS 'STP_VLAN_PORT*'"
+    },
+    {
+      "table": "STP_PORT",
+      "key_pattern": "STP_PORT|<ifname>",
+      "relevant_fields": [
+        "enabled: STP enabled on this port (true/false)",
+        "root_guard: Root Guard enabled (true/false) -- rejects superior BPDUs",
+        "bpdu_guard: BPDU Guard enabled (true/false) -- disables port on BPDU receipt",
+        "bpdu_filter: BPDU Filter enabled (true/false) -- suppresses BPDU TX/RX",
+        "portfast: PortFast enabled (true/false) -- immediate Forwarding, suppresses TCN",
+        "path_cost: port path cost override",
+        "priority: port priority override",
+        "uplink_fast: UplinkFast enabled for faster root port failover",
+        "bpdu_guard_do_disable: whether BPDU Guard violation shuts down the port"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'STP_PORT|<ifname>'",
+      "redis_command": "redis-cli -n 4 KEYS 'STP_PORT*'"
+    },
+    {
+      "table": "STP_VLAN_TABLE (STATE_DB)",
+      "key_pattern": "STP_VLAN_TABLE|Vlan<vlan-id>",
+      "relevant_fields": [
+        "bridge_id: local bridge ID for this VLAN instance",
+        "root_bridge_id: current root bridge ID",
+        "root_path_cost: cumulative path cost to root",
+        "root_port: interface name of the root port",
+        "topology_change: whether topology change is active (0/1)",
+        "topology_change_count: total TC count since startup",
+        "topology_change_time: time of last topology change"
+      ],
+      "verify_command": "redis-cli -n 6 HGETALL 'STP_VLAN_TABLE|Vlan<id>'",
+      "redis_command": "redis-cli -n 6 KEYS 'STP_VLAN_TABLE*'"
+    },
+    {
+      "table": "STP_PORT_TABLE (STATE_DB)",
+      "key_pattern": "STP_PORT_TABLE|<ifname>",
+      "relevant_fields": [
+        "port_state: current STP state (FORWARDING, BLOCKING, LEARNING, LISTENING, DISABLED, BROKEN)",
+        "port_role: STP port role (ROOT, DESIGNATED, ALTERNATE, BACKUP)",
+        "path_cost: effective path cost for this port",
+        "port_priority: effective port priority",
+        "bpdu_guard_err: whether port is in BPDU Guard error state",
+        "root_guard_err: whether port is in Root Guard inconsistent state"
+      ],
+      "verify_command": "redis-cli -n 6 HGETALL 'STP_PORT_TABLE|<ifname>'",
+      "redis_command": "redis-cli -n 6 KEYS 'STP_PORT_TABLE*'"
+    }
+  ],
+  "sonic_notes": [
+    {
+      "note": "SONiC implements STP/RSTP via the stpmgrd daemon, which runs on the host (not inside a Docker container). stpmgrd subscribes to CONFIG_DB for configuration, writes operational state to STATE_DB, and programs port blocking state via APPL_DB to orchagent. Unlike routing protocols (which use FRR inside containers), STP is a native SONiC daemon. Use 'sudo systemctl status stpmgrd' not 'docker exec' to check its health.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "sonic-buildimage:src/sonic-stp/"
+    },
+    {
+      "note": "SONiC STP configuration must always be done via the SONiC CLI ('config spanning_tree ...') which writes to CONFIG_DB. There is no equivalent of 'vtysh' for STP. Direct STATE_DB or APPL_DB writes will be overwritten by stpmgrd. After configuration changes, run 'config save' to persist to /etc/sonic/config_db.json.",
+      "human_error_risk": "HIGH",
+      "source_ref": "SONiC STP CLI design"
+    },
+    {
+      "note": "In SONiC, PortFast (edge port) is configured per-interface and suppresses Topology Change Notification generation when the port transitions. Enable PortFast on ALL access ports connected to end hosts to prevent normal workstation boot/shutdown cycles from generating network-wide MAC table flushes. Forgetting PortFast on access ports is the leading cause of TC storms in SONiC L2 deployments.",
+      "human_error_risk": "HIGH",
+      "source_ref": "SONiC STP PortFast configuration and IEEE 802.1D TC suppression"
+    },
+    {
+      "note": "BPDU Guard is a critical security feature that should be enabled on all PortFast (access) ports. If BPDU Guard triggers and disables a port, the port enters error-disabled state in SONiC. The operator must either manually re-enable via 'config interface startup <ifname>' or configure auto-recovery with 'config spanning_tree bpduguard recovery-interval <seconds>'. Without auto-recovery, disabled ports require manual intervention.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "SONiC STP BPDU Guard implementation in stpmgrd"
+    },
+    {
+      "note": "SONiC PVST+ (Per-VLAN Spanning Tree Plus) runs a separate STP instance per VLAN. Each VLAN has its own root bridge election, topology, and timer configuration. When troubleshooting, always specify the VLAN in 'show spanning_tree vlan <id>' -- the global 'show spanning_tree' may not reveal per-VLAN issues. PVST+ requires VLANs to exist in CONFIG_DB (via vlanmgrd) before stpmgrd can manage STP for that VLAN.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "SONiC PVST+ design and STP_VLAN CONFIG_DB schema"
+    },
+    {
+      "note": "SONiC STP bridge priority must be configured in multiples of 4096 (0, 4096, 8192, 12288, ..., 61440). The default is 32768. To ensure a specific switch is always root, set priority to 0 or 4096. Setting different priorities per VLAN in a PVST+ deployment allows load-balancing across redundant uplinks by assigning different root bridges per VLAN group.",
+      "human_error_risk": "LOW",
+      "source_ref": "IEEE 802.1D Bridge ID format and SONiC spanning_tree priority CLI"
+    },
+    {
+      "note": "STP and LACP (PortChannels) interact: stpmgrd treats a PortChannel as a single logical STP port. If STP is configured on individual member ports instead of the PortChannel, behavior is undefined. Always configure STP parameters (cost, priority, portfast, BPDU guard) on the PortChannel interface, not on individual Ethernet members. When LACP adds or removes a member, stpmgrd receives a notification and may trigger a topology recalculation.",
+      "human_error_risk": "HIGH",
+      "source_ref": "SONiC STP-LACP interaction design in stpmgrd and teammgrd"
+    },
+    {
+      "note": "RSTP rapid transition only works on full-duplex point-to-point links. If a port is half-duplex or connected to a shared segment (hub), RSTP falls back to legacy STP timer-based convergence (30 seconds to Forwarding). In SONiC, always verify link duplex ('show interfaces <ifname>') on interop links when diagnosing slow RSTP convergence. Auto-negotiation failures resulting in half-duplex are a common cause.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "IEEE 802.1w RSTP rapid transition requirements and SONiC stpmgrd link type detection"
+    }
+  ],
+  "sonic_frr_mapping": {
+    "frr_process": "N/A (STP is not implemented in FRR -- SONiC uses native stpmgrd daemon)",
+    "frr_config_file": "N/A",
+    "bgpcfgd_source": "N/A",
+    "config_managed_by": "stpmgrd (reads CONFIG_DB STP tables directly; no template engine)",
+    "container": "host (stpmgrd runs as a systemd service, not in a Docker container)",
+    "frr_socket": "N/A",
+    "fpm_port": "N/A",
+    "bgpcfgd_templates": "N/A",
+    "supervisor_config": "N/A (stpmgrd managed by systemd: /lib/systemd/system/stpmgrd.service)"
+  },
+  "key_commands": [
+    "show spanning_tree",
+    "show spanning_tree vlan <vlan-id>",
+    "show spanning_tree interface <ifname>",
+    "show spanning_tree bpdu_guard",
+    "show spanning_tree statistics",
+    "sudo systemctl status stpmgrd",
+    "sudo journalctl -u stpmgrd --since '1 hour ago'",
+    "redis-cli -n 4 HGETALL 'STP|GLOBAL'",
+    "redis-cli -n 4 KEYS 'STP_VLAN*'",
+    "redis-cli -n 4 HGETALL 'STP_VLAN|Vlan<id>'",
+    "redis-cli -n 4 HGETALL 'STP_PORT|<ifname>'",
+    "redis-cli -n 4 HGETALL 'STP_VLAN_PORT|Vlan<id>|<ifname>'",
+    "redis-cli -n 6 HGETALL 'STP_VLAN_TABLE|Vlan<id>'",
+    "redis-cli -n 6 HGETALL 'STP_PORT_TABLE|<ifname>'",
+    "redis-cli -n 6 KEYS 'STP_PORT_TABLE*'",
+    "sudo tcpdump -i <ifname> -c 20 ether dst 01:80:c2:00:00:00",
+    "sudo tcpdump -i <ifname> -c 20 -e ether dst 01:00:0c:cc:cc:cd",
+    "config spanning_tree mode rstp",
+    "config spanning_tree priority <value>",
+    "config spanning_tree vlan <id> priority <value>",
+    "config spanning_tree interface portfast <ifname>",
+    "config spanning_tree interface bpduguard <ifname>",
+    "config spanning_tree interface cost <ifname> <value>",
+    "config interface startup <ifname>",
+    "config interface shutdown <ifname>",
+    "show portchannel summary",
+    "show interfaces counters",
+    "show mac address-table"
+  ],
+  "related_protocols": [
+    "lacp",
+    "vxlan-evpn"
+  ],
+  "tags": [
+    "loop-prevention",
+    "layer-2",
+    "bridge",
+    "rstp",
+    "stp",
+    "bpdu",
+    "pvst"
+  ]
+}

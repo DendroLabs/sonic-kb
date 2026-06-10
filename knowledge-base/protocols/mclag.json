@@ -1,0 +1,895 @@
+{
+  "protocol_id": "mclag",
+  "protocol_name": "MC-LAG",
+  "protocol_family": "switching",
+  "standard": "RFC 7275 (ICCP), SONiC-specific implementation",
+  "category": "switching",
+  "purpose": "Multi-Chassis Link Aggregation for dual-homed server/switch redundancy -- two switches act as a single logical LAG endpoint, providing active-active redundancy without spanning tree blocking",
+  "operates_at": "Layer 2/3",
+  "transport": "TCP (ICCP session between MC-LAG peers)",
+  "def_refs": [
+    "daemon:iccpd",
+    "daemon:mclagsyncd",
+    "daemon:teammgrd",
+    "daemon:teamsyncd",
+    "daemon:orchagent",
+    "timer:mclag-keepalive",
+    "timer:mclag-session-timeout",
+    "db:config_db",
+    "db:appl_db",
+    "db:state_db"
+  ],
+  "states": [
+    {
+      "name": "MCLAG_STATE_INIT",
+      "description": "Initial state after iccpd starts or after a session reset. The MCLAG domain is configured in CONFIG_DB but no ICCP connection to the peer has been attempted yet. iccpd is loading its configuration and preparing to connect. Peer link and keepalive interfaces are being checked.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "show mclag brief",
+        "show mclag",
+        "redis-cli -n 6 HGETALL 'MCLAG_TABLE|<domain-id>'"
+      ]
+    },
+    {
+      "name": "MCLAG_STATE_CONNECTING",
+      "description": "iccpd is attempting to establish a TCP connection to the peer's keepalive IP address. The ICCP RG (Redundancy Group) Connect Timer is running. If this state persists, the keepalive link is down or the peer IP is unreachable.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "show mclag brief",
+        "sudo ss -tnp | grep 8888",
+        "ping <peer-ip> -I <keepalive-interface>"
+      ]
+    },
+    {
+      "name": "MCLAG_STATE_ESTABLISHED",
+      "description": "The ICCP session between the two MC-LAG peers is fully up. Both peers have exchanged RG Connect messages, System ID TLVs, and port channel state information. MAC synchronization is active. This is the only steady-state operational state.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "show mclag brief",
+        "show mclag",
+        "redis-cli -n 6 HGETALL 'MCLAG_TABLE|<domain-id>'"
+      ]
+    },
+    {
+      "name": "MCLAG_STATE_ERROR",
+      "description": "The ICCP session encountered an unrecoverable error such as a protocol message sequence error, incompatible configuration, or TCP connection reset with no reconnect. iccpd will attempt to reset and reconnect after a delay.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "show mclag brief",
+        "docker logs teamd 2>&1 | grep -i mclag | tail -30",
+        "redis-cli -n 6 HGETALL 'MCLAG_TABLE|<domain-id>'"
+      ]
+    },
+    {
+      "name": "PEER_LINK_DOWN",
+      "description": "The ICCP session may still be up (via keepalive path) but the physical peer link (portchannel connecting the two MC-LAG peers) is operationally down. In this state inter-chassis traffic cannot be forwarded across the peer link. Orphan port traffic may be blackholed if it arrives on the peer without a local uplink.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "show mclag brief",
+        "show interfaces portchannel",
+        "show mclag | grep 'peer link'"
+      ]
+    },
+    {
+      "name": "SPLIT_BRAIN",
+      "description": "Both peers have lost visibility of each other (both keepalive and peer link are down or blocked) and both have independently declared themselves the active peer. Both peers are programming identical forwarding entries and both are forwarding traffic. This is the most dangerous MC-LAG failure state -- it can result in duplicate packets, loops, and MAC table inconsistencies.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "show mclag brief",
+        "show mclag | grep -i role",
+        "redis-cli -n 6 HGETALL 'MCLAG_TABLE|<domain-id>'"
+      ]
+    }
+  ],
+  "transitions": [
+    {
+      "from_state": "MCLAG_STATE_INIT",
+      "to_state": "MCLAG_STATE_CONNECTING",
+      "trigger": "iccpd configuration loaded from CONFIG_DB; TCP connection attempt initiated to peer's source IP on ICCP port",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "MCLAG_STATE_CONNECTING",
+      "to_state": "MCLAG_STATE_ESTABLISHED",
+      "trigger": "TCP connection to peer established; ICCP RG Connect and system ID TLVs exchanged successfully; port channel state synchronized",
+      "failure_if_stuck": "Peer IP unreachable, keepalive interface down, firewall blocking TCP, or peer iccpd not running"
+    },
+    {
+      "from_state": "MCLAG_STATE_CONNECTING",
+      "to_state": "MCLAG_STATE_INIT",
+      "trigger": "TCP connection failed; reconnect timer expired; iccpd resets and retries",
+      "failure_if_stuck": "Persistent keepalive link failure or misconfigured peer IP"
+    },
+    {
+      "from_state": "MCLAG_STATE_ESTABLISHED",
+      "to_state": "MCLAG_STATE_CONNECTING",
+      "trigger": "ICCP session keepalive timeout; TCP session dropped; peer iccpd restarted",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "MCLAG_STATE_ESTABLISHED",
+      "to_state": "SPLIT_BRAIN",
+      "trigger": "Both keepalive link and peer link fail simultaneously; both peers stop receiving ICCP keepalives and declare the other dead; both assert active role",
+      "failure_if_stuck": "Hardware failure on keepalive path with no redundant path; must restore at least one path to resolve"
+    },
+    {
+      "from_state": "MCLAG_STATE_ESTABLISHED",
+      "to_state": "PEER_LINK_DOWN",
+      "trigger": "Peer link portchannel goes down while ICCP session (keepalive) remains up; iccpd detects via STATE_DB update from mclagsyncd",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "PEER_LINK_DOWN",
+      "to_state": "MCLAG_STATE_ESTABLISHED",
+      "trigger": "Peer link portchannel restored; mclagsyncd updates STATE_DB; iccpd re-synchronizes forwarding state",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "SPLIT_BRAIN",
+      "to_state": "MCLAG_STATE_CONNECTING",
+      "trigger": "Keepalive path restored; one peer detects the other is alive and initiates ICCP reconnect",
+      "failure_if_stuck": "If both peers restored simultaneously, role election may cause reconnect loop; check system MAC priority"
+    }
+  ],
+  "timers": [
+    {
+      "name": "Keepalive Timer",
+      "description": "Interval at which iccpd sends ICCP keepalive messages to the peer over the keepalive link. Used to detect peer failures between ICCP protocol exchanges. If no keepalive is received within the session timeout window, the peer is declared dead.",
+      "default": "1s",
+      "range": "1-60s",
+      "on_expiry": "Send ICCP keepalive message to peer",
+      "sonic_default": "1s",
+      "sonic_config_path": "CONFIG_DB MCLAG_DOMAIN|<domain-id>: keepalive_interval field",
+      "sonic_frr_path": "N/A (not FRR-managed; iccpd internal timer)",
+      "tuning_advice": "Default of 1s with 15s session timeout provides reasonable failure detection. Do not set below 1s. Increasing keepalive reduces false positives on congested management links."
+    },
+    {
+      "name": "Session Timeout",
+      "description": "Maximum time without receiving an ICCP keepalive before the peer is declared dead and split-brain avoidance measures are triggered. Must be greater than keepalive_interval. When the session times out, iccpd isolates orphan ports and disables the peer's MAC entries.",
+      "default": "15s",
+      "range": "3-3600s",
+      "on_expiry": "Peer declared dead; orphan port isolation triggered; peer MAC entries withdrawn; local node asserts active role",
+      "sonic_default": "15s",
+      "sonic_config_path": "CONFIG_DB MCLAG_DOMAIN|<domain-id>: session_timeout field",
+      "sonic_frr_path": "N/A (not FRR-managed; iccpd internal timer)",
+      "tuning_advice": "Session timeout should be at least 3x the keepalive interval. Lower values increase the risk of false positives (declaring a live peer dead due to transient keepalive loss). Higher values slow failover response."
+    }
+  ],
+  "messages": [
+    {
+      "name": "ICCP RG Connect",
+      "description": "Establishes the ICCP Redundancy Group session between the two MC-LAG peers. Contains the Sender Name TLV and Sender ID TLV identifying the local node. The RG Connect is the first ICCP message exchanged after the TCP connection is established.",
+      "when_sent": "Immediately after TCP connection is established to the peer; repeated after session reset",
+      "key_fields": [
+        "Sender Name TLV: identifies the local node by system MAC",
+        "Sender ID TLV: numeric identifier for this node in the RG",
+        "RG ID: Redundancy Group identifier (must match on both peers)",
+        "ICC Parameter Capabilities: bitmask of supported ICCP application types"
+      ]
+    },
+    {
+      "name": "ICCP RG Disconnect",
+      "description": "Sent to cleanly terminate the ICCP session. Contains a reason code. The receiving peer marks the sender as disconnected and may trigger failover procedures if the peer link is also down.",
+      "when_sent": "On graceful iccpd shutdown, 'config mclag del' command, or after detecting unrecoverable session error",
+      "key_fields": [
+        "Reason Code: 0=unspecified, 1=admin down, 2=config mismatch",
+        "RG ID: Redundancy Group this disconnect applies to"
+      ]
+    },
+    {
+      "name": "MLAG System Config TLV",
+      "description": "Advertises the MC-LAG system-level configuration to the peer, including the system MAC address used for LACP PDUs and the node role preference. Both peers exchange this TLV during session establishment and when configuration changes.",
+      "when_sent": "During ICCP session establishment after RG Connect; when system MAC or role configuration changes",
+      "key_fields": [
+        "System MAC: the common LACP system MAC advertised to downstream devices on all MC-LAG member ports",
+        "System Priority: LACP system priority (must be identical on both peers)",
+        "Node Role: primary/secondary preference"
+      ]
+    },
+    {
+      "name": "MLAG Port Config TLV",
+      "description": "Synchronizes the operational state of each MC-LAG portchannel to the peer. Both peers exchange port config TLVs for all their local MC-LAG member portchannels so each knows the full state of every MC-LAG interface.",
+      "when_sent": "During session establishment (full state sync); whenever a portchannel operational state changes (link up/down, member add/remove)",
+      "key_fields": [
+        "PortChannel ID: the MC-LAG interface identifier",
+        "Operational Status: up/down",
+        "LACP Key: must match on both peers for the same MC-LAG",
+        "Member Port List: physical ports participating in this portchannel"
+      ]
+    },
+    {
+      "name": "MAC Sync TLV",
+      "description": "Synchronizes MAC address table entries learned on the local peer to the remote peer. Allows both peers to have a complete view of MAC-to-port mappings without the remote peer having to flood to learn them. Critical for preventing unicast flooding when a MAC is reachable only via the peer link.",
+      "when_sent": "Continuously as new MACs are learned on local ports; also as bulk sync during ICCP session establishment",
+      "key_fields": [
+        "MAC Address: the learned Ethernet MAC",
+        "VLAN ID: the VLAN on which this MAC was learned",
+        "Port: the local portchannel or interface the MAC was learned on",
+        "Operation: add/delete",
+        "Flags: local/remote, static/dynamic"
+      ]
+    },
+    {
+      "name": "ARP/ND Sync TLV",
+      "description": "Synchronizes ARP and IPv6 Neighbor Discovery entries between peers. Ensures both peers can resolve next-hops for routed traffic without generating additional ARP/ND traffic. Used in MC-LAG deployments with Layer 3 gateway functionality (anycast gateway or VRF routing).",
+      "when_sent": "When a new ARP or ND entry is learned locally; during bulk sync on session establishment",
+      "key_fields": [
+        "IP Address: the resolved neighbor IP",
+        "MAC Address: the neighbor's Ethernet MAC",
+        "Interface: the local interface on which the neighbor was resolved",
+        "VLAN: VLAN context for the ARP/ND entry",
+        "Operation: add/delete"
+      ]
+    },
+    {
+      "name": "Keepalive",
+      "description": "Lightweight heartbeat message sent periodically over the keepalive link. Not an ICCP protocol message per se -- in SONiC's iccpd implementation this is a simple UDP or TCP heartbeat that keeps the session alive and detects peer reachability. Distinct from the ICCP protocol messages sent over the ICCP TCP session.",
+      "when_sent": "Every keepalive_interval seconds; sent over the dedicated keepalive link or interface",
+      "key_fields": [
+        "Sequence Number: monotonically increasing counter",
+        "Timestamp: for round-trip time measurement",
+        "Peer IP: echoed back for verification"
+      ]
+    }
+  ],
+  "failure_modes": [
+    {
+      "scenario": "MC-LAG peer link down -- inter-chassis data path lost",
+      "description": "The portchannel connecting the two MC-LAG peers (the peer link) has gone down while the ICCP keepalive session remains up. The peer link carries traffic for dual-homed clients when only one peer has a local uplink, orphan port traffic destined for the remote peer, and BUM (Broadcast, Unknown unicast, Multicast) traffic. When the peer link is down, traffic that requires crossing to the other chassis is dropped. Orphan devices (single-homed to one peer) will lose connectivity to networks only accessible via the remote peer.",
+      "symptoms": [
+        "'show mclag brief' shows peer link portchannel as down",
+        "Single-homed (orphan) ports on one peer lose connectivity to resources only on the other peer",
+        "BUM traffic flooding is impaired -- some VLANs may stop receiving broadcasts",
+        "STATE_DB shows peer link status as down: 'redis-cli -n 6 HGETALL \"MCLAG_TABLE|<domain>\"'",
+        "Increased traffic drops on orphan ports",
+        "iccpd logs show peer link state change notification"
+      ],
+      "root_causes": [
+        "Physical cable failure on the peer link portchannel member ports",
+        "All member interfaces of the peer link portchannel went down simultaneously (transceiver failure, fiber cut)",
+        "LACP negotiation failure on peer link members -- misconfigured LACP mode (active/passive mismatch)",
+        "teammgrd failed to bring up portchannel members after a reboot",
+        "Switch fabric or linecard failure affecting the peer link ports",
+        "Incorrect minimum-links configuration causing portchannel to go down on partial member loss"
+      ],
+      "resolution": [
+        "Check peer link physical status: 'show interfaces portchannel <peer-link-pc>'",
+        "Check individual member port status: 'show interfaces status | grep <peer-link-ports>'",
+        "Check LACP on peer link members: 'show lacp neighbor' -- verify partner system ID and key",
+        "Check transceiver health: 'show interfaces transceiver eeprom <port>'",
+        "Check teamd/LACP logs: 'docker exec teamd supervisorctl status' and 'docker logs teamd 2>&1 | tail -50'",
+        "If portchannel min-links is too high, reduce with: 'portchannel minimum-links <n>' after fixing physical issue",
+        "Restore physical peer link connectivity -- there is no software workaround for a completely failed peer link"
+      ],
+      "verify_commands": [
+        {
+          "command": "show mclag brief",
+          "look_for": "Peer link status field -- should be 'Up'; 'Down' confirms peer link failure",
+          "confirms_if": "Peer link shown as Down in MCLAG brief output confirms this failure mode"
+        },
+        {
+          "command": "show interfaces portchannel <peer-link-portchannel>",
+          "look_for": "Operational status (up/down), member port states, and reason for down if available",
+          "confirms_if": "PortChannel shown as down with all or minimum-links members down confirms physical peer link failure"
+        },
+        {
+          "command": "show lacp neighbor",
+          "look_for": "Peer link portchannel member entries -- missing or down entries indicate LACP negotiation failure",
+          "confirms_if": "No LACP neighbor entries for peer link member ports confirms LACP negotiation failure on the peer link"
+        },
+        {
+          "command": "redis-cli -n 6 HGETALL 'MCLAG_TABLE|<domain-id>'",
+          "look_for": "peer_link_if and peer_link_oper_status fields in STATE_DB",
+          "confirms_if": "peer_link_oper_status showing 'down' confirms iccpd has detected the peer link failure"
+        },
+        {
+          "command": "docker logs teamd 2>&1 | grep -E 'ERROR|peer|portchannel' | tail -30",
+          "look_for": "LACP or portchannel error messages related to peer link interface",
+          "confirms_if": "LACP negotiation failure or member port error messages confirm the root cause"
+        }
+      ]
+    },
+    {
+      "scenario": "Keepalive link failure -- peer declared dead despite peer link being up",
+      "description": "The ICCP keepalive path between the two MC-LAG peers has failed. iccpd sends keepalives over the keepalive link (a separate management or data path interface) and when these stop being received within the session timeout window, iccpd declares the peer dead. If the peer link is still physically up at this moment, the result is a false positive failure: one or both nodes may isolate orphan ports or trigger failover procedures unnecessarily. This is a high-risk scenario because it can cause split-brain if the peer link also later fails.",
+      "symptoms": [
+        "'show mclag brief' shows MCLAG session state as 'down' or 'error'",
+        "'show mclag' shows keepalive link status as down",
+        "ICCP session drop without corresponding peer link failure",
+        "iccpd logs show session timeout on keepalive path",
+        "Orphan ports may be isolated (disabled) due to false peer-down detection",
+        "Both peers may show themselves as active/primary"
+      ],
+      "root_causes": [
+        "Keepalive link interface (typically a management port or dedicated data port) went down",
+        "Routing table on the management plane does not have a route to the peer's keepalive IP",
+        "Management VRF misconfiguration -- keepalive IP is in a different VRF than iccpd is using",
+        "Firewall or ACL blocking traffic between the two keepalive IPs",
+        "iccpd configured with wrong source IP or peer IP for the keepalive path",
+        "Split management network -- management switch failure causing loss of keepalive path",
+        "TCP connection to peer torn down by OS network stack (FIN/RST) without iccpd reconnecting"
+      ],
+      "resolution": [
+        "Check keepalive interface: 'show interfaces status <keepalive-interface>'",
+        "Ping peer keepalive IP: 'ping <peer-keepalive-ip> -I <keepalive-interface> -c 5'",
+        "Check iccpd config: 'redis-cli -n 4 HGETALL \"MCLAG_DOMAIN|<domain-id>\"' for source_ip and peer_ip",
+        "Check ICCP TCP socket: 'sudo ss -tnp | grep 8888' for connection to peer IP",
+        "Verify routing to peer keepalive IP: 'ip route get <peer-keepalive-ip>'",
+        "If in management VRF: 'ip vrf exec mgmt ping <peer-keepalive-ip>'",
+        "Check iccpd logs for disconnect reason: 'docker exec teamd cat /var/log/iccpd/iccpd.log | tail -50'"
+      ],
+      "verify_commands": [
+        {
+          "command": "show mclag brief",
+          "look_for": "MCLAG session state and keepalive link status",
+          "confirms_if": "Keepalive shown as Down while peer link was previously Up confirms keepalive path failure causing false peer-down"
+        },
+        {
+          "command": "ping <peer-keepalive-ip> -I <keepalive-interface> -c 5",
+          "look_for": "Packet loss -- any loss indicates keepalive path problem",
+          "confirms_if": "100% packet loss to peer keepalive IP from keepalive interface confirms keepalive path is broken"
+        },
+        {
+          "command": "sudo ss -tnp | grep 8888",
+          "look_for": "ESTABLISHED TCP connection to peer IP on ICCP port 8888; absence means ICCP TCP session is down",
+          "confirms_if": "No ESTABLISHED entry to peer IP on port 8888 confirms ICCP TCP session is not up"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'MCLAG_DOMAIN|<domain-id>'",
+          "look_for": "source_ip and peer_ip fields -- verify correct IPs are configured for keepalive path",
+          "confirms_if": "Wrong source_ip or peer_ip in CONFIG_DB confirms misconfiguration as root cause"
+        },
+        {
+          "command": "docker exec teamd cat /var/log/iccpd/iccpd.log | tail -50",
+          "look_for": "Session timeout messages, TCP connection reset messages, or keepalive failure logs",
+          "confirms_if": "Session timeout log entries confirm keepalive path failure was detected by iccpd"
+        }
+      ]
+    },
+    {
+      "scenario": "MAC address synchronization failure -- remote MACs not programmed",
+      "description": "The ICCP session is up and the peer link is operational, but MAC addresses learned on one peer are not being synchronized to the other peer's FDB (Forwarding Database). As a result, traffic destined for hosts single-homed to the remote peer is flooded as unknown unicast rather than being forwarded directly. This can cause significant bandwidth overhead and may trigger BUM rate limiters. In SONiC this is typically a failure in the iccpd->mclagsyncd->orchagent pipeline for remote MAC programming.",
+      "symptoms": [
+        "High unknown unicast flood rate on peer link",
+        "Remote MACs not appearing in 'show mac address-table' on the local peer",
+        "Traffic to hosts on the remote peer is consistently flooded rather than unicast forwarded",
+        "STATE_DB MAC table shows local MACs only, not remote ones",
+        "mclagsyncd logs show errors publishing MAC sync entries to APPL_DB",
+        "orchagent logs show FDB entry programming errors"
+      ],
+      "root_causes": [
+        "iccpd MAC sync TLVs are being sent but mclagsyncd is not receiving or processing them",
+        "mclagsyncd failed to write MAC entries to APPL_DB FDB_TABLE",
+        "orchagent failed to program remote MAC entries into ASIC_DB",
+        "VLAN mismatch between peers -- MAC synced on a VLAN that does not exist on the receiving peer",
+        "FDB table capacity reached on the ASIC -- new MACs cannot be programmed",
+        "mclagsyncd process crashed or is in an error state",
+        "iccpd MAC sync is disabled or rate-limited due to excessive MAC table churn"
+      ],
+      "resolution": [
+        "Check MAC table on both peers: 'show mac address-table' -- compare entries for remote hosts",
+        "Check APPL_DB FDB entries: 'redis-cli -n 0 KEYS \"FDB_TABLE*\" | wc -l'",
+        "Check mclagsyncd status: 'docker exec teamd supervisorctl status mclagsyncd'",
+        "Check mclagsyncd logs: 'docker logs teamd 2>&1 | grep mclagsyncd | tail -50'",
+        "Check orchagent FDB errors: 'docker logs swss 2>&1 | grep -i fdb | tail -30'",
+        "Verify VLAN consistency: 'show vlan brief' on both peers -- VLANs must match",
+        "Trigger MAC resync: restart iccpd session to force bulk MAC re-advertisement (disruptive -- causes brief session reset)"
+      ],
+      "verify_commands": [
+        {
+          "command": "show mac address-table | grep PortChannel",
+          "look_for": "MAC entries with remote portchannel as source -- these are synced remote MACs",
+          "confirms_if": "Absence of remote portchannel MAC entries while remote hosts are active confirms MAC sync failure"
+        },
+        {
+          "command": "redis-cli -n 0 KEYS 'FDB_TABLE:*' | wc -l",
+          "look_for": "Count of FDB entries in APPL_DB; should reflect both local and remote MACs",
+          "confirms_if": "Low FDB count compared to expected MACs confirms mclagsyncd is not publishing remote MACs to APPL_DB"
+        },
+        {
+          "command": "docker exec teamd supervisorctl status mclagsyncd",
+          "look_for": "mclagsyncd process status -- should be RUNNING",
+          "confirms_if": "STOPPED or FATAL mclagsyncd state confirms the MAC sync pipeline is broken"
+        },
+        {
+          "command": "docker logs swss 2>&1 | grep -i fdb | tail -30",
+          "look_for": "FDB programming errors, SAI_STATUS_TABLE_FULL, or failed FDB entry creation",
+          "confirms_if": "FDB programming errors in orchagent confirm ASIC-level MAC table failure"
+        },
+        {
+          "command": "show vlan brief",
+          "look_for": "VLAN list on both peers -- all VLANs expected to carry synced MACs must exist on both peers",
+          "confirms_if": "Missing VLANs on one peer confirms VLAN mismatch as the cause of MAC sync failure for those VLANs"
+        }
+      ]
+    },
+    {
+      "scenario": "Orphan port traffic issues during failover",
+      "description": "Orphan ports are single-homed devices connected to only one MC-LAG peer (not dual-homed across both). During failover (when the peer that owns the orphan port loses connectivity), traffic to and from the orphan device must traverse the peer link to reach the active peer. If the peer link is also down, or if iccpd has isolated the orphan ports as a split-brain avoidance measure, the orphan device completely loses network connectivity. This is a topology vulnerability inherent to MC-LAG architectures.",
+      "symptoms": [
+        "Single-homed devices behind one MC-LAG peer lose connectivity during or after failover",
+        "'show mclag' shows orphan port isolation is active",
+        "Traffic from orphan ports is not reaching the uplink network",
+        "MACs learned on orphan ports are not visible on the peer",
+        "ICMP to orphan-side hosts fails from the network while dual-homed hosts remain reachable"
+      ],
+      "root_causes": [
+        "Peer link is down and iccpd isolated orphan ports to prevent looping (correct behavior but service-impacting)",
+        "iccpd triggered split-brain avoidance by disabling orphan ports on the secondary node when keepalive is lost",
+        "Orphan port MAC entries not synchronized to the peer before the failover occurred",
+        "ARP entries for orphan port hosts not synchronized -- remote peer cannot route to orphan hosts",
+        "Network design has no redundancy for orphan ports -- single point of failure by design"
+      ],
+      "resolution": [
+        "Check orphan port isolation status: 'show mclag' -- look for isolated port list",
+        "If split-brain avoidance isolated ports unnecessarily, investigate and restore keepalive path first",
+        "Verify ARP sync for orphan hosts: 'show arp' on both peers -- orphan host IPs should appear on both",
+        "Check STATE_DB for orphan port list: 'redis-cli -n 6 HGETALL \"MCLAG_TABLE|<domain>\"'",
+        "For persistent orphan port issues: consider converting orphan ports to dual-homed connections (requires physical cabling changes)",
+        "After restoring keepalive and peer link: 'show mclag' to confirm orphan ports are no longer isolated"
+      ],
+      "verify_commands": [
+        {
+          "command": "show mclag",
+          "look_for": "Isolated ports list or orphan port status -- any ports shown as isolated indicate failover protection is active",
+          "confirms_if": "Ports listed as isolated confirm iccpd has disabled them due to split-brain avoidance"
+        },
+        {
+          "command": "show arp | grep <orphan-host-ip>",
+          "look_for": "ARP entry for the orphan host on both peers -- must be present on both for routed traffic to work",
+          "confirms_if": "Missing ARP entry on the non-owning peer confirms ARP sync failure for orphan hosts"
+        },
+        {
+          "command": "redis-cli -n 6 HGETALL 'MCLAG_TABLE|<domain-id>'",
+          "look_for": "isolated_peer_link_ports or similar field indicating port isolation state",
+          "confirms_if": "Non-empty isolated port list in STATE_DB confirms iccpd-driven port isolation is active"
+        },
+        {
+          "command": "show mclag | grep -i orphan",
+          "look_for": "Orphan port list and their current status (up/isolated)",
+          "confirms_if": "Orphan ports shown as isolated directly confirms the connectivity loss mechanism"
+        }
+      ]
+    },
+    {
+      "scenario": "Split-brain -- both peers claim active role simultaneously",
+      "description": "Both the keepalive link and the peer link have failed simultaneously (or in rapid succession), leaving both MC-LAG peers isolated from each other. Each peer independently determines the other is dead and asserts the active role. Both peers program identical MAC and ARP entries and both forward traffic for all MC-LAG clients. This results in duplicate packets being sent to hosts, MAC table thrashing on upstream switches, and potential forwarding loops. Split-brain is the highest-severity MC-LAG failure mode.",
+      "symptoms": [
+        "'show mclag brief' on both peers shows both as active/primary with session down",
+        "Upstream switches see MAC addresses flapping between two different ports",
+        "Hosts connected to both peers may receive duplicate packets",
+        "Network performance degrades significantly due to MAC table instability upstream",
+        "Both peers show MCLAG session state as down but both claim to be active",
+        "'show mclag' on both peers shows identical portchannel state but no peer session"
+      ],
+      "root_causes": [
+        "Single shared keepalive path (no redundancy) failed at the same time as the peer link",
+        "Management switch failure taking out both the keepalive path and management connectivity",
+        "Cabling error: peer link and keepalive link both route through the same physical path",
+        "Software bug causing iccpd to declare peer dead even when keepalive is borderline (jitter sensitivity)",
+        "Network partition affecting both the data plane peer link and the management keepalive path",
+        "Both peers rebooted simultaneously and neither could contact the other on startup"
+      ],
+      "resolution": [
+        "Immediately identify which peer is the intended primary (higher system priority or lower system MAC)",
+        "Manually shut down the secondary peer's MC-LAG portchannels to stop duplicate forwarding",
+        "Restore at least one path (keepalive or peer link) between the two peers",
+        "Once ICCP session re-establishes, verify role election: 'show mclag | grep role'",
+        "After recovery, audit the keepalive and peer link design for single points of failure",
+        "Add a secondary keepalive path via a different interface or VLAN to prevent future split-brain"
+      ],
+      "verify_commands": [
+        {
+          "command": "show mclag brief",
+          "look_for": "Run on both peers -- if both show 'Active' role and session 'Down', split-brain is confirmed",
+          "confirms_if": "Both peers showing Active role with no established session confirms split-brain"
+        },
+        {
+          "command": "show mclag | grep -E 'role|session|keepalive|peer'",
+          "look_for": "Role field on both peers; session state; peer link state; keepalive state",
+          "confirms_if": "Both peers showing active role with all paths down confirms full split-brain condition"
+        },
+        {
+          "command": "show mac address-table | grep <mclag-portchannel>",
+          "look_for": "On upstream switches: same MAC address appearing on two different ports (MAC flapping indicator)",
+          "confirms_if": "MAC flapping on upstream devices directly confirms both peers are forwarding for the same hosts"
+        },
+        {
+          "command": "redis-cli -n 6 HGETALL 'MCLAG_TABLE|<domain-id>'",
+          "look_for": "local_role field showing active/primary on both peers; peer session status showing down",
+          "confirms_if": "Both peers with local_role=active and peer_session_status=down in STATE_DB confirms split-brain"
+        },
+        {
+          "command": "docker exec teamd cat /var/log/iccpd/iccpd.log | grep -E 'split|brain|active|role' | tail -30",
+          "look_for": "Split-brain detection log messages or role transition to active without peer acknowledgment",
+          "confirms_if": "iccpd log entries showing unilateral active role assertion confirm the split-brain event"
+        }
+      ]
+    },
+    {
+      "scenario": "Traffic blackholing during failover -- stale forwarding entries",
+      "description": "After a MC-LAG peer fails, there is a window where forwarding entries on the surviving peer point to the failed peer via the peer link or contain stale next-hop information. During this window, traffic destined for hosts previously reached via the failed peer is dropped. The blackhole period lasts until: MAC entries for remote hosts are aged out or flushed, ARP entries synchronized from the failed peer are refreshed, and orchagent has reprogrammed the ASIC with updated forwarding entries. In SONiC this window can be 2-30 seconds depending on timing and configuration.",
+      "symptoms": [
+        "Traffic drops to specific hosts immediately following a MC-LAG peer failure",
+        "Drops are transient -- recover after MAC aging or ARP refresh",
+        "'show mac address-table' shows MAC entries pointing to the now-down peer link",
+        "Ping loss to specific hosts for 5-30 seconds after peer failure then recovery",
+        "ASIC_DB shows FDB entries pointing to the peer link portchannel that is down"
+      ],
+      "root_causes": [
+        "Stale FDB entries pointing to peer link portchannel not flushed after peer link went down",
+        "ARP entries synchronized from the failed peer still in the ASIC neighbor table",
+        "MAC aging timer has not expired for entries learned through the peer link",
+        "orchagent delayed in processing FDB flush notifications from mclagsyncd",
+        "Hosts behind the failed peer have not re-ARPed to update the surviving peer's tables",
+        "iccpd flush of remote MAC entries delayed due to high STATE_DB update latency"
+      ],
+      "resolution": [
+        "Verify FDB flush after failover: 'show mac address-table' -- peer link MACs should flush within MAC aging time",
+        "Check APPL_DB FDB flush events: 'redis-cli -n 0 KEYS \"FDB_TABLE*\"' after failover",
+        "Manually flush stale MACs if needed: 'sonic-clear fdb all' (disruptive -- causes temporary flooding)",
+        "Check ARP table for stale entries: 'show arp' and look for entries via peer link",
+        "Reduce MAC aging time to accelerate recovery: 'config mac aging_time <seconds>' in CONFIG_DB",
+        "Check orchagent processing latency: 'docker logs swss 2>&1 | grep -i fdb | tail -50'"
+      ],
+      "verify_commands": [
+        {
+          "command": "show mac address-table | grep <peer-link-portchannel>",
+          "look_for": "MAC entries still pointing to the peer link portchannel after peer failure",
+          "confirms_if": "MAC entries pointing to the down peer link confirm stale FDB entries causing the blackhole"
+        },
+        {
+          "command": "redis-cli -n 0 KEYS 'FDB_TABLE:*' | wc -l",
+          "look_for": "Count of FDB entries; should decrease after peer failure as remote MACs are flushed",
+          "confirms_if": "Unchanged FDB count after peer failure confirms stale entries are not being flushed"
+        },
+        {
+          "command": "show arp | grep <stale-host-ip>",
+          "look_for": "ARP entries for hosts that were behind the failed peer, showing peer link as egress",
+          "confirms_if": "ARP entries with peer link as egress interface after peer failure confirm stale ARP/neighbor entries"
+        },
+        {
+          "command": "docker logs swss 2>&1 | grep -i 'fdb.*flush\\|flush.*fdb' | tail -20",
+          "look_for": "FDB flush events triggered by MC-LAG failover notification",
+          "confirms_if": "Absence of FDB flush log entries after peer failure confirms orchagent did not receive or process the flush trigger"
+        }
+      ]
+    },
+    {
+      "scenario": "ICCP session establishment failure -- TCP or config mismatch",
+      "description": "iccpd on one or both peers cannot establish the ICCP TCP session. The MC-LAG domain is configured in CONFIG_DB on both peers but 'show mclag brief' shows the session as down or never established. This is a bootstrap failure -- without the ICCP session, no MAC sync, port state sync, or coordinated failover is possible. Each peer operates independently without knowledge of the other's state.",
+      "symptoms": [
+        "'show mclag brief' shows MCLAG session state as 'down' on one or both peers",
+        "iccpd is running but session never reaches established state",
+        "'sudo ss -tnp | grep 8888' shows no ESTABLISHED connection between peers",
+        "iccpd logs show repeated connection attempts with failure messages",
+        "No MAC entries from the remote peer appear in the local FDB"
+      ],
+      "root_causes": [
+        "Peer IP (source_ip or peer_ip) misconfigured in MCLAG_DOMAIN CONFIG_DB entry",
+        "Keepalive interface is down or not configured",
+        "TCP port 8888 blocked by iptables or ACL between the two peers",
+        "iccpd domain-id mismatch between the two peers (must be identical)",
+        "iccpd process not running on one or both peers",
+        "System MAC mismatch -- peers have different mclag_system_mac configured",
+        "Both peers configured as the same role (both primary) -- role conflict preventing session"
+      ],
+      "resolution": [
+        "Check iccpd is running: 'docker exec teamd supervisorctl status iccpd'",
+        "Verify CONFIG_DB MCLAG_DOMAIN entries match on both peers: 'redis-cli -n 4 HGETALL \"MCLAG_DOMAIN|<id>\"'",
+        "Test TCP connectivity: 'nc -zv <peer-ip> 8888' from each peer",
+        "Check iptables for port 8888: 'sudo iptables -L -n | grep 8888'",
+        "Verify system MAC config: 'redis-cli -n 4 HGETALL \"MCLAG_DOMAIN|<id>\"' -- mclag_system_mac must match",
+        "Check iccpd startup logs: 'docker exec teamd cat /var/log/iccpd/iccpd.log | head -100'",
+        "If domain-id mismatch: correct via 'config mclag' CLI and restart iccpd"
+      ],
+      "verify_commands": [
+        {
+          "command": "show mclag brief",
+          "look_for": "MCLAG session state -- 'Down' with iccpd running indicates TCP or config failure",
+          "confirms_if": "Session Down state while iccpd is running confirms TCP connectivity or config mismatch"
+        },
+        {
+          "command": "sudo ss -tnp | grep 8888",
+          "look_for": "ESTABLISHED TCP connection to peer IP on port 8888; SYN-SENT indicates TCP not completing",
+          "confirms_if": "No ESTABLISHED entry on port 8888 confirms ICCP TCP session is not up"
+        },
+        {
+          "command": "redis-cli -n 4 HGETALL 'MCLAG_DOMAIN|<domain-id>'",
+          "look_for": "source_ip, peer_ip, domain_id, mclag_system_mac fields -- compare against peer's CONFIG_DB",
+          "confirms_if": "Mismatched domain_id or mclag_system_mac between peers confirms configuration mismatch as root cause"
+        },
+        {
+          "command": "docker exec teamd supervisorctl status iccpd",
+          "look_for": "iccpd process status -- must be RUNNING for ICCP session to work",
+          "confirms_if": "iccpd not in RUNNING state confirms daemon failure as the root cause"
+        },
+        {
+          "command": "sudo iptables -L -n | grep 8888",
+          "look_for": "DROP or REJECT rules matching port 8888",
+          "confirms_if": "Matching DROP rule on port 8888 confirms firewall is blocking the ICCP TCP connection"
+        },
+        {
+          "command": "docker exec teamd cat /var/log/iccpd/iccpd.log | tail -50",
+          "look_for": "Connection refused, timeout, config mismatch, or domain-id error messages",
+          "confirms_if": "Specific error messages in iccpd log identify whether the failure is TCP connectivity, config, or protocol mismatch"
+        }
+      ]
+    },
+    {
+      "scenario": "LAG member state inconsistency -- peers show different portchannel membership",
+      "description": "The two MC-LAG peers have different views of the member ports that are active in a shared MC-LAG portchannel. For example, Peer A thinks PortChannel10 has members Ethernet0 and Ethernet4 both up, while Peer B thinks only Ethernet0 is up. This inconsistency means the LACP key and system ID advertised to the downstream device may not match, causing the downstream LAG to select suboptimal members or flap. In SONiC this is typically caused by a stale ICCP port sync TLV or a teamd/LACP failure on one peer.",
+      "symptoms": [
+        "'show mclag' shows different local and remote portchannel member states for the same MCLAG",
+        "'show lacp neighbor' shows different partner counts on the two peers for the same portchannel",
+        "Downstream devices show LAG instability or member port flapping",
+        "Traffic from the downstream device is not load-balanced as expected",
+        "ICCP port config TLVs are being sent but not applied on the receiving peer"
+      ],
+      "root_causes": [
+        "LACP PDU not reaching one or more member ports -- cable or optical issue on specific member",
+        "teamd not running or failed to process LACP PDUs for specific portchannel members",
+        "LACP key mismatch: member ports on one peer have a different LACP key than the other peer's members for the same MC-LAG",
+        "LACP actor timeout mismatch: one peer uses fast LACP (1s PDU) and the other uses slow LACP (30s PDU)",
+        "Port config TLV from peer not processed by local iccpd/mclagsyncd",
+        "Physical member port failure on one peer not synchronized to the other peer before MAC flush"
+      ],
+      "resolution": [
+        "Check portchannel state on both peers: 'show interfaces portchannel <pc>' and compare output",
+        "Check LACP configuration: 'show lacp' -- verify lacp-key, actor-priority match on both peers",
+        "Verify LACP PDU exchange on each member: 'show lacp neighbor' -- all members should show partner info",
+        "Check LACP fast/slow mode: both peers must agree on LACP timeout mode per member port",
+        "Verify iccpd port sync: check 'show mclag' output for remote_portchannel_status field",
+        "If specific member stuck down: 'show interfaces status <port>' and check physical layer",
+        "Trigger re-sync by restarting iccpd: 'docker exec teamd supervisorctl restart iccpd' (brief MCLAG session disruption)"
+      ],
+      "verify_commands": [
+        {
+          "command": "show mclag",
+          "look_for": "Local vs remote portchannel member state for each MCLAG interface -- they should match",
+          "confirms_if": "Differing local and remote member states for the same MCLAG portchannel confirms state inconsistency"
+        },
+        {
+          "command": "show lacp neighbor",
+          "look_for": "Partner system ID and partner key for each portchannel member -- should be identical across both peers' members on the same MCLAG",
+          "confirms_if": "Different partner counts or missing partner entries on one peer confirms LACP state inconsistency"
+        },
+        {
+          "command": "show interfaces portchannel <portchannel-id>",
+          "look_for": "Member port list and operational status of each member",
+          "confirms_if": "Member port count or state differs between the two peers' portchannel output for the same MCLAG"
+        },
+        {
+          "command": "docker logs teamd 2>&1 | grep -E 'lacp|portchannel|member' | tail -50",
+          "look_for": "LACP negotiation errors, member port state transitions, or teamd processing errors",
+          "confirms_if": "LACP error messages for specific member ports confirm the physical or negotiation issue causing inconsistency"
+        },
+        {
+          "command": "redis-cli -n 6 HGETALL 'MCLAG_REMOTE_INTF_TABLE|<domain-id>|<portchannel-id>'",
+          "look_for": "Remote portchannel operational status and member list as seen by iccpd",
+          "confirms_if": "Stale or incorrect remote interface data in STATE_DB confirms ICCP port sync TLV was not applied correctly"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "type": "daemon",
+      "name": "iccpd (teamd container)",
+      "description": "Inter-Chassis Communication Protocol daemon. Manages the ICCP session between MC-LAG peers, exchanges port state TLVs, and coordinates MAC/ARP synchronization. Runs inside the 'teamd' Docker container in SONiC. The central daemon for all MC-LAG protocol operations."
+    },
+    {
+      "type": "daemon",
+      "name": "mclagsyncd (teamd container)",
+      "description": "MC-LAG synchronization daemon. Acts as the bridge between iccpd and the SONiC database infrastructure. Reads iccpd's peer state updates and publishes them to APPL_DB and STATE_DB. Also reads CONFIG_DB MCLAG tables and passes configuration to iccpd. Required for MAC sync to reach orchagent."
+    },
+    {
+      "type": "daemon",
+      "name": "teammgrd (teamd container)",
+      "description": "Team manager daemon. Manages LACP portchannel configuration, translating CONFIG_DB PORTCHANNEL entries into the Linux team driver (or kernel bond) configuration. Required for MC-LAG portchannel members to be correctly configured with the shared LACP system MAC."
+    },
+    {
+      "type": "daemon",
+      "name": "teamsyncd (teamd container)",
+      "description": "Team synchronization daemon. Monitors LACP portchannel operational state via netlink and publishes member port state changes to APPL_DB and STATE_DB. iccpd relies on teamsyncd's STATE_DB updates to detect member port changes and synchronize them to the peer via ICCP port config TLVs."
+    },
+    {
+      "type": "daemon",
+      "name": "orchagent (swss container)",
+      "description": "Consumes APPL_DB FDB_TABLE entries published by mclagsyncd for remote MAC synchronization, and translates them into SAI API calls for ASIC FDB programming. Also processes ARP table updates for orphan host reachability."
+    },
+    {
+      "type": "network",
+      "name": "Peer link portchannel",
+      "description": "A dedicated portchannel between the two MC-LAG peers that carries inter-chassis traffic including orphan port traffic, BUM traffic, and MAC sync control traffic. Must be a portchannel (LAG) for redundancy. Typically carries all VLANs that the MC-LAG serves as a trunk."
+    },
+    {
+      "type": "network",
+      "name": "Keepalive link",
+      "description": "A separate dedicated link (typically management or a dedicated data port) used exclusively for ICCP session keepalive messages. Must be physically separate from the peer link to avoid both paths failing simultaneously. If only a single path exists for both peer link and keepalive, split-brain risk is high."
+    },
+    {
+      "type": "database",
+      "name": "CONFIG_DB (Redis DB 4)",
+      "description": "Source of truth for MC-LAG configuration: MCLAG_DOMAIN, MCLAG_INTERFACE tables. mclagsyncd reads from here to configure iccpd. Must be identical on both peers for the ICCP session to establish."
+    },
+    {
+      "type": "database",
+      "name": "APPL_DB (Redis DB 0)",
+      "description": "Publication bus for MAC and ARP sync entries from mclagsyncd to orchagent. FDB_TABLE entries for remote MACs are written here by mclagsyncd and consumed by orchagent for ASIC programming."
+    },
+    {
+      "type": "database",
+      "name": "STATE_DB (Redis DB 6)",
+      "description": "Operational state store for MC-LAG. MCLAG_TABLE and MCLAG_REMOTE_INTF_TABLE in STATE_DB hold the current session state, peer status, orphan port list, and remote portchannel state. Used by monitoring tools and by iccpd/mclagsyncd for state coordination."
+    }
+  ],
+  "config_db_tables": [
+    {
+      "table": "MCLAG_DOMAIN",
+      "key_pattern": "MCLAG_DOMAIN|<domain-id>",
+      "relevant_fields": [
+        "source_ip: local IP address for the ICCP session (must be reachable from peer over keepalive link)",
+        "peer_ip: remote peer IP address for the ICCP session",
+        "peer_link: portchannel interface name used as the peer link (e.g., PortChannel1)",
+        "keepalive_interval: ICCP keepalive send interval in seconds (default 1)",
+        "session_timeout: ICCP session timeout in seconds (default 15; must be > keepalive_interval)",
+        "mclag_system_mac: common LACP system MAC address used on all MC-LAG portchannels (must match on both peers)"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'MCLAG_DOMAIN|<domain-id>'",
+      "redis_command": "redis-cli -n 4 KEYS 'MCLAG_DOMAIN*'"
+    },
+    {
+      "table": "MCLAG_INTERFACE",
+      "key_pattern": "MCLAG_INTERFACE|<domain-id>|<portchannel-name>",
+      "relevant_fields": [
+        "if_name: portchannel interface name participating in this MCLAG domain (e.g., PortChannel10)"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'MCLAG_INTERFACE|<domain-id>|<portchannel>'",
+      "redis_command": "redis-cli -n 4 KEYS 'MCLAG_INTERFACE*'"
+    },
+    {
+      "table": "PORTCHANNEL",
+      "key_pattern": "PORTCHANNEL|<portchannel-name>",
+      "relevant_fields": [
+        "admin_status: administrative state (up/down)",
+        "mtu: maximum transmission unit",
+        "lacp_key: LACP key (must match on both peers for the same MC-LAG portchannel)",
+        "min_links: minimum number of member ports required for portchannel to be up",
+        "fast_rate: LACP PDU rate -- fast (1s) or slow (30s)"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'PORTCHANNEL|<portchannel>'",
+      "redis_command": "redis-cli -n 4 KEYS 'PORTCHANNEL|*'"
+    },
+    {
+      "table": "PORTCHANNEL_MEMBER",
+      "key_pattern": "PORTCHANNEL_MEMBER|<portchannel-name>|<interface-name>",
+      "relevant_fields": [
+        "(key only -- presence of key indicates this interface is a member of the portchannel)"
+      ],
+      "verify_command": "redis-cli -n 4 KEYS 'PORTCHANNEL_MEMBER|<portchannel>|*'",
+      "redis_command": "redis-cli -n 4 KEYS 'PORTCHANNEL_MEMBER*'"
+    },
+    {
+      "table": "MCLAG_TABLE (STATE_DB)",
+      "key_pattern": "MCLAG_TABLE|<domain-id>",
+      "relevant_fields": [
+        "oper_status: MCLAG domain operational state (up/down)",
+        "peer_link_if: peer link portchannel interface name",
+        "peer_link_oper_status: operational status of the peer link (up/down)",
+        "keepalive_oper_status: operational status of the keepalive link (up/down)",
+        "local_role: this peer's elected role (active/standby or primary/secondary)",
+        "system_mac: the LACP system MAC in use",
+        "peer_session_status: status of the ICCP session (established/down)"
+      ],
+      "verify_command": "redis-cli -n 6 HGETALL 'MCLAG_TABLE|<domain-id>'",
+      "redis_command": "redis-cli -n 6 KEYS 'MCLAG_TABLE*'"
+    },
+    {
+      "table": "MCLAG_REMOTE_INTF_TABLE (STATE_DB)",
+      "key_pattern": "MCLAG_REMOTE_INTF_TABLE|<domain-id>|<portchannel-name>",
+      "relevant_fields": [
+        "oper_status: operational status of this portchannel on the remote peer (up/down)",
+        "isolate_with_peer_link: whether this portchannel is isolated due to peer link being down (true/false)"
+      ],
+      "verify_command": "redis-cli -n 6 HGETALL 'MCLAG_REMOTE_INTF_TABLE|<domain-id>|<portchannel>'",
+      "redis_command": "redis-cli -n 6 KEYS 'MCLAG_REMOTE_INTF_TABLE*'"
+    }
+  ],
+  "sonic_notes": [
+    {
+      "note": "MC-LAG in SONiC is implemented via the iccpd daemon running inside the 'teamd' Docker container. iccpd implements a subset of ICCP (RFC 7275) with SONiC-specific extensions for MAC/ARP synchronization. The implementation is NOT a full RFC 7275 implementation -- only the features required for two-peer MC-LAG are implemented. Do not expect full ICCP interoperability with third-party ICCP implementations.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "sonic-buildimage:src/iccpd/"
+    },
+    {
+      "note": "The MC-LAG system MAC (mclag_system_mac in MCLAG_DOMAIN CONFIG_DB entry) is the single most critical configuration parameter and MUST be identical on both peers. This MAC is advertised as the LACP System ID to all downstream dual-homed devices. A mismatch causes the downstream device to see two different LACP System IDs on what should be a single LAG, resulting in the LAG splitting into two separate LAGs or flapping. Always verify this value on both peers when troubleshooting LACP issues on MC-LAG portchannels.",
+      "human_error_risk": "HIGH",
+      "source_ref": "sonic-buildimage:src/iccpd/ and SONiC MCLAG HLD"
+    },
+    {
+      "note": "In SONiC MC-LAG, configuration must be applied via 'config mclag ...' CLI commands or direct CONFIG_DB writes -- not via vtysh or teamd configuration files. The MCLAG_DOMAIN and MCLAG_INTERFACE tables in CONFIG_DB are the source of truth. mclagsyncd reads these tables and passes configuration to iccpd. Direct iccpd configuration file edits are overwritten on restart.",
+      "human_error_risk": "HIGH",
+      "source_ref": "SONiC MCLAG configuration guide and sonic-buildimage:src/sonic-utilities/mclagdctl/"
+    },
+    {
+      "note": "The keepalive link (used for ICCP session maintenance) must be physically separate from the peer link. If a single cable or switch carries both the peer link portchannel and the keepalive interface, a failure of that switch or cable will simultaneously kill both paths, causing guaranteed split-brain. Best practice is to route the keepalive path over the management network (eth0/Management0) so it is independent of the data plane.",
+      "human_error_risk": "HIGH",
+      "source_ref": "SONiC MCLAG design guide -- keepalive path redundancy recommendation"
+    },
+    {
+      "note": "SONiC MC-LAG does not use a dedicated control plane VLAN or STP for loop prevention across the peer link. Loop prevention relies on MAC address synchronization: if a MAC is learned locally, the remote peer will not flood traffic for that MAC over the peer link. If MAC sync fails (e.g., mclagsyncd crash), flooding over the peer link increases significantly and can saturate the peer link. Monitor peer link utilization as a health proxy for MAC sync.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "SONiC MCLAG HLD -- MAC sync design"
+    },
+    {
+      "note": "When a MC-LAG peer goes down, the surviving peer must flush all MAC addresses that were learned via the peer link for that peer's orphan ports. This flush triggers orchagent to remove ASIC FDB entries and allows the network to re-learn correct forwarding paths. The flush is triggered by iccpd -> mclagsyncd -> APPL_DB pipeline. If this flush is delayed or missed, traffic blackholing persists after failover. Check 'docker logs swss 2>&1 | grep fdb' to verify flush events.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "sonic-buildimage:src/iccpd/ flush handling and sonic-swss:orchagent/fdborch.cpp"
+    },
+    {
+      "note": "MC-LAG in SONiC supports an 'active-active' forwarding model where both peers forward traffic for dual-homed clients simultaneously. There is no spanning tree blocking. This means VLAN configuration must be identical on both peers -- any VLAN missing from one peer that exists on the other will cause asymmetric MAC learning and forwarding failures for that VLAN. Run 'show vlan brief' on both peers and compare the VLAN lists before troubleshooting other issues.",
+      "human_error_risk": "HIGH",
+      "source_ref": "SONiC MCLAG active-active forwarding design"
+    },
+    {
+      "note": "The 'show mclag' and 'show mclag brief' commands read from STATE_DB (Redis DB 6). If iccpd or mclagsyncd has crashed and STATE_DB entries are stale, these commands may show outdated information. Always cross-check with 'docker exec teamd supervisorctl status' and 'sudo ss -tnp | grep 8888' for current daemon and TCP connection state.",
+      "human_error_risk": "LOW",
+      "source_ref": "sonic-utilities:show/mclag.py"
+    }
+  ],
+  "sonic_frr_mapping": {
+    "frr_process": "N/A (MC-LAG is not FRR-managed; uses iccpd and teamd)",
+    "frr_config_file": "N/A",
+    "bgpcfgd_source": "N/A",
+    "config_managed_by": "mclagsyncd (reads CONFIG_DB MCLAG_DOMAIN and MCLAG_INTERFACE tables and passes to iccpd)",
+    "container": "teamd",
+    "iccp_port": "TCP 8888 (ICCP session between peers)",
+    "iccpd_log": "/var/log/iccpd/iccpd.log (inside teamd container)",
+    "supervisor_config": "/etc/supervisor/conf.d/iccpd.conf (inside teamd container)"
+  },
+  "key_commands": [
+    "show mclag brief",
+    "show mclag",
+    "show mclag | grep -E 'session|role|keepalive|peer'",
+    "show interfaces portchannel",
+    "show lacp neighbor",
+    "show mac address-table",
+    "show arp",
+    "docker exec teamd supervisorctl status",
+    "docker exec teamd cat /var/log/iccpd/iccpd.log | tail -50",
+    "docker logs teamd 2>&1 | grep -E 'ERROR|mclag|iccp' | tail -30",
+    "redis-cli -n 4 HGETALL 'MCLAG_DOMAIN|<domain-id>'",
+    "redis-cli -n 4 KEYS 'MCLAG_DOMAIN*'",
+    "redis-cli -n 4 KEYS 'MCLAG_INTERFACE*'",
+    "redis-cli -n 6 HGETALL 'MCLAG_TABLE|<domain-id>'",
+    "redis-cli -n 6 KEYS 'MCLAG_REMOTE_INTF_TABLE*'",
+    "redis-cli -n 0 KEYS 'FDB_TABLE:*' | wc -l",
+    "sudo ss -tnp | grep 8888",
+    "ping <peer-ip> -I <keepalive-interface> -c 5",
+    "show vlan brief",
+    "show interfaces status",
+    "show interfaces transceiver eeprom <port>",
+    "docker logs swss 2>&1 | grep -i fdb | tail -30"
+  ],
+  "related_protocols": [
+    "lacp",
+    "stp",
+    "bgp-4"
+  ],
+  "tags": [
+    "multi-chassis",
+    "lag",
+    "redundancy",
+    "iccp",
+    "mclag",
+    "dual-homing",
+    "active-active"
+  ]
+}

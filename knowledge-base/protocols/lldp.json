@@ -1,0 +1,663 @@
+{
+  "protocol_id": "lldp",
+  "protocol_name": "LLDP",
+  "protocol_family": "adjacency",
+  "standard": "IEEE 802.1AB",
+  "category": "adjacency",
+  "purpose": "Link Layer Discovery Protocol for neighbor and topology discovery -- advertises device identity, capabilities, and port information to directly connected neighbors over Ethernet",
+  "operates_at": "Layer 2",
+  "transport": "Ethernet (EtherType 0x88CC, multicast 01:80:C2:00:00:0E)",
+  "def_refs": [
+    "daemon:lldpsyncd",
+    "daemon:lldpmgrd",
+    "daemon:orchagent",
+    "timer:lldp-tx-interval",
+    "timer:lldp-tx-hold",
+    "timer:lldp-reinit-delay",
+    "db:config_db",
+    "db:appl_db",
+    "db:state_db"
+  ],
+  "states": [
+    {
+      "name": "DISABLED",
+      "description": "LLDP is administratively disabled on the port. The port will not transmit or process LLDP frames. In SONiC this state is entered when lldp_enabled is set to false in CONFIG_DB PORT table or when the port is admin-down. lldpd does not register the interface for LLDP operation.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "show lldp table",
+        "redis-cli -n 4 HGETALL 'PORT|<ifname>'",
+        "docker exec lldp lldpcli show neighbors"
+      ]
+    },
+    {
+      "name": "INIT",
+      "description": "LLDP port state machine has been initialized. The reinit-delay timer is running before the first LLDP frame is transmitted. This prevents rapid LLDP frame bursts when a port comes up. The port listens for incoming LLDP frames during this window. In SONiC, lldpmgrd triggers this transition when it detects a port-up event from CONFIG_DB.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "docker exec lldp lldpcli show neighbors",
+        "docker exec lldp supervisorctl status lldpd"
+      ]
+    },
+    {
+      "name": "TX_WAIT",
+      "description": "The reinit-delay has expired and lldpd is waiting for the tx-interval timer before sending the first LLDP frame. The port is actively listening for LLDP frames from the neighbor. This is a brief transient state before the first transmission.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "docker exec lldp lldpcli show neighbors",
+        "sudo tcpdump -i <ifname> ether proto 0x88cc -c 5"
+      ]
+    },
+    {
+      "name": "TX",
+      "description": "lldpd is transmitting LLDP frames at the configured tx-interval. The port is sending LLDPDUs containing the local device's TLVs to the multicast address 01:80:C2:00:00:0E. Frames are also being received and processed from the neighbor. This is the normal operating state for an LLDP-enabled port with a connected neighbor.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "show lldp neighbors <ifname>",
+        "docker exec lldp lldpcli show neighbors",
+        "sudo tcpdump -i <ifname> ether proto 0x88cc -c 5"
+      ]
+    },
+    {
+      "name": "NEIGHBOR_PRESENT",
+      "description": "At least one valid LLDP neighbor has been discovered on the port. The neighbor entry is cached by lldpd with a TTL equal to tx-interval * tx-hold-multiplier. lldpsyncd has published the neighbor information to STATE_DB LLDP_ENTRY table. This is the fully operational steady state for a connected LLDP port.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "show lldp neighbors",
+        "show lldp table",
+        "redis-cli -n 6 HGETALL 'LLDP_ENTRY_TABLE|<ifname>'",
+        "docker exec lldp lldpcli show neighbors"
+      ]
+    },
+    {
+      "name": "NEIGHBOR_AGED_OUT",
+      "description": "A previously discovered LLDP neighbor entry has exceeded its TTL (tx-interval * tx-hold-multiplier) without being refreshed. lldpd removes the neighbor from its cache and lldpsyncd deletes the STATE_DB LLDP_ENTRY entry. This can indicate a link failure, a neighbor reboot, or the neighbor has disabled LLDP.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "show lldp table",
+        "show interface status <ifname>",
+        "redis-cli -n 6 KEYS 'LLDP_ENTRY_TABLE|<ifname>'",
+        "docker exec lldp lldpcli show neighbors"
+      ]
+    }
+  ],
+  "transitions": [
+    {
+      "from_state": "DISABLED",
+      "to_state": "INIT",
+      "trigger": "Port admin-up event received; lldpmgrd sets lldp_enabled in CONFIG_DB; lldpd registers the interface for LLDP operation and starts reinit-delay timer",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "INIT",
+      "to_state": "TX_WAIT",
+      "trigger": "reinit-delay timer expires (default 2s); port is now eligible to transmit LLDP frames; tx-interval timer started",
+      "failure_if_stuck": "lldpd not running, or port removed from lldpd interface list before reinit completed"
+    },
+    {
+      "from_state": "TX_WAIT",
+      "to_state": "TX",
+      "trigger": "tx-interval timer fires; lldpd constructs LLDPDU from local TLVs and sends to 01:80:C2:00:00:0E multicast; continues transmitting at tx-interval",
+      "failure_if_stuck": "CoPP rate-limiting LLDP egress, or lldpd cannot bind to the interface (e.g., interface in LAG and LLDP not enabled on LAG member)"
+    },
+    {
+      "from_state": "TX",
+      "to_state": "NEIGHBOR_PRESENT",
+      "trigger": "Valid LLDPDU received from neighbor; lldpd parses mandatory TLVs (chassis ID, port ID, TTL) and stores neighbor entry; lldpsyncd publishes to STATE_DB",
+      "failure_if_stuck": "CoPP dropping incoming LLDP frames, neighbor not sending LLDP, or lldpsyncd not running"
+    },
+    {
+      "from_state": "NEIGHBOR_PRESENT",
+      "to_state": "NEIGHBOR_AGED_OUT",
+      "trigger": "Neighbor TTL expires without receiving a refresh LLDPDU (ttl = tx-interval * tx-hold-multiplier); lldpd ages out the entry and notifies lldpsyncd",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "NEIGHBOR_AGED_OUT",
+      "to_state": "TX",
+      "trigger": "Port is still physically up and lldpd continues transmitting; waiting for neighbor to send a new LLDPDU to repopulate the entry",
+      "failure_if_stuck": "Neighbor disabled LLDP, cable replaced with non-LLDP device, or CoPP rate-limiting inbound LLDP frames"
+    },
+    {
+      "from_state": "NEIGHBOR_PRESENT",
+      "to_state": "DISABLED",
+      "trigger": "Port admin-down or lldp_enabled set to false; lldpd sends LLDPDU with TTL=0 (shutdown TLV) to notify neighbor, then removes port from operation",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "TX",
+      "to_state": "DISABLED",
+      "trigger": "Port admin-down event; lldpmgrd detects port state change and instructs lldpd to stop LLDP on that interface",
+      "failure_if_stuck": ""
+    }
+  ],
+  "timers": [
+    {
+      "name": "tx-interval",
+      "description": "Interval between consecutive LLDP frame transmissions on a port. Determines how frequently the local device advertises its presence and TLV information to neighbors. Also controls the base value for TTL calculation (TTL = tx-interval * tx-hold-multiplier).",
+      "default": "30s (IEEE 802.1AB default)",
+      "range": "5-32768s",
+      "on_expiry": "lldpd transmits a new LLDPDU on all active LLDP-enabled ports",
+      "sonic_default": "30s",
+      "sonic_config_path": "CONFIG_DB DEVICE_METADATA|localhost: lldp_tx_interval field; also configurable via 'config lldp interval <seconds>'",
+      "sonic_frr_path": "N/A -- LLDP is not managed by FRR in SONiC",
+      "tuning_advice": "Lower for faster topology discovery in dynamic environments (e.g., 10s). Increasing reduces CPU and bandwidth overhead on large port-count switches. TTL automatically adjusts with this value."
+    },
+    {
+      "name": "tx-hold-multiplier",
+      "description": "Multiplied by tx-interval to compute the TTL advertised in LLDP frames. Neighbors age out the local device entry after TTL seconds without a refresh. Higher values mean neighbors hold stale entries longer after a failure.",
+      "default": "4 (IEEE 802.1AB default; TTL = 30 * 4 = 120s)",
+      "range": "2-10",
+      "on_expiry": "N/A -- this is a multiplier, not a countdown timer; TTL = tx-interval * tx-hold is encoded in each LLDPDU",
+      "sonic_default": "4",
+      "sonic_config_path": "CONFIG_DB DEVICE_METADATA|localhost: lldp_tx_hold field; also configurable via 'config lldp hold <multiplier>'",
+      "sonic_frr_path": "N/A",
+      "tuning_advice": "Increase to 6-8 if LLDP neighbors flap during normal traffic spikes (CoPP drops causing missed refreshes). Decrease to 2-3 for faster stale-entry cleanup in environments with frequent topology changes."
+    },
+    {
+      "name": "reinit-delay",
+      "description": "Minimum time to wait before transmitting the first LLDP frame after a port comes up or LLDP is re-enabled. Prevents LLDP frame bursts when many ports come up simultaneously (e.g., after a switch reboot).",
+      "default": "2s (IEEE 802.1AB default)",
+      "range": "1-10s",
+      "on_expiry": "Port transitions from INIT to TX_WAIT and may begin transmitting LLDPDUs",
+      "sonic_default": "2s",
+      "sonic_config_path": "Not directly exposed in CONFIG_DB; controlled by lldpd configuration generated by lldpmgrd",
+      "sonic_frr_path": "N/A",
+      "tuning_advice": "Generally leave at default. Only lower if fast LLDP neighbor discovery is required immediately after port-up events (e.g., automated cabling verification workflows)."
+    }
+  ],
+  "messages": [
+    {
+      "name": "LLDPDU (Link Layer Discovery Protocol Data Unit)",
+      "description": "The sole message type in LLDP. Sent as an Ethernet frame to the well-known multicast address 01:80:C2:00:00:0E with EtherType 0x88CC. Contains an ordered sequence of TLVs (Type-Length-Value) starting with three mandatory TLVs and ending with End-of-LLDPDU TLV. Each device transmits LLDPDUs at tx-interval and processes received LLDPDUs to build its neighbor table.",
+      "when_sent": "Periodically at tx-interval on every LLDP-enabled port; also sent immediately with TTL=0 (shutdown TLV sequence) when LLDP is administratively disabled on a port",
+      "key_fields": [
+        "Chassis ID TLV (Type 1, mandatory): uniquely identifies the transmitting device -- in SONiC typically the MAC address of the management port or a configured system identifier",
+        "Port ID TLV (Type 2, mandatory): identifies the specific port -- in SONiC typically the interface name (e.g., Ethernet0) or port MAC address",
+        "Time To Live TLV (Type 3, mandatory): TTL in seconds = tx-interval * tx-hold-multiplier; value 0 signals administrative shutdown",
+        "Port Description TLV (Type 4, optional): human-readable port description -- maps to interface description in SONiC CONFIG_DB",
+        "System Name TLV (Type 5, optional): device hostname -- taken from CONFIG_DB DEVICE_METADATA|localhost hostname field",
+        "System Description TLV (Type 6, optional): free-form text about the device -- SONiC includes OS version and platform info",
+        "System Capabilities TLV (Type 7, optional): bitmask of device capabilities (bridge, router, etc.) and which are enabled",
+        "Management Address TLV (Type 8, optional): management IP address(es) and interface index -- used for SNMP/NMS correlation",
+        "IEEE 802.1 OUI Extension TLVs: VLAN Name, Port VLAN ID, Link Aggregation (LAG membership)",
+        "IEEE 802.3 OUI Extension TLVs: MAC/PHY Configuration, Power via MDI, Link Aggregation, Maximum Frame Size",
+        "End-of-LLDPDU TLV (Type 0, mandatory): zero-length TLV marking end of the LLDPDU"
+      ]
+    }
+  ],
+  "failure_modes": [
+    {
+      "scenario": "No LLDP neighbors discovered on any port",
+      "description": "The switch is running but 'show lldp table' or 'show lldp neighbors' returns no entries. lldpd may not be running, all ports may be admin-down, CoPP may be dropping all inbound LLDP frames, or lldpsyncd may not be publishing neighbor data to STATE_DB. This is the most common LLDP failure and is often discovered when automated topology validation scripts return empty neighbor tables.",
+      "symptoms": [
+        "'show lldp table' returns no entries or an empty table",
+        "'docker exec lldp lldpcli show neighbors' returns 'No neighbor found'",
+        "redis-cli -n 6 KEYS 'LLDP_ENTRY_TABLE|*' returns empty",
+        "Neighbor switches show LLDP entries for their side of the link but this switch shows nothing",
+        "lldpd process shows as stopped or repeatedly restarting in 'docker exec lldp supervisorctl status'"
+      ],
+      "root_causes": [
+        "lldpd process not running inside the lldp container -- crash or supervisord not starting it",
+        "lldp Docker container itself is not running or is in a restart loop",
+        "All ports are admin-down -- lldpd does not transmit or receive on admin-down interfaces",
+        "CoPP (Control Plane Policing) rate-limiting or dropping LLDP frames destined for the CPU -- lldpd never sees incoming frames",
+        "lldpsyncd not running -- lldpd has neighbors in its cache but they are never published to STATE_DB",
+        "lldpmgrd not running -- lldpd has not been given the interface list from CONFIG_DB and is operating on no interfaces",
+        "Network device between switches filtering EtherType 0x88CC frames (some intermediate devices do not forward LLDP multicast)"
+      ],
+      "resolution": [
+        "Check lldp container: 'docker ps | grep lldp' -- should show Up status",
+        "Check all lldp processes: 'docker exec lldp supervisorctl status' -- lldpd, lldpsyncd, and lldpmgrd should all be RUNNING",
+        "Check port admin status: 'show interfaces status' -- verify ports are admin up",
+        "Check CoPP: 'show policer' or 'redis-cli -n 0 HGETALL \"COPP_TABLE:trap.group.lldp\"' for LLDP trap configuration",
+        "Capture LLDP frames on the wire: 'sudo tcpdump -i <ifname> ether proto 0x88cc -c 5' -- if frames appear here but not in lldp table, suspect CoPP or lldpsyncd",
+        "Check STATE_DB: 'redis-cli -n 6 KEYS \"LLDP_ENTRY_TABLE|*\"' -- if lldpd has neighbors but STATE_DB is empty, lldpsyncd is the issue",
+        "Restart lldp container if all processes appear stopped: 'sudo systemctl restart lldp'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker ps | grep lldp",
+          "look_for": "lldp container status -- should show 'Up' not 'Exited' or 'Restarting'",
+          "confirms_if": "Exited or Restarting status confirms lldp container is not running -- root cause of all LLDP failures"
+        },
+        {
+          "command": "docker exec lldp supervisorctl status",
+          "look_for": "lldpd, lldpsyncd, and lldpmgrd should all show RUNNING state",
+          "confirms_if": "Any process in STOPPED or FATAL state confirms that specific component is the failure point"
+        },
+        {
+          "command": "docker exec lldp lldpcli show neighbors",
+          "look_for": "'No neighbor found' vs actual neighbor entries -- distinguishes whether lldpd itself has no neighbors or whether lldpsyncd is failing to publish",
+          "confirms_if": "If lldpcli shows neighbors but 'show lldp table' is empty, lldpsyncd is the problem; if lldpcli also shows nothing, suspect CoPP or port state"
+        },
+        {
+          "command": "sudo tcpdump -i <ifname> ether proto 0x88cc -c 5",
+          "look_for": "LLDP frames arriving on the wire from the neighbor",
+          "confirms_if": "Frames seen by tcpdump but not appearing in lldp table confirms CoPP is dropping them before lldpd can process them"
+        },
+        {
+          "command": "redis-cli -n 6 KEYS 'LLDP_ENTRY_TABLE|*'",
+          "look_for": "List of interface keys with LLDP neighbor data in STATE_DB",
+          "confirms_if": "Empty STATE_DB when lldpd has neighbors confirms lldpsyncd is not publishing; populated STATE_DB rules out lldpsyncd as the issue"
+        },
+        {
+          "command": "show interfaces status",
+          "look_for": "Admin state column -- ports must be 'up' for LLDP to operate",
+          "confirms_if": "All ports showing admin-down explains why no LLDP neighbors are discovered"
+        }
+      ]
+    },
+    {
+      "scenario": "Stale LLDP neighbor entries -- old neighbors persist after cable swap",
+      "description": "After replacing a cable or moving a connection to a different neighbor, the old LLDP neighbor entry remains in the neighbor table instead of being replaced by the new neighbor. This causes topology confusion in NMS systems and can delay automated topology-validation workflows. The stale entry should age out after TTL (tx-interval * tx-hold-multiplier) seconds but this can take 2 minutes or more with default settings.",
+      "symptoms": [
+        "'show lldp neighbors <ifname>' shows the old neighbor's system name and chassis ID after a cable swap",
+        "NMS or topology discovery tools report incorrect neighbor relationships",
+        "New cable is physically connected and new neighbor is sending LLDP frames, but old entry is still shown",
+        "STATE_DB LLDP_ENTRY_TABLE still contains the old neighbor's data",
+        "'docker exec lldp lldpcli show neighbors' also shows the stale entry (not just a display/sync issue)"
+      ],
+      "root_causes": [
+        "LLDP TTL not yet expired -- default TTL is 120s (30s * 4); stale entry is expected until TTL countdown completes",
+        "Old neighbor sent a shutdown LLDPDU (TTL=0) but it was not received or was dropped by CoPP before lldpd could process it",
+        "lldpsyncd crashed and restarted, leaving a stale STATE_DB entry that was not cleaned up during the restart",
+        "lldpd process was restarted without flushing its neighbor cache, leaving orphan STATE_DB entries",
+        "New neighbor on the port is not sending LLDP frames yet (or has LLDP disabled), so the old entry simply ages out on TTL without being replaced"
+      ],
+      "resolution": [
+        "Wait for natural TTL expiry (up to 120s with defaults) -- this is normal behavior, not a bug",
+        "Force immediate flush: 'docker exec lldp lldpcli update ports' to trigger an immediate re-scan",
+        "Clear specific neighbor manually: 'docker exec lldp lldpcli pause' then 'lldpcli resume' to force a resync",
+        "Check if the new neighbor is actually sending LLDP: 'sudo tcpdump -i <ifname> ether proto 0x88cc -c 5'",
+        "If lldpsyncd left orphan entries: 'redis-cli -n 6 DEL \"LLDP_ENTRY_TABLE|<ifname>\"' (use with caution -- lldpsyncd will repopulate on next update)",
+        "Reduce tx-hold-multiplier to 2 if faster stale-entry cleanup is needed in high-churn environments: 'config lldp hold 2'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec lldp lldpcli show neighbors",
+          "look_for": "age field on each neighbor entry -- shows how many seconds since last LLDPDU was received; high age indicates the neighbor stopped sending",
+          "confirms_if": "Age close to TTL value confirms this is a normal TTL-expiry scenario, not a lldpsyncd bug"
+        },
+        {
+          "command": "redis-cli -n 6 HGETALL 'LLDP_ENTRY_TABLE|<ifname>'",
+          "look_for": "lldp_rem_sys_name, lldp_rem_port_id fields -- compare against expected new neighbor values",
+          "confirms_if": "Old system name still in STATE_DB confirms stale entry has not been replaced or aged out yet"
+        },
+        {
+          "command": "sudo tcpdump -i <ifname> ether proto 0x88cc -c 5",
+          "look_for": "Source MAC and system name in LLDP frames -- should show new neighbor after cable swap",
+          "confirms_if": "New neighbor's MAC in frames but old entry in table confirms lldpd is receiving but not yet replacing the cached entry (within TTL window)"
+        },
+        {
+          "command": "docker exec lldp lldpcli show statistics",
+          "look_for": "Frame discard and frame error counts per port -- elevated discards suggest CoPP dropping shutdown LLDPDUs",
+          "confirms_if": "High frame discard count on the affected port suggests CoPP may have dropped the old neighbor's shutdown LLDPDU"
+        }
+      ]
+    },
+    {
+      "scenario": "Missing or incorrect TLV information in LLDP neighbor entries",
+      "description": "LLDP neighbors are discovered and appear in 'show lldp table' but key TLV fields are wrong, empty, or missing: system name shows an IP address instead of hostname, port description is blank, or management address is not populated. This typically indicates a configuration issue on the local switch that prevents lldpd from correctly populating its own TLVs before advertising them.",
+      "symptoms": [
+        "'show lldp neighbors' shows neighbors but system name is blank or shows a raw MAC/IP instead of hostname",
+        "Port description field is empty in neighbor LLDP advertisements from this switch",
+        "Management address TLV is missing or shows the wrong IP address",
+        "Remote switches report incorrect system information for this SONiC device",
+        "NMS systems show wrong device identity despite LLDP being operational"
+      ],
+      "root_causes": [
+        "Hostname not configured in CONFIG_DB DEVICE_METADATA|localhost -- lldpd uses this for System Name TLV; defaults to a generic identifier if not set",
+        "Port description not set in CONFIG_DB PORT|<ifname> description field -- lldpd will advertise a blank or auto-generated port description",
+        "Management address not configured or lldpmgrd has not pushed the correct management IP to lldpd",
+        "lldpmgrd crashed or has not run since boot -- lldpd is running with stale or default TLV values not reflecting current CONFIG_DB state",
+        "lldp container was started before CONFIG_DB was fully populated (race condition at boot) -- lldpmgrd read incomplete configuration",
+        "Chassis ID type mismatch -- lldpd configured to use MAC address but NMS expects interface name or vice versa"
+      ],
+      "resolution": [
+        "Verify hostname: 'redis-cli -n 4 HGETALL \"DEVICE_METADATA|localhost\"' -- check hostname field",
+        "Set hostname if missing: 'sudo config hostname <name>' then verify lldpmgrd picks it up",
+        "Check port descriptions: 'redis-cli -n 4 HGETALL \"PORT|<ifname>\"' -- check description field",
+        "Restart lldpmgrd to force re-read of CONFIG_DB: 'docker exec lldp supervisorctl restart lldpmgrd'",
+        "Verify lldpd TLV state: 'docker exec lldp lldpcli show configuration' -- shows what lldpd has been told to advertise",
+        "Check lldpmgrd logs: 'docker exec lldp cat /var/log/lldpmgrd.log' or 'docker logs lldp 2>&1 | grep lldpmgrd'"
+      ],
+      "verify_commands": [
+        {
+          "command": "redis-cli -n 4 HGETALL 'DEVICE_METADATA|localhost'",
+          "look_for": "hostname field -- must be set for LLDP System Name TLV to advertise the correct hostname",
+          "confirms_if": "Empty or missing hostname field explains why neighbor switches see a generic identifier instead of the device hostname"
+        },
+        {
+          "command": "docker exec lldp lldpcli show configuration",
+          "look_for": "System description, hostname, capabilities, and management address lldpd has been configured to advertise",
+          "confirms_if": "Wrong or missing values here confirm lldpmgrd has not correctly pushed CONFIG_DB state to lldpd"
+        },
+        {
+          "command": "docker exec lldp supervisorctl status lldpmgrd",
+          "look_for": "lldpmgrd RUNNING state and uptime -- recently restarted lldpmgrd may not have completed its CONFIG_DB sync",
+          "confirms_if": "STOPPED or very recently restarted lldpmgrd explains why TLV values have not been updated"
+        },
+        {
+          "command": "sudo tcpdump -i <ifname> ether proto 0x88cc -c 3 -XX",
+          "look_for": "Raw LLDPDU content -- hex dump shows exact TLV values being transmitted; compare system name TLV to expected hostname",
+          "confirms_if": "LLDPDU in wire capture showing wrong system name confirms lldpd is advertising incorrect local TLVs"
+        },
+        {
+          "command": "docker logs lldp 2>&1 | grep -i lldpmgrd | tail -30",
+          "look_for": "CONFIG_DB subscription errors, template rendering failures, or lldpcli invocation failures in lldpmgrd output",
+          "confirms_if": "Error messages in lldpmgrd log confirm it failed to push correct TLV configuration to lldpd"
+        }
+      ]
+    },
+    {
+      "scenario": "lldpd process crash or excessive memory consumption",
+      "description": "The lldpd process inside the lldp container crashes repeatedly or consumes abnormally high memory, causing the container to be OOM-killed or lldpd to be continuously restarted by supervisord. This results in LLDP neighbor tables being intermittently empty or oscillating. lldpd is vulnerable to malformed LLDP frames from misbehaving neighbors and can also accumulate memory on very high port-count switches with many neighbors.",
+      "symptoms": [
+        "lldp neighbor table intermittently empty then repopulates -- oscillating LLDP state",
+        "'docker exec lldp supervisorctl status lldpd' shows lldpd STARTING or with frequent restart timestamps",
+        "'docker inspect lldp | grep RestartCount' shows non-zero restart count",
+        "'docker stats lldp --no-stream' shows abnormally high memory usage for the lldp container",
+        "syslog shows OOM kill events for the lldp container or lldpd process",
+        "journalctl or syslog shows core dump or segfault from lldpd"
+      ],
+      "root_causes": [
+        "Malformed LLDP frame from a neighbor triggering a parsing bug in lldpd -- some third-party NICs or embedded devices send non-compliant LLDPDUs",
+        "Excessive number of LLDP neighbors -- switches with 128+ ports and 2 neighbors per port can accumulate significant neighbor state in lldpd memory",
+        "lldpd receiving LLDP frames with abnormally large TLV values or excessively long string fields that trigger buffer issues",
+        "lldpd bug in the SONiC-bundled version -- check if a known lldpd CVE or bug applies to the running SONiC version",
+        "Memory leak in lldpd accumulating over long uptime -- may not be reproducible in short-term testing",
+        "lldp container hitting Docker cgroup memory limit -- the limit may be set too low for high port-count platforms"
+      ],
+      "resolution": [
+        "Check lldpd crash frequency: 'docker inspect lldp | grep RestartCount'",
+        "Check for OOM: 'sudo dmesg | grep -i oom | grep -i lldp'",
+        "Check memory: 'docker stats lldp --no-stream'",
+        "Identify offending port: 'docker exec lldp lldpcli show statistics' -- look for frame error spikes on specific ports",
+        "Temporarily disable LLDP rx on the offending port: 'docker exec lldp lldpcli configure ports <ifname> lldp status rx-only' then 'tx-only' then 'disabled' to isolate",
+        "Capture the malformed frame: 'sudo tcpdump -i <ifname> ether proto 0x88cc -c 10 -w /tmp/lldp_debug.pcap'",
+        "Update SONiC to a version with a newer lldpd that addresses known parsing issues",
+        "If memory leak: schedule periodic lldpd restart via cron as a workaround while investigating root cause"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker inspect lldp | grep -A2 RestartCount",
+          "look_for": "RestartCount > 0 indicates lldpd container has been restarted",
+          "confirms_if": "Non-zero RestartCount confirms lldpd is crashing and being restarted by Docker"
+        },
+        {
+          "command": "docker stats lldp --no-stream",
+          "look_for": "MEM USAGE / LIMIT -- unusually high memory for an LLDP daemon (normal is <50MB; concern at >200MB)",
+          "confirms_if": "Memory at or near container limit confirms OOM pressure is the cause of lldpd restarts"
+        },
+        {
+          "command": "sudo dmesg | grep -i oom | grep -i lldp | tail -10",
+          "look_for": "OOM kill events targeting lldpd or the lldp container cgroup",
+          "confirms_if": "OOM kill event for lldpd confirms memory exhaustion is causing the crash-restart cycle"
+        },
+        {
+          "command": "docker exec lldp lldpcli show statistics",
+          "look_for": "Frame discards, frame errors, and TLV discards per port -- spikes on a specific port indicate a misbehaving neighbor",
+          "confirms_if": "Elevated frame errors on one specific port identifies the likely source of the malformed frames crashing lldpd"
+        },
+        {
+          "command": "docker logs lldp 2>&1 | grep -E 'crash|core|signal|segfault|killed' | tail -20",
+          "look_for": "Crash signals, segfault, or SIGKILL events in lldpd output",
+          "confirms_if": "Segfault or signal 11 in lldpd logs confirms a parsing/memory crash rather than a graceful shutdown"
+        }
+      ]
+    },
+    {
+      "scenario": "CoPP rate-limiting dropping LLDP frames on high port-count switches",
+      "description": "On switches with 48 or more ports, the volume of inbound LLDP frames (one per port every tx-interval seconds) can exceed the CoPP (Control Plane Policing) rate limit for the LLDP traffic class. When the CoPP policer drops frames, lldpd misses LLDP refreshes from neighbors, causing neighbor TTLs to expire prematurely and entries to age out even though the link and neighbor are physically healthy. This is a SONiC-specific operational hazard most visible on 64-port or 128-port spine switches.",
+      "symptoms": [
+        "LLDP neighbors intermittently disappear from 'show lldp table' on high port-count switches despite links being up",
+        "'show lldp table' shows neighbors with very recent discovery but then they vanish within 1-2 refresh cycles",
+        "CoPP counters show drops in the LLDP traffic class: 'redis-cli -n 0 HGETALL \"COPP_TABLE:trap.group.lldp\"'",
+        "Problem is worse during periods of high control-plane load (BGP convergence, STP topology change, etc.)",
+        "'sudo tcpdump -i <ifname> ether proto 0x88cc' shows frames arriving at the NIC but lldpd statistics show fewer received frames than expected",
+        "Reducing tx-interval temporarily resolves the issue (more frequent frames means fewer consecutive drops needed to age out an entry)"
+      ],
+      "root_causes": [
+        "LLDP CoPP policer rate too low for the port count -- default is typically 200-500 pps which is sufficient for <32 ports at 30s interval but not for 64+ ports",
+        "LLDP and other L2 control traffic (LACP, STP BPDUs) sharing the same CoPP queue, exhausting the shared budget",
+        "CPU already under heavy load from BGP convergence, orchagent processing, or other control-plane work -- LLDP packets queued in the trap buffer but not processed in time",
+        "Platform-specific ASIC CoPP default is too conservative for SONiC high port-count deployments",
+        "CoPP configuration drift -- COPP_TABLE in APPL_DB does not match what coppmgrd intended due to a config reload issue"
+      ],
+      "resolution": [
+        "Check CoPP counters: 'show policer' -- look for drops in the lldp or l2 control class",
+        "Check APPL_DB CoPP config: 'redis-cli -n 0 HGETALL \"COPP_TABLE:trap.group.lldp\"'",
+        "Increase CoPP rate for LLDP: edit /etc/sonic/copp_cfg.json and increase cir/cbs for the LLDP trap group, then reload CoPP config",
+        "Increase tx-hold-multiplier as a workaround: 'config lldp hold 6' -- requires 6 consecutive missed refreshes to age out instead of 4",
+        "Increase tx-interval to reduce total LLDP frame rate: 'config lldp interval 60' -- halves inbound frame rate on a 64-port switch",
+        "Check if LLDP shares a CoPP group with other protocols and separate them if platform supports it",
+        "After any CoPP change: 'config reload' or 'sudo systemctl restart swss' to apply"
+      ],
+      "verify_commands": [
+        {
+          "command": "show policer",
+          "look_for": "Drop counts in LLDP or L2 control policer entries -- any drops indicate rate-limiting is occurring",
+          "confirms_if": "Non-zero drop count in the LLDP CoPP class confirms frames are being policed before reaching lldpd"
+        },
+        {
+          "command": "redis-cli -n 0 HGETALL 'COPP_TABLE:trap.group.lldp'",
+          "look_for": "cir (committed information rate) and cbs (committed burst size) values -- compare against port count * (1/tx-interval) pps",
+          "confirms_if": "CIR lower than total expected LLDP frame rate confirms CoPP is the bottleneck"
+        },
+        {
+          "command": "docker exec lldp lldpcli show statistics",
+          "look_for": "Frames received count per port -- if count is lower than tx-interval would predict, frames are being dropped before lldpd",
+          "confirms_if": "Received frame count significantly lower than transmitted by neighbor confirms CoPP or kernel drop before lldpd"
+        },
+        {
+          "command": "redis-cli -n 2 HGETALL 'COUNTERS:oid:<trap-group-oid>'",
+          "look_for": "SAI_POLICER_STAT_GREEN_PACKETS vs SAI_POLICER_STAT_RED_PACKETS ratio -- red packets are dropped by CoPP",
+          "confirms_if": "High red packet count in ASIC CoPP counters confirms ASIC-level LLDP frame dropping"
+        },
+        {
+          "command": "sudo tcpdump -i <ifname> ether proto 0x88cc -c 10 -q",
+          "look_for": "Frame arrival rate -- if neighbor is sending at expected interval but lldpd statistics show fewer arrivals, CoPP is dropping between NIC and CPU",
+          "confirms_if": "Frames visible to tcpdump (NIC) but not counted in lldpd statistics confirms kernel or CoPP drop in the path from NIC to lldpd socket"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "type": "daemon",
+      "name": "lldpd",
+      "description": "The core LLDP protocol daemon inside the lldp Docker container. Handles LLDP frame transmission and reception, maintains the neighbor table, and advertises local TLVs. lldpd is an open-source implementation (lldpd.github.io) bundled with SONiC. All LLDP protocol state lives here."
+    },
+    {
+      "type": "daemon",
+      "name": "lldpmgrd",
+      "description": "SONiC management daemon that bridges CONFIG_DB and lldpd. Subscribes to CONFIG_DB changes (port descriptions, hostname, management addresses) and calls lldpcli to update lldpd's advertised TLVs. Without lldpmgrd, lldpd operates with stale or default TLV values that do not reflect the current SONiC configuration."
+    },
+    {
+      "type": "daemon",
+      "name": "lldpsyncd",
+      "description": "SONiC synchronization daemon that reads lldpd's neighbor table (via lldpcli) and publishes it to STATE_DB LLDP_ENTRY_TABLE. Without lldpsyncd, LLDP neighbor data exists in lldpd's internal state but is never visible to 'show lldp neighbors', NMS systems, or other SONiC components that consume STATE_DB."
+    },
+    {
+      "type": "daemon",
+      "name": "orchagent (swss container)",
+      "description": "Consumes STATE_DB LLDP_ENTRY_TABLE for neighbor correlation and topology awareness. LLDP neighbor data can be used by orchagent for port identification and by the SONiC management framework for topology queries. Not required for basic LLDP operation but needed for LLDP data to feed higher-level SONiC features."
+    },
+    {
+      "type": "infrastructure",
+      "name": "CoPP (Control Plane Policing)",
+      "description": "ASIC-level rate limiter for control-plane traffic. LLDP frames are trapped from the ASIC forwarding pipeline to the CPU via a dedicated CoPP trap entry. If the LLDP CoPP policer is too restrictive (low CIR/CBS) for the port count, frames are dropped before lldpd can receive them, causing neighbor entries to age out prematurely."
+    },
+    {
+      "type": "database",
+      "name": "CONFIG_DB (Redis DB 4)",
+      "description": "Source of truth for LLDP configuration: DEVICE_METADATA|localhost (hostname, lldp_tx_interval, lldp_tx_hold), PORT|<ifname> (description, admin_status). lldpmgrd reads CONFIG_DB to populate lldpd's local TLV advertisements."
+    },
+    {
+      "type": "database",
+      "name": "STATE_DB (Redis DB 6)",
+      "description": "Destination for discovered LLDP neighbor data. lldpsyncd writes LLDP_ENTRY_TABLE entries keyed by interface name. The 'show lldp neighbors' command reads from STATE_DB. External NMS and automation tools query STATE_DB to get neighbor topology data."
+    },
+    {
+      "type": "database",
+      "name": "APPL_DB (Redis DB 0)",
+      "description": "Contains the COPP_TABLE configuration for LLDP trap groups used by coppmgrd and orchagent to program ASIC CoPP rules. The LLDP CoPP policer rate directly affects whether LLDP frames reach lldpd."
+    }
+  ],
+  "config_db_tables": [
+    {
+      "table": "DEVICE_METADATA",
+      "key_pattern": "DEVICE_METADATA|localhost",
+      "relevant_fields": [
+        "hostname: device hostname -- used as LLDP System Name TLV; if missing lldpd may advertise IP or blank",
+        "lldp_tx_interval: LLDP transmit interval in seconds (default 30); controls how often LLDPDUs are sent and indirectly controls TTL",
+        "lldp_tx_hold: TTL multiplier (default 4); TTL advertised = lldp_tx_interval * lldp_tx_hold",
+        "mac: chassis MAC address used as fallback Chassis ID TLV if no other identifier configured",
+        "platform: platform identifier included in System Description TLV"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'DEVICE_METADATA|localhost'",
+      "redis_command": "redis-cli -n 4 KEYS 'DEVICE_METADATA*'"
+    },
+    {
+      "table": "PORT",
+      "key_pattern": "PORT|<ifname>",
+      "relevant_fields": [
+        "description: port description string -- advertised as LLDP Port Description TLV to neighbors",
+        "admin_status: up/down -- LLDP only operates on admin-up ports",
+        "alias: human-readable port alias -- may be used in Port ID TLV depending on lldpd configuration",
+        "mtu: MTU -- included in IEEE 802.3 Maximum Frame Size TLV",
+        "speed: interface speed -- included in IEEE 802.3 MAC/PHY Configuration TLV"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'PORT|<ifname>'",
+      "redis_command": "redis-cli -n 4 KEYS 'PORT|Ethernet*'"
+    },
+    {
+      "table": "LLDP_ENTRY_TABLE (STATE_DB)",
+      "key_pattern": "LLDP_ENTRY_TABLE|<ifname>",
+      "relevant_fields": [
+        "lldp_rem_chassis_id: neighbor chassis ID (typically neighbor MAC or system ID)",
+        "lldp_rem_chassis_id_subtype: chassis ID encoding (1=component, 4=MAC, 5=network address, 7=locally assigned)",
+        "lldp_rem_port_id: neighbor port identifier (interface name or MAC)",
+        "lldp_rem_port_id_subtype: port ID encoding",
+        "lldp_rem_sys_name: neighbor hostname (System Name TLV)",
+        "lldp_rem_sys_desc: neighbor system description (OS version, platform)",
+        "lldp_rem_port_desc: neighbor port description",
+        "lldp_rem_man_addr: neighbor management address",
+        "lldp_rem_sys_cap_supported: bitmask of neighbor capabilities",
+        "lldp_rem_sys_cap_enabled: bitmask of neighbor enabled capabilities"
+      ],
+      "verify_command": "redis-cli -n 6 HGETALL 'LLDP_ENTRY_TABLE|<ifname>'",
+      "redis_command": "redis-cli -n 6 KEYS 'LLDP_ENTRY_TABLE|*'"
+    },
+    {
+      "table": "COPP_TABLE (APPL_DB)",
+      "key_pattern": "COPP_TABLE:trap.group.lldp  or  COPP_TABLE:trap.group.l2",
+      "relevant_fields": [
+        "trap_ids: lldp -- specifies which trap type this policer applies to",
+        "trap_action: trap -- forward to CPU; copy -- copy to CPU and forward in hardware",
+        "cir: committed information rate in pps -- LLDP frames exceeding this rate are dropped",
+        "cbs: committed burst size -- burst allowance above the CIR",
+        "meter_type: packets -- rate measured in packets per second for L2 traps",
+        "mode: sr_tcm or tr_tcm -- policing mode"
+      ],
+      "verify_command": "redis-cli -n 0 HGETALL 'COPP_TABLE:trap.group.lldp'",
+      "redis_command": "redis-cli -n 0 KEYS 'COPP_TABLE*lldp*'"
+    },
+    {
+      "table": "MGMT_INTERFACE",
+      "key_pattern": "MGMT_INTERFACE|eth0|<ip/prefix>",
+      "relevant_fields": [
+        "gwaddr: management gateway -- used when lldpmgrd constructs the management address TLV",
+        "(key contains the IP/prefix): management IP address advertised in LLDP Management Address TLV"
+      ],
+      "verify_command": "redis-cli -n 4 KEYS 'MGMT_INTERFACE*'",
+      "redis_command": "redis-cli -n 4 KEYS 'MGMT_INTERFACE*'"
+    }
+  ],
+  "sonic_notes": [
+    {
+      "note": "LLDP in SONiC runs inside the 'lldp' Docker container. It consists of three processes managed by supervisord: lldpd (the protocol daemon), lldpmgrd (reads CONFIG_DB and configures lldpd), and lldpsyncd (reads lldpd neighbor table and writes to STATE_DB). All three must be running for end-to-end LLDP functionality. Check all three with 'docker exec lldp supervisorctl status' before assuming a single-process failure.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "sonic-buildimage:src/lldpd/ and src/sonic-lldp/"
+    },
+    {
+      "note": "lldpmgrd is the CONFIG_DB-to-lldpd bridge, analogous to bgpcfgd for BGP. It calls lldpcli (lldpd's CLI tool) to configure lldpd at runtime whenever CONFIG_DB changes. Direct lldpcli commands made outside of lldpmgrd may be overwritten on the next lldpmgrd CONFIG_DB sync event. For persistent LLDP configuration, always use 'config lldp ...' SONiC CLI commands or modify CONFIG_DB directly and let lldpmgrd pick up the change.",
+      "human_error_risk": "HIGH",
+      "source_ref": "sonic-buildimage:src/sonic-lldp/lldpmgrd.py"
+    },
+    {
+      "note": "lldpsyncd uses polling (not event-driven) to read lldpd's neighbor table via 'lldpcli -f json show neighbors'. It polls at a fixed interval (typically 10 seconds) and diffs against the current STATE_DB state. This means STATE_DB LLDP neighbor data can be up to 10 seconds stale relative to what lldpd knows internally. Use 'docker exec lldp lldpcli show neighbors' for the freshest view of LLDP state.",
+      "human_error_risk": "LOW",
+      "source_ref": "sonic-buildimage:src/sonic-lldp/lldpsyncd.py"
+    },
+    {
+      "note": "LLDP multicast frames (01:80:C2:00:00:0E) are not forwarded by switches operating as Layer 2 bridges -- this is by IEEE design. If a SONiC switch is acting as a pure L2 switch, LLDP only discovers directly connected neighbors one hop away. It cannot see topology beyond the local link. This is a common source of confusion when operators expect LLDP to behave like CDP in a multi-hop context.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "IEEE 802.1AB-2016, Section 7.2"
+    },
+    {
+      "note": "On SONiC switches with LAG (Link Aggregation) ports, LLDP runs on the individual member ports (Ethernet0, Ethernet4, etc.) rather than the LAG interface (PortChannel0). Operators looking for LLDP neighbors on PortChannel interfaces will not find them -- they must check the member ports. 'show lldp table' shows all interfaces including LAG members.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "SONiC LLDP design -- lldpd interface binding"
+    },
+    {
+      "note": "The CoPP rate limit for LLDP defaults are designed for typical access-layer port counts. On 64-port or 128-port spine/aggregation switches in SONiC 202511, the default CoPP rate may be too low. With 64 ports at a 30-second tx-interval, the expected LLDP frame arrival rate is ~2 pps -- well within defaults. However, if multiple VLANs, multiple neighbors per port, or rapid topology changes are involved, the rate can spike significantly. Monitor CoPP counters proactively on high-density platforms.",
+      "human_error_risk": "LOW",
+      "source_ref": "SONiC CoPP configuration: /etc/sonic/copp_cfg.json"
+    },
+    {
+      "note": "In SONiC, the 'show lldp neighbors' and 'show lldp table' commands read from STATE_DB (Redis DB 6) LLDP_ENTRY_TABLE. If lldpsyncd is stopped, these commands will show stale data from the last sync. Always cross-check with 'docker exec lldp lldpcli show neighbors' which reads directly from lldpd in-memory state to determine if the issue is in the protocol layer or in the SONiC sync pipeline.",
+      "human_error_risk": "LOW",
+      "source_ref": "SONiC show commands: src/sonic-utilities/show/lldp.py"
+    }
+  ],
+  "sonic_frr_mapping": {
+    "frr_process": "N/A -- LLDP is not managed by FRR in SONiC; lldpd is a separate open-source daemon",
+    "container": "lldp",
+    "lldpd_socket": "/var/run/lldpd.socket (lldpcli control socket)",
+    "lldpcli_path": "/usr/sbin/lldpcli",
+    "lldpmgrd_source": "sonic-buildimage:src/sonic-lldp/lldpmgrd.py",
+    "lldpsyncd_source": "sonic-buildimage:src/sonic-lldp/lldpsyncd.py",
+    "supervisor_config": "/etc/supervisor/conf.d/lldpd.conf (inside lldp container)",
+    "config_managed_by": "lldpmgrd (reads CONFIG_DB DEVICE_METADATA and PORT tables, calls lldpcli to configure lldpd)"
+  },
+  "key_commands": [
+    "show lldp table",
+    "show lldp neighbors",
+    "show lldp neighbors <ifname>",
+    "docker exec lldp lldpcli show neighbors",
+    "docker exec lldp lldpcli show neighbors details",
+    "docker exec lldp lldpcli show statistics",
+    "docker exec lldp lldpcli show configuration",
+    "docker exec lldp supervisorctl status",
+    "docker ps | grep lldp",
+    "docker stats lldp --no-stream",
+    "docker inspect lldp | grep RestartCount",
+    "docker logs lldp 2>&1 | tail -50",
+    "redis-cli -n 6 KEYS 'LLDP_ENTRY_TABLE|*'",
+    "redis-cli -n 6 HGETALL 'LLDP_ENTRY_TABLE|<ifname>'",
+    "redis-cli -n 4 HGETALL 'DEVICE_METADATA|localhost'",
+    "redis-cli -n 4 HGETALL 'PORT|<ifname>'",
+    "redis-cli -n 0 HGETALL 'COPP_TABLE:trap.group.lldp'",
+    "sudo tcpdump -i <ifname> ether proto 0x88cc -c 10",
+    "show policer",
+    "show interfaces status"
+  ],
+  "related_protocols": [
+    "lacp"
+  ],
+  "tags": [
+    "discovery",
+    "neighbor",
+    "topology",
+    "layer-2",
+    "lldp",
+    "cdp-alternative"
+  ]
+}

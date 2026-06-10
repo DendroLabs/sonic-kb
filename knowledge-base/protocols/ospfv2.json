@@ -1,0 +1,925 @@
+{
+  "protocol_id": "ospfv2",
+  "protocol_name": "OSPFv2",
+  "protocol_family": "routing",
+  "standard": "RFC 2328",
+  "category": "routing",
+  "purpose": "Link-state interior gateway protocol for intra-AS routing with area hierarchy",
+  "operates_at": "Layer 3",
+  "transport": "IP Protocol 89 (raw IP, no TCP/UDP)",
+  "def_refs": [
+    "timer:ospf-hello",
+    "timer:ospf-dead",
+    "timer:ospf-lsa-age",
+    "timer:ospf-spf-delay",
+    "daemon:ospfd",
+    "daemon:zebra",
+    "daemon:fpmsyncd",
+    "daemon:frrcfgd",
+    "daemon:orchagent",
+    "daemon:syncd",
+    "db:config_db",
+    "db:appl_db",
+    "db:asic_db",
+    "db:state_db"
+  ],
+  "states": [
+    {
+      "name": "Down",
+      "description": "No Hello packets have been received from this neighbor within the Dead Interval. The neighbor relationship has not started or has timed out. This is the initial state for every potential neighbor. In SONiC/FRR, a neighbor enters Down state when the Dead Interval expires without a Hello, when the interface goes down, or after a manual 'clear ip ospf' reset.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "docker exec bgp vtysh -c 'show ip ospf neighbor'",
+        "docker exec bgp vtysh -c 'show ip ospf neighbor detail'"
+      ]
+    },
+    {
+      "name": "Attempt",
+      "description": "Used only on NBMA networks. A Hello has been sent to the neighbor's configured IP address but no Hello has been received back yet. On point-to-point and broadcast networks this state is skipped entirely.",
+      "is_steady": false,
+      "is_failure": false,
+      "verify_commands": [
+        "docker exec bgp vtysh -c 'show ip ospf neighbor'"
+      ]
+    },
+    {
+      "name": "Init",
+      "description": "A Hello packet has been received from the neighbor but the local router's Router ID does not appear in the neighbor's Hello packet neighbor list. One-way communication: we hear them, but they do not yet acknowledge hearing us. A router stuck in Init indicates asymmetric Hello delivery -- the neighbor receives our Hellos but its acknowledgment (neighbor list in its Hello) is not reaching us. In SONiC this often means a multicast routing issue or ACL dropping OSPF packets in one direction.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "docker exec bgp vtysh -c 'show ip ospf neighbor'",
+        "sudo tcpdump -i <interface> proto ospf -c 20"
+      ]
+    },
+    {
+      "name": "2-Way",
+      "description": "Bidirectional communication established. Each router sees its own Router ID in the other's Hello packet neighbor list. On broadcast networks (Ethernet), DR/BDR election occurs in this state. Non-DR/BDR routers on broadcast segments remain in 2-Way with each other -- they do NOT form full adjacencies with each other, only with the DR and BDR. This is the expected steady state for DROther-to-DROther relationships.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "docker exec bgp vtysh -c 'show ip ospf neighbor'",
+        "docker exec bgp vtysh -c 'show ip ospf interface <ifname>'"
+      ]
+    },
+    {
+      "name": "ExStart",
+      "description": "Beginning of the database exchange process. Master/slave relationship is negotiated via DBD (Database Description) packets. The router with the higher Router ID becomes master and sets the initial sequence number. Stuck in ExStart almost always means an MTU mismatch -- DBD packets exceed the interface MTU on one side and are silently dropped.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "docker exec bgp vtysh -c 'show ip ospf neighbor'",
+        "docker exec bgp vtysh -c 'show ip ospf neighbor detail'",
+        "sudo tcpdump -i <interface> proto ospf -c 50"
+      ]
+    },
+    {
+      "name": "Exchange",
+      "description": "Routers are exchanging Database Description (DBD) packets containing their LSDB summaries (LSA headers). Each router builds a list of LSAs it needs from the neighbor. Stuck in Exchange also indicates MTU or authentication issues where DBD packets are being lost or rejected mid-exchange.",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "docker exec bgp vtysh -c 'show ip ospf neighbor detail'",
+        "sudo tcpdump -i <interface> proto ospf -c 50 -w /tmp/ospf.pcap"
+      ]
+    },
+    {
+      "name": "Loading",
+      "description": "The router is sending Link State Request (LSR) packets to request LSAs it needs but does not have. The neighbor sends Link State Update (LSU) packets in response. Stuck in Loading indicates LSR/LSU packet loss or the neighbor does not have the requested LSA (possible LSDB inconsistency).",
+      "is_steady": false,
+      "is_failure": true,
+      "verify_commands": [
+        "docker exec bgp vtysh -c 'show ip ospf neighbor detail'",
+        "docker exec bgp vtysh -c 'show ip ospf database'"
+      ]
+    },
+    {
+      "name": "Full",
+      "description": "Full adjacency established. Both routers have synchronized LSDBs. This is the only steady-state operational adjacency. Routes derived from the LSDB via SPF are installed into the FRR RIB (zebra), then flow to APPL_DB via fpmsyncd, and on to the ASIC via orchagent and syncd. On broadcast networks, Full adjacency is only formed between DROther routers and the DR/BDR -- not between DROther routers.",
+      "is_steady": true,
+      "is_failure": false,
+      "verify_commands": [
+        "docker exec bgp vtysh -c 'show ip ospf neighbor'",
+        "docker exec bgp vtysh -c 'show ip ospf neighbor detail'",
+        "docker exec bgp vtysh -c 'show ip route ospf'",
+        "show ip route ospf"
+      ]
+    }
+  ],
+  "transitions": [
+    {
+      "from_state": "Down",
+      "to_state": "Init",
+      "trigger": "Hello packet received from neighbor; the neighbor's Router ID is noted but our Router ID is not yet in their Hello neighbor list",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "Down",
+      "to_state": "Attempt",
+      "trigger": "NBMA network only: Hello sent to configured neighbor IP, waiting for response",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "Init",
+      "to_state": "2-Way",
+      "trigger": "Hello received with local Router ID in the neighbor list -- bidirectional communication confirmed",
+      "failure_if_stuck": "Asymmetric link: our Hellos reach the neighbor but their Hellos do not reach us (or vice versa). Check ACLs, multicast group join (224.0.0.5), interface MTU mismatch for Hello packets, or OSPF disabled on the neighbor's interface."
+    },
+    {
+      "from_state": "2-Way",
+      "to_state": "ExStart",
+      "trigger": "DR/BDR election complete (broadcast networks) or adjacency decision made (point-to-point); master/slave negotiation begins",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "ExStart",
+      "to_state": "Exchange",
+      "trigger": "Master/slave relationship established via DBD with I/M/MS bits; initial sequence number agreed upon",
+      "failure_if_stuck": "MTU mismatch: one side drops DBD packets that exceed its interface MTU. Check 'ip ospf mtu-ignore' and interface MTU on both sides. Also check authentication mismatch causing DBD rejection."
+    },
+    {
+      "from_state": "Exchange",
+      "to_state": "Loading",
+      "trigger": "All DBD packets exchanged; routers have complete lists of LSA headers; LSR packets sent for missing LSAs",
+      "failure_if_stuck": "MTU mismatch causing large DBD packets to be dropped. Authentication issues. Check 'show ip ospf neighbor detail' for retransmission counts."
+    },
+    {
+      "from_state": "Loading",
+      "to_state": "Full",
+      "trigger": "All requested LSAs received via LSU; LSDB is fully synchronized",
+      "failure_if_stuck": "LSR/LSU packet loss; corrupted LSA causing repeated request-response cycle; neighbor does not originate the requested LSA. Check retransmit queue: 'show ip ospf neighbor detail'."
+    },
+    {
+      "from_state": "Full",
+      "to_state": "Down",
+      "trigger": "Dead Interval expires (no Hello received within dead-interval seconds), interface goes down, or 'clear ip ospf' issued",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "Full",
+      "to_state": "2-Way",
+      "trigger": "On broadcast network: DR or BDR failure causes DROther to lose Full adjacency with DR/BDR; 2-Way maintained with other DROthers",
+      "failure_if_stuck": ""
+    },
+    {
+      "from_state": "2-Way",
+      "to_state": "Down",
+      "trigger": "Dead Interval expires or interface goes down",
+      "failure_if_stuck": ""
+    }
+  ],
+  "timers": [
+    {
+      "name": "Hello Interval",
+      "description": "How often ospfd sends Hello packets on an interface to announce presence and maintain neighbor relationships. All routers on the same segment must have identical Hello Interval values or adjacency will not form. Hellos are multicast to 224.0.0.5 (AllSPFRouters) on broadcast/point-to-point networks.",
+      "default": "10s (broadcast/point-to-point); 30s (NBMA)",
+      "range": "1-65535s",
+      "on_expiry": "Send Hello packet out the interface",
+      "sonic_default": "10s (FRR ospfd default)",
+      "sonic_config_path": "Not in CONFIG_DB; configured via frrcfgd or vtysh: 'ip ospf hello-interval <seconds>' on interface",
+      "sonic_frr_path": "ospfd: oi->v_hello (FRR source: ospfd/ospf_interface.c)",
+      "tuning_advice": "Keep consistent across all routers on a segment. Lower values (1-2s) improve failover speed but increase CPU and bandwidth. Use BFD instead of aggressive OSPF timers for sub-second detection."
+    },
+    {
+      "name": "Dead Interval",
+      "description": "Time after which a neighbor is declared down if no Hello is received. Must be the same on both ends of a link. RFC 2328 recommends Dead Interval = 4 * Hello Interval. All routers on the same OSPF segment must agree on Dead Interval or adjacency will not form.",
+      "default": "40s (broadcast/point-to-point); 120s (NBMA)",
+      "range": "1-65535s",
+      "on_expiry": "Neighbor declared down; adjacency torn down; LSA originated to reflect topology change; SPF scheduled",
+      "sonic_default": "40s (FRR ospfd default)",
+      "sonic_config_path": "Not in CONFIG_DB; configured via frrcfgd or vtysh: 'ip ospf dead-interval <seconds>' on interface",
+      "sonic_frr_path": "ospfd: oi->v_wait (FRR source: ospfd/ospf_interface.c)",
+      "tuning_advice": "Must match on both ends. For fast failover without BFD, reduce to 'ip ospf dead-interval minimal hello-multiplier 3' (1s dead, ~333ms Hello). Production environments should use BFD for sub-second detection."
+    },
+    {
+      "name": "LSA Age / MaxAge",
+      "description": "Every LSA carries an age field that starts at 0 and increments by 1 per second as it propagates and ages in the LSDB. When LSA age reaches MaxAge (3600s = 1 hour), the LSA is flushed from the LSDB and re-flooded as a MaxAge LSA. LSAs are refreshed by the originating router every LSRefreshTime (30 minutes) before they reach MaxAge.",
+      "default": "MaxAge=3600s; LSRefreshTime=1800s (30 minutes)",
+      "range": "0-3600s (LSA age field)",
+      "on_expiry": "LSA with age=MaxAge is re-flooded to signal deletion; all routers remove it from LSDB and re-run SPF",
+      "sonic_default": "MaxAge=3600s, LSRefreshTime=1800s (FRR ospfd defaults; RFC 2328 standard values)",
+      "sonic_config_path": "Not in CONFIG_DB; FRR defaults apply; not typically changed in SONiC deployments",
+      "sonic_frr_path": "ospfd: OSPF_LSA_MAXAGE=3600, OSPF_LS_REFRESH_TIME=1800 (FRR source: ospfd/ospf_lsa.h)",
+      "tuning_advice": "Do not change MaxAge or LSRefreshTime in production. An LSDB flooded with MaxAge LSAs indicates an unstable topology or a router repeatedly originating and flushing LSAs."
+    },
+    {
+      "name": "SPF Delay",
+      "description": "Minimum delay between receiving an LSA and running the Dijkstra SPF algorithm. Prevents SPF from running on every individual LSA when multiple topology changes arrive in rapid succession. FRR implements a three-value exponential backoff: initial-delay, short-delay, long-delay (spf-delay-ietf in FRR config).",
+      "default": "FRR default: initial=200ms, short=1000ms, long=10000ms (spf-delay-ietf values)",
+      "range": "0-600000ms",
+      "on_expiry": "SPF (Dijkstra) algorithm runs on current LSDB; new best paths computed; routes updated in zebra RIB",
+      "sonic_default": "FRR ospfd default exponential backoff timers",
+      "sonic_config_path": "Not in CONFIG_DB; configured via frrcfgd or vtysh: 'timers throttle spf <delay> <initial-hold> <max-hold>' under 'router ospf'",
+      "sonic_frr_path": "ospfd: t_spf_calc (FRR source: ospfd/ospf_spf.c)",
+      "tuning_advice": "The exponential backoff prevents SPF storms during link flapping. Do not set initial-delay to 0 in production -- this causes repeated SPF runs on each LSA during a flap event. The default FRR values are well-tuned for data-center deployments."
+    }
+  ],
+  "messages": [
+    {
+      "name": "Hello",
+      "description": "Sent periodically on all OSPF-enabled interfaces to discover neighbors, establish/maintain bidirectional communication, and perform DR/BDR election. Multicast to 224.0.0.5 (AllSPFRouters) on broadcast/point-to-point, unicast on NBMA. Contains parameters that must match between neighbors.",
+      "when_sent": "Every Hello Interval on all OSPF-enabled interfaces",
+      "key_fields": [
+        "Network Mask: must match on broadcast segments",
+        "Hello Interval: must match on both ends of link",
+        "Options: E-bit (external LSAs), N-bit (NSSA), DC-bit",
+        "Router Priority: used for DR/BDR election (0 = ineligible)",
+        "Router Dead Interval: must match on both ends of link",
+        "Designated Router IP: current DR (0.0.0.0 if unknown)",
+        "Backup Designated Router IP: current BDR (0.0.0.0 if unknown)",
+        "Neighbor list: Router IDs of neighbors from which Hello was received"
+      ]
+    },
+    {
+      "name": "DBD (Database Description)",
+      "description": "Used during the ExStart and Exchange states to synchronize LSDBs. Contains LSA headers (without full LSA data) summarizing the sender's LSDB. The master sends DBDs with incrementing sequence numbers; the slave echoes each sequence number to acknowledge. The M (More) bit indicates more DBD packets to follow.",
+      "when_sent": "During ExStart (to negotiate master/slave) and Exchange (to describe LSDB contents)",
+      "key_fields": [
+        "Interface MTU: must not exceed neighbor's interface MTU or DBD is rejected (key field causing ExStart stuck)",
+        "Options: capability bits (same as Hello)",
+        "Flags: I (Init), M (More), MS (Master/Slave)",
+        "DD Sequence Number: monotonically increasing; used for reliable exchange",
+        "LSA Headers: Type-1 through Type-5/7 LSA headers describing LSDB contents"
+      ]
+    },
+    {
+      "name": "LSR (Link State Request)",
+      "description": "Sent during Loading state to request specific LSAs from the neighbor that were identified as missing or newer during the DBD exchange. A router sends LSRs for every LSA it needs; the neighbor responds with LSU packets containing the full LSA data.",
+      "when_sent": "During Loading state after DBD exchange identifies LSAs needed from the neighbor",
+      "key_fields": [
+        "LS Type: type of requested LSA (1=Router, 2=Network, 3=Summary, 4=ASBR Summary, 5=AS External, 7=NSSA External)",
+        "Link State ID: identifies the LSA within its type",
+        "Advertising Router: Router ID of the LSA's originator"
+      ]
+    },
+    {
+      "name": "LSU (Link State Update)",
+      "description": "Carries one or more complete LSAs in response to LSR packets, or as part of link-state flooding when a topology change occurs. LSUs are sent as unicast in response to LSRs, and multicast (224.0.0.5 or 224.0.0.6) during flooding. The receiving router must send an LSAck.",
+      "when_sent": "In response to LSR during Loading state; during flooding when a new or updated LSA is received or originated locally",
+      "key_fields": [
+        "Number of LSAs: count of LSAs in this packet",
+        "LSAs: one or more complete LSAs (Router-LSA, Network-LSA, Summary-LSA, AS External-LSA, etc.)",
+        "LSA Header: LS Age, Options, LS Type, Link State ID, Advertising Router, LS Sequence Number, LS Checksum, Length"
+      ]
+    },
+    {
+      "name": "LSAck (Link State Acknowledgment)",
+      "description": "Acknowledges receipt of LSU packets. OSPF uses reliable flooding -- every LSU must be acknowledged or the sender retransmits. LSAcks can be immediate (unicast) or delayed (multicast, batched). Missing LSAcks cause retransmission floods. High retransmission counts visible in 'show ip ospf neighbor detail' indicate LSAck loss.",
+      "when_sent": "After receiving LSU packets during flooding or Loading state; can be delayed to batch multiple ACKs",
+      "key_fields": [
+        "LSA Headers: list of LSA headers being acknowledged (same format as LSA header in LSU)"
+      ]
+    }
+  ],
+  "failure_modes": [
+    {
+      "scenario": "Hello/Dead interval mismatch -- adjacency never forms",
+      "description": "Two OSPF routers on the same segment have different Hello Interval or Dead Interval values configured. When Hello packets are received, the intervals in the received Hello are compared against the local interface configuration. A mismatch causes the Hello to be silently ignored -- no error message is generated, no adjacency forms, and the neighbor never advances past Down state. This is one of the most common OSPF misconfiguration errors and is especially subtle because ospfd logs do not always surface the mismatch reason.",
+      "symptoms": [
+        "'show ip ospf neighbor' shows no neighbor entry for the expected peer IP",
+        "Neighbor is permanently in Down state or never appears",
+        "Interface shows ospf enabled but neighbor count is 0",
+        "tcpdump on the interface shows OSPF Hello packets arriving from the peer",
+        "ospfd logs may show 'Packet[Hello:RECV]: NetworkMask mismatch' or interval mismatch message"
+      ],
+      "root_causes": [
+        "Hello Interval configured differently on the two ends of the link",
+        "Dead Interval configured differently on the two ends of the link",
+        "One side uses 'ip ospf dead-interval minimal hello-multiplier' fast timers and the other uses standard timers",
+        "Configuration applied to wrong interface or missing on one side",
+        "frrcfgd rendered different timer values from CONFIG_DB due to template issue"
+      ],
+      "resolution": [
+        "Capture Hello packets on both sides: 'sudo tcpdump -i <interface> proto ospf -c 20' and compare Hello Interval and Dead Interval fields",
+        "Check local OSPF interface config: 'docker exec bgp vtysh -c \"show ip ospf interface <ifname>\"' -- shows configured hello-interval and dead-interval",
+        "Check peer's OSPF interface config via out-of-band or console access",
+        "Align Hello and Dead intervals: 'ip ospf hello-interval <N>' and 'ip ospf dead-interval <N>' on both interfaces in vtysh (or via frrcfgd/config)",
+        "Verify change took effect: 'docker exec bgp vtysh -c \"show ip ospf interface <ifname>\"'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf interface <ifname>'",
+          "look_for": "Timer intervals configured: Hello <N>s, Dead <N>s -- compare with expected peer values",
+          "confirms_if": "Different Hello or Dead Interval values between the two ends confirms the mismatch"
+        },
+        {
+          "command": "sudo tcpdump -i <interface> proto ospf -nn -c 20",
+          "look_for": "Hello packets from peer showing HelloInt and DeadInt fields; compare against local values",
+          "confirms_if": "Peer Hello shows different HelloInt or DeadInt than local interface config confirms interval mismatch"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf neighbor'",
+          "look_for": "Absence of expected neighbor or neighbor stuck in Down state",
+          "confirms_if": "Missing neighbor entry with active OSPF on both sides and Hellos being sent confirms a parameter mismatch causing Hello rejection"
+        },
+        {
+          "command": "docker logs bgp 2>&1 | grep -i 'ospf\\|hello\\|interval' | tail -30",
+          "look_for": "Interval mismatch log messages from ospfd",
+          "confirms_if": "Log messages mentioning Hello Interval or Dead Interval mismatch confirm the cause"
+        }
+      ]
+    },
+    {
+      "scenario": "Area ID mismatch -- neighbors ignore each other's Hellos",
+      "description": "OSPF routers on the same physical segment have different Area IDs configured on their interfaces. OSPF Hello packets contain the Area ID in their IP header (technically, in the OSPF common header). If the Area ID in a received Hello does not match the receiving interface's configured Area ID, the packet is silently discarded. The neighbor never appears and the adjacency never starts. Unlike Hello/Dead interval mismatch, there is usually no log message for Area ID mismatch in default FRR logging level.",
+      "symptoms": [
+        "No OSPF neighbor relationship forms despite both routers having OSPF enabled on the interface",
+        "'show ip ospf neighbor' shows no entry for the peer",
+        "'show ip ospf interface' shows the interface as 'OSPF is enabled' with correct network statement",
+        "tcpdump confirms Hellos are arriving from the peer",
+        "ospfd debug logs (debug ospf packet hello recv) show 'area id mismatch'"
+      ],
+      "root_causes": [
+        "Interface on one router configured in area 0.0.0.0 (backbone) and the other in area 0.0.0.1 (or any non-matching area)",
+        "Mistyped area ID in the 'network <prefix> area <id>' command under 'router ospf'",
+        "Area ID entered as dotted-decimal on one side and as integer on the other (area 1 vs area 0.0.0.1 -- these are equivalent in FRR, but area 0.0.0.10 is different from area 10)",
+        "Interface-level 'ip ospf area <id>' overrides the router-level 'network' statement and was configured incorrectly"
+      ],
+      "resolution": [
+        "Enable OSPF packet debugging temporarily: 'docker exec bgp vtysh -c \"debug ospf packet hello recv\"'",
+        "Check logs for area mismatch: 'docker logs bgp 2>&1 | grep -i \"area\" | tail -20'",
+        "Verify area assignment on interface: 'docker exec bgp vtysh -c \"show ip ospf interface <ifname>\"' -- shows 'Area <id>'",
+        "Confirm peer's area assignment via out-of-band or by reading their Hello packet (area field is in OSPF common header)",
+        "Correct the area assignment: 'interface <ifname>' then 'ip ospf area <correct-area>' in vtysh",
+        "Disable debug after confirmation: 'docker exec bgp vtysh -c \"no debug ospf packet hello recv\"'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf interface <ifname>'",
+          "look_for": "Area field -- shows which OSPF area this interface belongs to",
+          "confirms_if": "Area ID differs from what is configured on the peer's interface confirms area mismatch"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf'",
+          "look_for": "All areas listed under 'Number of areas in this router'; verify the correct area exists",
+          "confirms_if": "Expected area ID absent from the OSPF process confirms the interface was not assigned to the correct area"
+        },
+        {
+          "command": "sudo tcpdump -i <interface> proto ospf -c 10 -v",
+          "look_for": "Area ID field in OSPF common header of peer's Hello packets",
+          "confirms_if": "Peer's Hello shows different Area ID than local interface's configured area confirms mismatch"
+        }
+      ]
+    },
+    {
+      "scenario": "Area type mismatch -- adjacency forms but routes not exchanged correctly",
+      "description": "OSPF adjacency reaches Full state successfully (Hello/Dead intervals and Area IDs match), but routes from external sources or from other areas are missing. This happens when routers on the same area have inconsistent area type configuration: one router treats the area as a stub and another as a normal area, or one treats it as NSSA and another as stub. The adjacency itself forms because area type is not checked during Hello exchange on some FRR versions, but external LSAs (Type-5) are dropped by the stub router, causing route black-holes.",
+      "symptoms": [
+        "OSPF adjacency shows Full state for the neighbor",
+        "Routes from redistributed sources (BGP, static, connected) are missing in the stub area",
+        "Type-5 (AS External) or Type-7 (NSSA External) LSAs absent from 'show ip ospf database' on stub/NSSA routers",
+        "Routers in stub area have only a default route but no external routes",
+        "ospfd logs may show LSA type filtering messages"
+      ],
+      "root_causes": [
+        "One router has 'area <id> stub' and another has no stub configuration (normal area) -- stub router drops Type-5 LSAs",
+        "One router has 'area <id> stub no-summary' (totally stubby) and another has plain 'area <id> stub' -- inter-area routes missing",
+        "One router has 'area <id> nssa' and another has 'area <id> stub' -- incompatible area type flags in Hello N-bit/E-bit",
+        "ABR configured as NSSA but internal routers not configured as NSSA -- Type-7 LSAs not generated or translated"
+      ],
+      "resolution": [
+        "Check area type on all routers in the area: 'docker exec bgp vtysh -c \"show ip ospf\"' -- look for area type in output",
+        "Check OSPF database for LSA types: 'docker exec bgp vtysh -c \"show ip ospf database\"' -- stub areas should have no Type-5 LSAs",
+        "Align area type configuration on all ABRs and internal routers for the area",
+        "For NSSA: ensure ABR has 'area <id> nssa' and internal routers also have 'area <id> nssa'",
+        "Restart ospfd after area type change: 'docker exec bgp supervisorctl restart ospfd' (disrupts all OSPF adjacencies briefly)"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf'",
+          "look_for": "Area description -- 'Stub', 'NSSA', or normal; all routers in area must show same type",
+          "confirms_if": "Different area types on routers in the same area confirms the mismatch causing LSA filtering"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf database'",
+          "look_for": "Presence or absence of 'AS External Link States' section; stub areas must not have Type-5 LSAs",
+          "confirms_if": "Type-5 LSAs present on a router configured as stub confirms area type mismatch with the ABR"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf database summary'",
+          "look_for": "LSA counts by type per area; Type-3 Summary LSAs absent in totally-stubby areas",
+          "confirms_if": "Missing LSA types that should be present (or unexpected LSAs that should be filtered) confirms area type inconsistency"
+        }
+      ]
+    },
+    {
+      "scenario": "MTU mismatch -- adjacency stuck in ExStart or Exchange",
+      "description": "Two OSPF neighbors successfully exchange Hello packets (reaching 2-Way) and begin database exchange, but the adjacency never advances past ExStart or Exchange state. The MTU field in Database Description (DBD) packets defaults to the interface MTU. If one side's interface MTU is smaller than the other's DBD packet, the DBD is silently dropped. The sending side retransmits indefinitely; the receiving side discards packets larger than its MTU. This is the second most common OSPF failure mode in SONiC environments where interface MTU may differ between different NIC types or configurations.",
+      "symptoms": [
+        "'show ip ospf neighbor' shows ExStart or Exchange state that never advances to Loading or Full",
+        "'show ip ospf neighbor detail' shows increasing 'Retransmit' count and zero 'Database Summary List' progress",
+        "Neighbor has been in ExStart/Exchange for minutes without advancing",
+        "tcpdump shows DBD packets being sent from one side but no corresponding DBD ACKs from the other",
+        "Interface MTU values differ between the two connected interfaces"
+      ],
+      "root_causes": [
+        "Interface MTU configured differently on the two ends of the link (common in SONiC with jumbo frames on some ports)",
+        "One interface has jumbo MTU (9100 or 9000) and the other has default Ethernet MTU (1500)",
+        "MTU mismatch introduced by VLAN tagging adding overhead not accounted for in OSPF MTU field",
+        "VxLAN or GRE tunnel overhead reduces effective MTU but OSPF does not account for the encapsulation",
+        "Hardware asymmetry: two different NIC types with different default MTUs in a SONiC chassis"
+      ],
+      "resolution": [
+        "Check local interface MTU: 'ip link show <interface>' -- look for mtu value",
+        "Check peer interface MTU out-of-band or via LLDP: 'show lldp neighbors detail | grep -A5 <port>'",
+        "Option 1 (preferred): Align MTUs on both interfaces to the same value",
+        "Option 2 (workaround): Configure 'ip ospf mtu-ignore' on the interface in vtysh to skip MTU check in DBD: 'interface <ifname>' then 'ip ospf mtu-ignore'",
+        "Verify neighbor advances: after MTU fix, 'show ip ospf neighbor' should reach Full within a few seconds"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf neighbor detail'",
+          "look_for": "State is ExStart or Exchange; high Retransmit count; Database Summary List length not decreasing",
+          "confirms_if": "Neighbor stuck in ExStart/Exchange with growing retransmit count confirms DBD exchange failure"
+        },
+        {
+          "command": "ip link show <interface>",
+          "look_for": "mtu value -- compare local MTU against peer's interface MTU",
+          "confirms_if": "MTU values differ between the two ends of the link confirms the root cause"
+        },
+        {
+          "command": "sudo tcpdump -i <interface> proto ospf -nn -c 30",
+          "look_for": "DBD packets being sent but no DBD ACK in return; retransmitted DBD sequences (same DD sequence number resent)",
+          "confirms_if": "One-way DBD traffic with no acknowledgment confirms DBD packets are being silently dropped by the peer"
+        },
+        {
+          "command": "show lldp neighbors detail",
+          "look_for": "Peer's port MTU (if advertised via LLDP); compare against local interface MTU",
+          "confirms_if": "LLDP-advertised MTU differs from local MTU confirms the link has asymmetric MTU configuration"
+        }
+      ]
+    },
+    {
+      "scenario": "Authentication mismatch -- Hellos rejected silently",
+      "description": "OSPF authentication (MD5 or plain-text) is configured on one side of a link but not the other, or both sides have authentication enabled but with different keys. OSPF treats authentication failures as silent drops -- no error is sent to the peer. The router discards the Hello without processing it, so the neighbor never advances past Down state. This is extremely difficult to diagnose without packet capture because ospfd does not log authentication failures at default log levels.",
+      "symptoms": [
+        "No OSPF neighbor forms despite correct Hello/Dead intervals and area configuration",
+        "tcpdump shows Hellos arriving from peer but neighbor stays in Down state",
+        "'show ip ospf interface' shows authentication type configured but no neighbors",
+        "ospfd debug authentication logs show 'authentication failed' messages",
+        "Hellos are being sent out but no 2-Way or higher state is reached"
+      ],
+      "root_causes": [
+        "Authentication enabled on one interface but not the other (type mismatch: null vs MD5 or plain-text)",
+        "Correct authentication type on both sides but different MD5 key-id or key string",
+        "Key rolled over on one side during a maintenance window but not the other",
+        "Plain-text password changed on one side and not replicated",
+        "frrcfgd applied authentication config from CONFIG_DB to wrong interface",
+        "Authentication key configured via direct vtysh on one side and via frrcfgd on the other, causing divergence"
+      ],
+      "resolution": [
+        "Enable OSPF authentication debugging temporarily: 'docker exec bgp vtysh -c \"debug ospf packet all recv\"'",
+        "Check logs for authentication failure: 'docker logs bgp 2>&1 | grep -i \"auth\\|password\\|key\" | tail -20'",
+        "Verify authentication config on interface: 'docker exec bgp vtysh -c \"show ip ospf interface <ifname>\"' -- shows authentication type",
+        "Check FRR running-config for key strings: 'docker exec bgp vtysh -c \"show running-config\"' | grep -A3 'ip ospf authentication'",
+        "Align authentication type and key on both sides; use MD5 with matching key-id and key string",
+        "After aligning, disable debug: 'docker exec bgp vtysh -c \"no debug ospf packet all recv\"'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf interface <ifname>'",
+          "look_for": "Authentication type field: None, Simple Password, or Cryptographic; key-id if MD5",
+          "confirms_if": "Authentication type differs from expected or from peer configuration confirms auth type mismatch"
+        },
+        {
+          "command": "sudo tcpdump -i <interface> proto ospf -c 20 -v",
+          "look_for": "Auth Type field in OSPF Hello header: 0=None, 1=Simple, 2=MD5; compare sent vs received",
+          "confirms_if": "Different Auth Type values in sent and received Hello packets confirms authentication mismatch"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show running-config' | grep -A5 'ip ospf authentication'",
+          "look_for": "Authentication type and key-id configured on the interface",
+          "confirms_if": "Different authentication settings than the peer confirms the mismatch; absence of authentication when peer has it confirms type mismatch"
+        }
+      ]
+    },
+    {
+      "scenario": "DR/BDR election issues on broadcast networks -- suboptimal or failed election",
+      "description": "On multi-access broadcast networks (Ethernet), OSPF elects a Designated Router (DR) and Backup Designated Router (BDR) to reduce the number of full adjacencies required. All routers form Full adjacency only with the DR and BDR. If the DR/BDR election produces unexpected results (wrong router elected, no DR, or priority misconfigured), non-DR routers may not form full adjacencies with each other and routing may be suboptimal or broken. In SONiC deployments, multi-access OSPF is common on management VLANs and server-facing segments.",
+      "symptoms": [
+        "'show ip ospf neighbor' shows some neighbors in 2-Way instead of Full (DROther-to-DROther, expected)",
+        "Wrong router is acting as DR (not the intended one with highest priority)",
+        "Adjacency count is lower than expected -- some routers not reaching Full with DR/BDR",
+        "DR or BDR role changes frequently, causing SPF recalculations",
+        "'show ip ospf interface' shows router as DROther when it should be DR"
+      ],
+      "root_causes": [
+        "OSPF router priority not configured -- all routers default to priority 1 and the router with highest Router ID wins (may not be the desired router)",
+        "Priority set to 0 on the intended DR making it ineligible for election",
+        "DR non-preemption: once a DR is elected, it stays DR even if a higher-priority router joins; router must be restarted to trigger new election",
+        "Multiple routers on same segment have duplicate Router IDs -- election produces inconsistent results",
+        "Partially connected broadcast segment (not all routers can hear each other) causing split DR/BDR views"
+      ],
+      "resolution": [
+        "Check current DR/BDR and priorities: 'docker exec bgp vtysh -c \"show ip ospf neighbor detail\"' and 'show ip ospf interface <ifname>'",
+        "Set router priority: 'interface <ifname>' then 'ip ospf priority <0-255>' (higher = more likely to be DR; 0 = ineligible)",
+        "Check for duplicate Router IDs: 'docker exec bgp vtysh -c \"show ip ospf database router\"' -- each router should have unique advertising Router ID",
+        "To force new DR election on a segment, clear OSPF process: 'docker exec bgp vtysh -c \"clear ip ospf process\"' (disrupts all adjacencies)",
+        "For spine-leaf fabrics, consider using point-to-point network type to avoid DR/BDR entirely: 'ip ospf network point-to-point' on the interface"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf interface <ifname>'",
+          "look_for": "DR and BDR IP addresses, local router's role (DR/BDR/DROther), router priority",
+          "confirms_if": "Unexpected DR IP or wrong role for local router confirms DR/BDR election issue"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf neighbor'",
+          "look_for": "Neighbors in 2-Way state (DROther to DROther is normal); any Full adjacency should be with DR or BDR only on broadcast segments",
+          "confirms_if": "Fewer Full adjacencies than expected DR/BDR count confirms election problem or adjacency formation failure with DR"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf'",
+          "look_for": "Router ID -- check for duplicate Router IDs across all OSPF routers in the area",
+          "confirms_if": "Duplicate Router IDs across routers in the area confirms the election will be unpredictable"
+        }
+      ]
+    },
+    {
+      "scenario": "LSA flooding storm -- excessive SPF recalculations and high CPU",
+      "description": "The OSPF LSDB is being flooded with rapidly changing LSAs, causing ospfd to run SPF (Dijkstra) repeatedly and consuming high CPU. This happens when a link or router is unstable (flapping), causing it to repeatedly originate and withdraw its Router-LSA. Each LSA change triggers a new SPF run. In SONiC, a high ospfd CPU load can also impact other processes in the bgp container including zebra and fpmsyncd, potentially causing OSPF-adjacent issues upstream.",
+      "symptoms": [
+        "ospfd or bgp container CPU usage is high: 'docker stats bgp --no-stream' shows elevated CPU",
+        "'docker exec bgp vtysh -c \"show ip ospf spf-calculation\"' shows high SPF run count or rapid last-run timestamps",
+        "Frequent log messages: 'SPF: Scheduled' or 'OSPF-5-ADJCHG' in syslog",
+        "Routing table instability -- routes flapping in and out",
+        "High OSPF packet rate visible in interface counters"
+      ],
+      "root_causes": [
+        "A link or interface is flapping, causing the connected router to repeatedly originate new Router-LSAs",
+        "ospfd process on a neighbor is oscillating (crash-restart cycle generating new self-originate LSAs each time)",
+        "LSA maxage flushing storm: a router is originating many LSAs and the LSRefreshTime is close to a network change cycle",
+        "Route redistribution instability: external routes being redistributed into OSPF are flapping (e.g., BGP prefixes flapping cause OSPF Type-5 LSA churn)",
+        "ospfd SPF throttle timers not configured, causing immediate SPF on every LSA arrival"
+      ],
+      "resolution": [
+        "Identify the flapping LSA source: 'docker exec bgp vtysh -c \"show ip ospf database\"' -- look for LSAs with rapidly incrementing LS Sequence Numbers",
+        "Find the unstable router: the Advertising Router field of the rapidly-changing LSA identifies the source",
+        "Check that router's interface stability: 'show interfaces status' or check syslog for link-down events",
+        "Configure SPF throttling if not set: 'timers throttle spf 200 1000 10000' under 'router ospf'",
+        "For redistribution storms: add route-map filters to OSPF redistribution to suppress unstable prefixes",
+        "Check ospfd container stability: 'docker inspect bgp | grep RestartCount' -- ospfd crash-restart generates new LSA sequence numbers"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker stats bgp --no-stream",
+          "look_for": "CPU % for the bgp container -- ospfd flooding storm typically pushes CPU above 50-80%",
+          "confirms_if": "High bgp container CPU during OSPF convergence events confirms excessive SPF recalculation"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf database'",
+          "look_for": "LSA Sequence Numbers -- rapidly incrementing sequence numbers for the same LSA indicate the originating router is repeatedly re-originating it",
+          "confirms_if": "High sequence numbers (0x80000100+ means 256+ originations) on a specific router's LSA identifies the flapping source"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf spf-calculation'",
+          "look_for": "SPF run count and timestamp of last SPF; multiple SPFs per minute indicates a flooding storm",
+          "confirms_if": "Very high SPF run count or frequent last-run timestamps confirms excessive SPF recalculation"
+        },
+        {
+          "command": "docker logs bgp 2>&1 | grep -E 'SPF|ADJCHG|ospf' | tail -50",
+          "look_for": "Rapid repeated SPF schedule messages or adjacency change events",
+          "confirms_if": "Repeated SPF and adjacency events within seconds of each other confirms routing instability driven by LSA flooding"
+        }
+      ]
+    },
+    {
+      "scenario": "Route redistribution loop -- mutual redistribution between OSPF and BGP",
+      "description": "OSPF and BGP are both running and routes are being redistributed in both directions -- OSPF routes into BGP and BGP routes into OSPF. Without proper filtering, a route learned from BGP gets redistributed into OSPF as an external route, then re-learned by BGP as an OSPF-sourced route, then redistributed back into OSPF with a different metric, creating a churn loop. Each redistribution cycle increments the OSPF LS Sequence Number on the external LSA, driving an LSA flooding storm and potentially causing route metric inflation.",
+      "symptoms": [
+        "OSPF Type-5 or Type-7 external LSA database is very large and growing",
+        "Routes appear with unexpected OSPF external metrics or oscillating metrics",
+        "BGP and OSPF RIBs show routes with alternating source protocols",
+        "ospfd CPU is high due to frequent LSA re-origination",
+        "Routes that should be BGP-only appear in 'show ip ospf database external' with OSPF External type"
+      ],
+      "root_causes": [
+        "Mutual redistribution configured: 'redistribute bgp' under 'router ospf' AND 'redistribute ospf' under 'router bgp' without filtering",
+        "Missing route-map to tag redistributed routes and filter tagged routes on re-import",
+        "Incorrect administrative distance allowing OSPF external routes to win over directly learned BGP routes",
+        "Multiple redistribution points (more than one ABR or ASBR redistributing the same prefixes)"
+      ],
+      "resolution": [
+        "Add OSPF route tagging to prevent re-import: use a route-map to tag BGP routes when redistributing into OSPF, then deny tagged routes when redistributing OSPF back into BGP",
+        "Example: in 'redistribute bgp' into OSPF, add 'route-map tag-bgp-routes' that sets tag 100; in BGP's 'redistribute ospf', add 'route-map deny-tag-100' that denies routes with tag 100",
+        "Use prefix-lists to explicitly define which prefixes should be redistributed in each direction",
+        "Check current redistribution config: 'docker exec bgp vtysh -c \"show running-config\"' -- look for 'redistribute' lines under both 'router ospf' and 'router bgp'",
+        "Remove bidirectional redistribution if not needed and replace with manual network statements"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf database external'",
+          "look_for": "Large number of Type-5 LSAs; LSAs with rapidly incrementing sequence numbers; routes that should be internal appearing as external",
+          "confirms_if": "Large and growing external LSA database with BGP-originated routes confirms redistribution loop"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show running-config' | grep -A2 redistribute",
+          "look_for": "Presence of 'redistribute bgp' under 'router ospf' AND 'redistribute ospf' under 'router bgp' without route-maps",
+          "confirms_if": "Mutual redistribution without filtering tags confirms the loop configuration exists"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf database external' | grep -c 'Link State ID'",
+          "look_for": "Count of external LSAs -- should be small (tens to low hundreds in a normal network); thousands indicates redistribution explosion",
+          "confirms_if": "Unexpectedly large external LSA count confirms route redistribution is generating excessive entries"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip route ospf'",
+          "look_for": "OSPF external (O E1/E2) routes that correspond to BGP prefixes -- if BGP prefixes appear as OSPF external routes on the local router, the loop is active",
+          "confirms_if": "BGP-originated prefixes showing as OSPF External routes on the redistributing router confirms the loop"
+        }
+      ]
+    },
+    {
+      "scenario": "OSPF routes not reaching ASIC -- fpmsyncd not syncing OSPF routes from zebra",
+      "description": "OSPF adjacency is Full and OSPF routes appear in 'show ip route ospf' in the FRR/zebra RIB, but traffic to OSPF-learned destinations is dropped. The routes have been installed into the Linux kernel routing table by zebra but fpmsyncd has not published them to APPL_DB ROUTE_TABLE, so orchagent never programs them into the ASIC. This is the same pipeline failure as with BGP routes but manifests in OSPF deployments. In SONiC, all routes (regardless of protocol) must flow through fpmsyncd to reach the ASIC.",
+      "symptoms": [
+        "'docker exec bgp vtysh -c \"show ip route ospf\"' shows OSPF routes in zebra RIB",
+        "Traffic to OSPF-learned prefixes is dropped or sent to wrong next-hop",
+        "APPL_DB ROUTE_TABLE is missing OSPF-learned prefixes: 'redis-cli -n 0 KEYS \"ROUTE_TABLE:*\"' shows incomplete table",
+        "ASIC_DB has no route entry for the OSPF prefix: 'redis-cli -n 1 KEYS \"ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*\" | grep <prefix>'",
+        "fpmsyncd logs show errors or process is in failed state"
+      ],
+      "root_causes": [
+        "fpmsyncd process has crashed or stalled inside the bgp container",
+        "FPM socket between zebra and fpmsyncd is broken -- zebra has installed routes in kernel but FPM notification was not sent",
+        "fpmsyncd Redis connection to APPL_DB is broken",
+        "zebra FPM module not loaded or misconfigured -- check 'show zebra fpm stats'",
+        "fpmsyncd restart without full kernel route resync -- routes added to kernel before fpmsyncd restarted are not re-pushed"
+      ],
+      "resolution": [
+        "Check fpmsyncd status: 'docker exec bgp supervisorctl status fpmsyncd'",
+        "Check FPM connection: 'docker exec bgp vtysh -c \"show zebra fpm stats\"' -- should show 'connected' and message counts",
+        "Check fpmsyncd logs: 'docker logs bgp 2>&1 | grep -i fpmsyncd | tail -30'",
+        "Restart fpmsyncd (safe, does not affect OSPF adjacencies): 'docker exec bgp supervisorctl restart fpmsyncd'",
+        "After restart, verify APPL_DB is populated: 'redis-cli -n 0 KEYS \"ROUTE_TABLE:*\" | wc -l'",
+        "If APPL_DB shows routes but ASIC_DB does not, the failure is in orchagent: 'docker logs swss 2>&1 | grep -E \"ERROR|route\" | tail -30'"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show ip route ospf'",
+          "look_for": "OSPF routes (marked 'O' for intra-area, 'O IA' for inter-area, 'O E1'/'O E2' for external) in zebra RIB",
+          "confirms_if": "Routes present in zebra RIB but absent in APPL_DB confirms fpmsyncd pipeline failure"
+        },
+        {
+          "command": "docker exec bgp supervisorctl status fpmsyncd",
+          "look_for": "fpmsyncd process state: RUNNING expected",
+          "confirms_if": "STOPPED or FATAL state confirms fpmsyncd is not publishing OSPF routes to APPL_DB"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show zebra fpm stats'",
+          "look_for": "FPM connection status (connected/disconnected), messages sent/received count",
+          "confirms_if": "Disconnected state or zero message count confirms zebra's FPM socket to fpmsyncd is broken"
+        },
+        {
+          "command": "redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l",
+          "look_for": "Count of routes in APPL_DB -- should include OSPF routes visible in zebra RIB",
+          "confirms_if": "Count significantly lower than number of routes in zebra RIB confirms fpmsyncd is not publishing routes"
+        },
+        {
+          "command": "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep <prefix>",
+          "look_for": "Matching key for the OSPF route prefix in ASIC_DB",
+          "confirms_if": "Key absent in ASIC_DB while present in APPL_DB confirms orchagent or syncd failure; key absent in both confirms fpmsyncd failure"
+        }
+      ]
+    },
+    {
+      "scenario": "Virtual link failure -- backbone continuity broken",
+      "description": "OSPF requires all non-backbone areas (area != 0.0.0.0) to connect directly to the backbone area (area 0). When an area's only connection to the backbone is via a transit area, a virtual link through that transit area must be configured. If the virtual link fails (transit area loses connectivity, virtual link neighbor goes down, or virtual link is misconfigured), the attached area loses backbone connectivity and loses all inter-area routes. This manifests as the virtual link neighbor disappearing from 'show ip ospf virtual-links'.",
+      "symptoms": [
+        "'show ip ospf virtual-links' shows virtual link neighbor in Down state or absent",
+        "Routers in the non-backbone area lose all inter-area (O IA) routes from 'show ip route'",
+        "Only intra-area routes remain in the disconnected area",
+        "ospfd logs show virtual link adjacency down events",
+        "Connectivity from the isolated area to other areas and external routes is lost"
+      ],
+      "root_causes": [
+        "Transit area lost its connection to one or both virtual link endpoints",
+        "Virtual link endpoint router ID changed (ospfd restart with different Router ID) and virtual link config not updated",
+        "Authentication mismatch on the virtual link",
+        "Hello/Dead interval mismatch specifically for the virtual link interface",
+        "Transit area configured as stub or NSSA -- virtual links cannot traverse stub or NSSA areas (RFC 2328 requirement)",
+        "ospfd on the ABR restarted and virtual link state was not re-established"
+      ],
+      "resolution": [
+        "Check virtual link state: 'docker exec bgp vtysh -c \"show ip ospf virtual-links\"' -- should show 'Full' state",
+        "Verify transit area reachability: check that a path exists through the transit area to the remote ABR",
+        "Verify transit area is not stub/NSSA: 'docker exec bgp vtysh -c \"show ip ospf\"' -- transit area must be a normal area",
+        "Check virtual link configuration matches on both ABRs: same transit area ID and correct remote router IDs",
+        "Verify remote ABR Router ID: 'docker exec bgp vtysh -c \"show ip ospf\"' on the remote ABR -- Router ID must match what is configured in 'area <transit> virtual-link <router-id>'",
+        "Clear virtual link to force re-establishment: 'docker exec bgp vtysh -c \"clear ip ospf process\"' on the ABR (disrupts all adjacencies)"
+      ],
+      "verify_commands": [
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf virtual-links'",
+          "look_for": "Virtual link state: Full is operational; Down means the virtual link has failed",
+          "confirms_if": "Virtual link in Down state confirms backbone connectivity is broken for the attached non-backbone area"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip ospf'",
+          "look_for": "Virtual link neighbor count; transit area type (must be normal, not stub/NSSA)",
+          "confirms_if": "Transit area shown as stub or NSSA confirms the virtual link cannot function through it per RFC 2328"
+        },
+        {
+          "command": "docker exec bgp vtysh -c 'show ip route ospf'",
+          "look_for": "Absence of 'O IA' (inter-area) routes in the isolated area's routing table",
+          "confirms_if": "Missing inter-area routes confirms the area has lost backbone connectivity via the virtual link"
+        },
+        {
+          "command": "docker logs bgp 2>&1 | grep -i 'virtual\\|vlink' | tail -20",
+          "look_for": "Virtual link adjacency down or configuration error messages from ospfd",
+          "confirms_if": "Virtual link down log messages confirm the virtual link failure event and timing"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "type": "transport",
+      "name": "IP Protocol 89 multicast to 224.0.0.5 and 224.0.0.6",
+      "description": "OSPF uses raw IP (protocol 89), not TCP or UDP. Hellos are multicast to 224.0.0.5 (AllSPFRouters) on broadcast and point-to-point networks, and DR/BDR receive updates via 224.0.0.6 (AllDRouters). In SONiC the interface must have multicast enabled and any ACLs or CoPP policies must permit IP protocol 89."
+    },
+    {
+      "type": "daemon",
+      "name": "FRR stack (ospfd + zebra)",
+      "description": "OSPF in SONiC runs inside the 'bgp' Docker container via FRR. ospfd handles the OSPF FSM, LSA flooding, and SPF computation. zebra receives computed OSPF routes from ospfd via the FRR inter-process socket and installs them into the Linux kernel RIB. Both must be running for OSPF to function."
+    },
+    {
+      "type": "daemon",
+      "name": "frrcfgd",
+      "description": "Translates CONFIG_DB OSPF entries into FRR vtysh commands. Required for CONFIG_DB-driven OSPF configuration to reach FRR. Runs inside the bgp container. Note: not all SONiC builds have full OSPF CONFIG_DB support -- some deployments configure OSPF directly via vtysh or frr.conf."
+    },
+    {
+      "type": "daemon",
+      "name": "fpmsyncd",
+      "description": "Subscribes to Linux kernel netlink events for route changes (including OSPF routes installed by zebra) and publishes them to APPL_DB ROUTE_TABLE. Without fpmsyncd, OSPF routes in the kernel RIB never reach orchagent or the ASIC. Runs inside the bgp container alongside ospfd and zebra."
+    },
+    {
+      "type": "daemon",
+      "name": "orchagent (swss container)",
+      "description": "Consumes APPL_DB ROUTE_TABLE entries (regardless of source protocol) and translates them into SAI API calls written to ASIC_DB. OSPF routes are not programmed into hardware until orchagent processes them successfully."
+    },
+    {
+      "type": "daemon",
+      "name": "syncd (syncd container)",
+      "description": "Reads ASIC_DB and calls the vendor SAI library to program the physical ASIC forwarding tables. The final step in the OSPF route programming pipeline."
+    },
+    {
+      "type": "database",
+      "name": "CONFIG_DB (Redis DB 4)",
+      "description": "Source of truth for OSPF configuration in SONiC deployments that use frrcfgd for OSPF config management. Not all SONiC builds have full OSPF CONFIG_DB table support -- check for DEVICE_METADATA and OSPF-specific tables."
+    },
+    {
+      "type": "database",
+      "name": "APPL_DB (Redis DB 0)",
+      "description": "Route publication bus between fpmsyncd and orchagent. OSPF routes must appear in ROUTE_TABLE here before they can reach the ASIC."
+    },
+    {
+      "type": "protocol",
+      "name": "BFD (optional)",
+      "description": "Bidirectional Forwarding Detection provides sub-second neighbor failure detection for OSPF. When BFD declares a neighbor down, ospfd tears down the adjacency faster than the Dead Interval. Configured in FRR as 'ip ospf bfd' on the interface."
+    }
+  ],
+  "config_db_tables": [
+    {
+      "table": "DEVICE_METADATA",
+      "key_pattern": "DEVICE_METADATA|localhost",
+      "relevant_fields": [
+        "hostname: device hostname, used as reference for OSPF router identity",
+        "mac: system MAC address",
+        "type: device type (LeafRouter, SpineRouter, etc.)"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'DEVICE_METADATA|localhost'",
+      "redis_command": "redis-cli -n 4 KEYS 'DEVICE_METADATA*'"
+    },
+    {
+      "table": "INTERFACE",
+      "key_pattern": "INTERFACE|<ifname>  or  INTERFACE|<ifname>|<ip/prefix>",
+      "relevant_fields": [
+        "NULL: presence indicates interface is managed by SONiC",
+        "ip: IP address and prefix length assigned to interface",
+        "vrf_name: VRF assignment for the interface"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'INTERFACE|<ifname>|<ip/prefix>'",
+      "redis_command": "redis-cli -n 4 KEYS 'INTERFACE|*'"
+    },
+    {
+      "table": "LOOPBACK_INTERFACE",
+      "key_pattern": "LOOPBACK_INTERFACE|<loopback>|<ip/prefix>",
+      "relevant_fields": [
+        "NULL: presence indicates loopback is managed",
+        "ip: loopback IP used as OSPF router-id if it is the highest configured loopback"
+      ],
+      "verify_command": "redis-cli -n 4 HGETALL 'LOOPBACK_INTERFACE|Loopback0|<ip/prefix>'",
+      "redis_command": "redis-cli -n 4 KEYS 'LOOPBACK_INTERFACE*'"
+    },
+    {
+      "table": "ROUTE_TABLE (APPL_DB)",
+      "key_pattern": "ROUTE_TABLE:<prefix/len>",
+      "relevant_fields": [
+        "nexthop: comma-separated list of next-hop IPs",
+        "ifname: egress interface name(s)",
+        "distance: administrative distance (OSPF intra=110, inter=110, external=150)",
+        "metric: route metric",
+        "nexthop-vrf: VRF for the nexthop"
+      ],
+      "verify_command": "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+      "redis_command": "redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l"
+    }
+  ],
+  "sonic_notes": [
+    {
+      "note": "OSPF in SONiC runs inside the 'bgp' Docker container via FRR (Free Range Routing), the same container as bgpd and zebra. ospfd handles the OSPF FSM, LSA database, and SPF computation. zebra receives OSPF routes and installs them into the Linux kernel RIB. The OSPF route programming pipeline (ospfd -> zebra -> fpmsyncd -> APPL_DB -> orchagent -> ASIC_DB -> syncd) is identical to the BGP route pipeline -- all routes converge at zebra and fpmsyncd.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "sonic-buildimage:src/sonic-frr/ and FRR ospfd"
+    },
+    {
+      "note": "SONiC's CONFIG_DB support for OSPF is less complete than for BGP. Many SONiC deployments configure OSPF directly in /etc/frr/frr.conf or via vtysh, rather than through CONFIG_DB + frrcfgd. Check whether frrcfgd has OSPF template support in your SONiC build. In builds without frrcfgd OSPF support, direct FRR config changes persist across ospfd restarts but may be overwritten by a full 'config reload'. Always verify with 'docker exec bgp vtysh -c show running-config'.",
+      "human_error_risk": "HIGH",
+      "source_ref": "sonic-buildimage:src/sonic-frr/frrcfgd/ -- check for ospf template files"
+    },
+    {
+      "note": "OSPF and BGP share the same 'bgp' container and the same zebra process in SONiC. Routes from both protocols are stored in zebra's RIB and forwarded to fpmsyncd. Administrative distance determines which protocol's route wins when both have a route to the same prefix: OSPF intra-area=110, OSPF inter-area=110, OSPF external E1/E2=150, BGP eBGP=20, BGP iBGP=200. Be aware of these interactions when both protocols are running simultaneously.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "FRR zebra administrative distance defaults and SONiC bgp container architecture"
+    },
+    {
+      "note": "OSPF hello and dead interval configuration in SONiC/FRR is done at the interface level, not globally. Every interface participating in OSPF can have independent timer values. This is both a feature (optimization per link type) and a trap -- engineers often configure timers globally expecting them to apply everywhere, but FRR requires explicit per-interface configuration. Always verify with 'docker exec bgp vtysh -c show ip ospf interface <ifname>' after configuring timers.",
+      "human_error_risk": "HIGH",
+      "source_ref": "FRR ospfd interface configuration: ospfd/ospf_interface.c"
+    },
+    {
+      "note": "On SONiC data-center switches with point-to-point links between routers, configure 'ip ospf network point-to-point' on each routed interface. This disables DR/BDR election (which is unnecessary on point-to-point links) and speeds up adjacency formation from 2-Way directly to ExStart without waiting for DR/BDR election. This is a best practice for spine-leaf SONiC fabrics using OSPF as the underlay IGP.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "RFC 2328 Section 9.1 and FRR ospfd network type configuration"
+    },
+    {
+      "note": "OSPF external route redistribution from BGP into OSPF ('redistribute bgp' under 'router ospf') should always include a route-map. Without a route-map, ALL BGP routes -- including BGP default routes and potentially thousands of prefixes -- are injected into the OSPF LSDB as Type-5 external LSAs. This can cause OSPF to flood thousands of LSAs to all routers in the OSPF domain and severely impact CPU and convergence time.",
+      "human_error_risk": "HIGH",
+      "source_ref": "FRR ospfd redistribution and RFC 2328 AS External LSA flooding"
+    },
+    {
+      "note": "The OSPF Router ID in FRR is selected automatically from the highest configured IP address on any interface, preferring loopback interfaces. In SONiC, Loopback0 is the standard management loopback -- configure it first before enabling OSPF to ensure a stable Router ID. A Router ID change (due to loopback removal or ospfd restart without a configured loopback) causes ospfd to flush and re-originate all its LSAs, temporarily breaking all adjacencies.",
+      "human_error_risk": "MEDIUM",
+      "source_ref": "FRR ospfd Router ID selection: ospfd/ospf_main.c"
+    },
+    {
+      "note": "BFD integration with OSPF in SONiC/FRR requires both ospfd and bfdd to be running. BFD for OSPF is configured per-interface ('ip ospf bfd') in vtysh. When BFD detects a link failure, it notifies ospfd which immediately tears down the OSPF adjacency -- much faster than waiting for the OSPF Dead Interval. Verify BFD sessions: 'docker exec bgp vtysh -c show bfd peers'. Note that BFD echo mode may not be supported on all SONiC ASIC platforms.",
+      "human_error_risk": "LOW",
+      "source_ref": "FRR bfdd and ospfd BFD integration: ospfd/ospf_bfd.c"
+    }
+  ],
+  "sonic_frr_mapping": {
+    "frr_process": "ospfd",
+    "frr_config_file": "/etc/frr/frr.conf or /etc/frr/ospfd.conf (may be managed by frrcfgd or edited directly depending on SONiC build)",
+    "frrcfgd_source": "sonic-buildimage:src/sonic-frr/frrcfgd/ (check for OSPF template support in build)",
+    "config_managed_by": "frrcfgd (if OSPF CONFIG_DB templates exist) or direct FRR config file",
+    "container": "bgp",
+    "frr_socket": "/var/run/frr/ospfd.vty",
+    "fpm_port": "localhost:2620 (zebra FPM module to fpmsyncd -- shared with BGP routes)",
+    "supervisor_config": "/etc/supervisor/conf.d/ospfd.conf (inside bgp container)"
+  },
+  "key_commands": [
+    "docker exec bgp vtysh -c 'show ip ospf'",
+    "docker exec bgp vtysh -c 'show ip ospf neighbor'",
+    "docker exec bgp vtysh -c 'show ip ospf neighbor detail'",
+    "docker exec bgp vtysh -c 'show ip ospf interface'",
+    "docker exec bgp vtysh -c 'show ip ospf interface <ifname>'",
+    "docker exec bgp vtysh -c 'show ip ospf database'",
+    "docker exec bgp vtysh -c 'show ip ospf database router'",
+    "docker exec bgp vtysh -c 'show ip ospf database external'",
+    "docker exec bgp vtysh -c 'show ip ospf database summary'",
+    "docker exec bgp vtysh -c 'show ip ospf virtual-links'",
+    "docker exec bgp vtysh -c 'show ip ospf spf-calculation'",
+    "docker exec bgp vtysh -c 'show ip route ospf'",
+    "docker exec bgp vtysh -c 'show zebra fpm stats'",
+    "docker exec bgp vtysh -c 'show running-config'",
+    "docker exec bgp supervisorctl status",
+    "docker exec bgp supervisorctl status fpmsyncd",
+    "docker exec bgp supervisorctl restart fpmsyncd",
+    "docker stats bgp --no-stream",
+    "sudo tcpdump -i <interface> proto ospf -nn -c 20",
+    "redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l",
+    "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix/len>'",
+    "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | wc -l",
+    "redis-cli -n 4 KEYS 'INTERFACE*'",
+    "docker logs bgp 2>&1 | grep -E 'ospf|OSPF' | tail -30",
+    "docker logs swss 2>&1 | grep -E 'ERROR|route' | tail -30",
+    "ip link show <interface>"
+  ],
+  "related_protocols": [
+    "bgp-4",
+    "bfd",
+    "static-routing"
+  ],
+  "tags": [
+    "routing",
+    "igp",
+    "link-state",
+    "area",
+    "spf",
+    "lsa",
+    "frr",
+    "ospf"
+  ]
+}

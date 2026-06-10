@@ -1,0 +1,252 @@
+{
+  "subsystem_id": "syncd-container",
+  "display_name": "Syncd Container",
+  "container_name": "syncd",
+  "purpose": "SAI-to-vendor-SDK bridge for ASIC programming. Receives SAI API calls from orchagent (via ASIC_DB redis notifications), translates them into vendor-specific SDK calls, and programs the forwarding ASIC. Acts as the sole gateway between the SONiC control plane and physical hardware. Owns ASIC_DB as the source of truth for hardware object state.",
+  "startup_order": 2,
+  "depends_on_containers": ["database-container"],
+  "def_refs": [
+    "daemon:syncd",
+    "daemon:gbsyncd",
+    "db:asic_db",
+    "db:counters_db",
+    "db:flex_counter_db",
+    "db:gb_asic_db",
+    "db:gb_counters_db",
+    "db:state_db"
+  ],
+  "daemons": [
+    {
+      "name": "syncd",
+      "role": "Main SAI bridge daemon. Subscribes to ASIC_DB for orchagent-written SAI object entries, calls the vendor SAI shared library (libsai.so) to program the ASIC, and writes SAI object OIDs and counter data back to ASIC_DB and COUNTERS_DB. Hosts the flex-counter thread that periodically polls ASIC counters and populates COUNTERS_DB for telemetry and monitoring. Single-threaded for SAI calls (SAI is not thread-safe); counter polling runs on a separate thread.",
+      "critical": true,
+      "db_interactions": {
+        "reads": ["ASIC_DB: ASIC_STATE:* (SAI object create/set/remove/get requests from orchagent)", "FLEX_COUNTER_DB: FLEX_COUNTER_TABLE (counter polling configuration and intervals)", "FLEX_COUNTER_DB: FLEX_COUNTER_GROUP_TABLE"],
+        "writes": ["ASIC_DB: ASIC_STATE:* (SAI OIDs after object creation)", "ASIC_DB: RIDTABLE (RIF/object ID mapping for warm restart)", "COUNTERS_DB: COUNTERS:* (port, queue, pg, ACL, tunnel counters)", "COUNTERS_DB: COUNTERS_PORT_NAME_MAP, COUNTERS_QUEUE_NAME_MAP, COUNTERS_PG_NAME_MAP", "STATE_DB: SWITCH_CAPABILITY|switch (SAI capability advertisement)"]
+      }
+    },
+    {
+      "name": "dsserve",
+      "role": "Debug shell server. Provides a Unix socket-based debug REPL that allows engineers to issue raw SAI API calls interactively for diagnostic purposes. Used by 'bcmcmd' or vendor-equivalent debug tools. Not involved in the forwarding plane data path; for diagnostic access only.",
+      "critical": false,
+      "db_interactions": {
+        "reads": [],
+        "writes": []
+      }
+    },
+    {
+      "name": "gbsyncd",
+      "role": "Gearbox syncd daemon. Platform-dependent -- only present on systems with external PHY gearbox devices (e.g., certain 400G platforms with retimers). Provides a secondary SAI bridge specifically for gearbox PHY programming. Mirrors the syncd pattern but targets the gearbox SAI library. Reads from GB_ASIC_DB and writes counter data to GB_COUNTERS_DB.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["db:gb_asic_db: ASIC_STATE:* (gearbox SAI object requests)"],
+        "writes": ["db:gb_asic_db: ASIC_STATE:* (gearbox SAI OIDs)", "db:gb_counters_db: COUNTERS:* (gearbox port counters)"]
+      }
+    }
+  ],
+  "key_data_flows": [
+    {
+      "flow": "SAI object programming (orchagent -> ASIC)",
+      "path": "orchagent writes ASIC_DB:ASIC_STATE:<SAI_OBJECT_TYPE>:<temp_OID> -> syncd receives redis keyspace notification -> syncd calls libsai.so sai_*_api->create_* -> vendor SDK programs ASIC -> syncd writes real OID back to ASIC_DB",
+      "notes": "The entire ASIC programming path runs through this single channel. If ASIC_DB pub/sub is broken or syncd is slow, all hardware programming stalls. Use 'redis-cli -n 1 monitor' to observe real-time SAI calls."
+    },
+    {
+      "flow": "Counter collection (ASIC -> COUNTERS_DB)",
+      "path": "FLEX_COUNTER_DB:FLEX_COUNTER_TABLE configures polling intervals -> syncd flex-counter thread wakes on interval -> calls SAI sai_port_api->get_port_stats() in batch -> writes raw counter values to COUNTERS_DB:COUNTERS:<port_OID>",
+      "notes": "Counter polling is independent of SAI programming. A hung flex-counter thread does NOT block SAI calls but COUNTERS_DB goes stale. 'show interfaces counters' will show frozen values."
+    },
+    {
+      "flow": "SAI capability advertisement (syncd -> orchagent)",
+      "path": "syncd starts -> calls sai_switch_api->get_switch_attribute() for capability set -> writes results to STATE_DB:SWITCH_CAPABILITY|switch -> orchagent reads on startup to constrain what SAI objects it will attempt to create",
+      "notes": "If this flow fails, orchagent may attempt unsupported SAI operations and get SAI_STATUS_NOT_SUPPORTED errors. Check STATE_DB:SWITCH_CAPABILITY|switch is populated after syncd start."
+    },
+    {
+      "flow": "Gearbox programming (orchagent -> external PHY)",
+      "path": "orchagent writes GB_ASIC_DB:ASIC_STATE:* -> gbsyncd receives notification -> calls gearbox SAI library -> programs external PHY via platform-specific bus",
+      "notes": "Only active on gearbox-capable platforms. If gbsyncd is absent on a non-gearbox platform, GB_ASIC_DB will be empty and this flow is a no-op."
+    }
+  ],
+  "warm_restart": {
+    "supported": true,
+    "mechanism": "syncd saves ASIC object state (OID mappings, RID table) to ASIC_DB:RIDTABLE before exit. On restart, syncd calls sai_switch_api->initialize_switch() in warm-boot mode, which instructs the vendor SDK to reconnect to the running ASIC without a hardware reset. orchagent then reconciles ASIC_DB state against APPL_DB and only programs deltas.",
+    "enable_command": "config warm_restart enable syncd",
+    "verify_command": "show warm_restart config",
+    "caveat": "Warm restart requires vendor SAI and SDK support. Not all platforms support SAI warm boot. A failed SAI warm boot will cause syncd to fall back to cold boot, resetting all ASIC state and triggering full reprogramming by orchagent. Verify with platform vendor before relying on this in production."
+  },
+  "restart_impact": "Severe traffic disruption. A syncd restart triggers a full ASIC reset on most platforms (cold boot), wiping all programmed routes, neighbors, VLANs, ACLs, and port configurations from hardware. orchagent must then fully reprogram all objects. On large-scale deployments with 500k+ routes and thousands of ACL entries, convergence can take 30-120 seconds. With warm restart enabled and vendor support, disruption is reduced to the SAI reconnect window (typically 1-5 seconds).",
+  "restart_commands": {
+    "full_restart": "sudo systemctl restart syncd",
+    "check_status": "docker exec syncd supervisorctl status",
+    "syncd_only": "docker exec syncd supervisorctl restart syncd",
+    "gbsyncd_only": "docker exec syncd supervisorctl restart gbsyncd",
+    "warm_restart": "config warm_restart enable syncd && sudo systemctl restart syncd"
+  },
+  "health_check_commands": [
+    "sudo systemctl status syncd",
+    "docker exec syncd supervisorctl status",
+    "show system-health summary",
+    "docker exec syncd ps aux | grep syncd",
+    "show processes memory | grep syncd",
+    "redis-cli -n 1 dbsize"
+  ],
+  "state_verification_commands": [
+    "redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | wc -l (ASIC_DB programmed route count)",
+    "redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_NEIGHBOR_ENTRY*' | wc -l (ASIC_DB programmed neighbor count)",
+    "redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_PORT*' | wc -l (ASIC_DB port object count)",
+    "redis-cli -n 2 hgetall 'COUNTERS:oid:0x*' (verify COUNTERS_DB is being populated)",
+    "sonic-db-cli STATE_DB hgetall 'SWITCH_CAPABILITY|switch' (verify SAI capabilities advertised)",
+    "redis-cli -n 5 keys '*' | wc -l (FLEX_COUNTER_DB entry count)",
+    "show interfaces counters (verify counter collection is live, not frozen)"
+  ],
+  "log_locations": {
+    "syncd": "/var/log/syncd.log",
+    "syslog": "/var/log/syslog (tagged syncd#syncd)",
+    "crash_dumps": "/var/core/ (syncd.*.core files)",
+    "vendor_sdk": "Platform-dependent. Common: /var/log/bcm.log (Broadcom), /var/log/sai.log (generic SAI trace). Check /etc/sonic/syncd.conf for SDK log path overrides.",
+    "gbsyncd": "/var/log/gbsyncd.log (if gearbox present)"
+  },
+  "common_issues": [
+    {
+      "issue": "syncd crash with SAI failure",
+      "symptoms": [
+        "All hardware forwarding stops simultaneously -- all traffic blackholed",
+        "supervisorctl shows syncd in FATAL or STOPPED state",
+        "systemctl status syncd shows recent restart timestamps in rapid succession",
+        "ASIC_DB ASIC_STATE keys are present but hardware is not programmed",
+        "orchagent.log shows 'SAI error' or 'syncd restarted' messages",
+        "show interfaces status shows all ports as operationally down after restart"
+      ],
+      "causes": [
+        "Vendor SAI library (libsai.so) assertion or segfault triggered by an unsupported object combination or scale limit",
+        "Vendor SDK initialization failure -- SDK cannot communicate with ASIC (PCI enumeration failure, firmware mismatch)",
+        "OOM killer terminating syncd during large route batch programming under memory pressure",
+        "ASIC_DB contains stale or corrupt SAI objects from a prior crash that trigger invariant violations in SAI",
+        "Kernel module for ASIC driver not loaded or wrong version loaded",
+        "Platform hardware fault (ASIC unresponsive over PCIe)"
+      ],
+      "diagnosis": [
+        "tail -200 /var/log/syncd.log -- look for 'SAI_STATUS_FAILURE', 'assert', 'SIGSEGV', 'terminate called after throwing'",
+        "ls -lt /var/core/*.core | head -5 -- check for fresh syncd core files",
+        "dmesg | grep -iE 'oom|killed|syncd|pci|asic' -- check for OOM kill or PCIe errors",
+        "journalctl -u syncd --since '10 minutes ago' | grep -iE 'error|fail|crash'",
+        "redis-cli -n 1 dbsize -- check if ASIC_DB is unexpectedly large (scale trigger)",
+        "docker exec syncd tail -50 /var/log/syncd.log | grep -i 'sai_status'",
+        "lsmod | grep -i asic (or platform kernel module name) -- verify ASIC driver loaded"
+      ],
+      "resolution": [
+        "For SAI library crash: capture core file and syncd.log, open vendor TAC case with both artifacts",
+        "For stale ASIC_DB: redis-cli -n 1 FLUSHDB (WARNING: clears all ASIC state) then sudo systemctl restart syncd && swss -- causes full reprogramming",
+        "For OOM: show processes memory | grep syncd; reduce scale or increase available memory; check for leak with repeated 'show processes memory' over time",
+        "For SDK init failure: check dmesg for ASIC driver errors; verify correct platform drivers loaded with 'sudo platform_utils.sh' or equivalent; power-cycle may be required",
+        "For kernel module: sudo modprobe <asic_driver_module>; verify with lsmod"
+      ]
+    },
+    {
+      "issue": "ASIC_DB and hardware state divergence",
+      "symptoms": [
+        "ASIC_DB shows routes/neighbors/VLANs present but traffic is not forwarded as expected",
+        "orchagent.log shows successful ASIC_DB writes with no errors",
+        "syncd.log shows SAI calls completing with SAI_STATUS_SUCCESS but hardware behavior is wrong",
+        "Specific traffic class or prefix range is affected while others work (partial divergence)",
+        "show arp shows neighbors resolved but pings to those destinations fail",
+        "ASIC counters show packets arriving on ingress port but no egress (ASIC drop, not Linux drop)"
+      ],
+      "causes": [
+        "syncd SAI call returned SAI_STATUS_SUCCESS but vendor SDK silently deferred or dropped the programming (known SDK bugs on some platforms)",
+        "orchagent wrote SAI objects in wrong dependency order -- child object created before parent (e.g., route before next-hop OID resolved)",
+        "ASIC hardware table corruption requiring SDK or ASIC reset to clear",
+        "Mismatched SAI library version between syncd binary and installed libsai.so -- silent API semantic differences",
+        "Flex-counter polling interfering with SAI programming thread on platforms with non-reentrant SAI implementations"
+      ],
+      "diagnosis": [
+        "redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*x.x.x.x*' -- verify specific route is in ASIC_DB",
+        "docker exec syncd grep 'x.x.x.x' /var/log/syncd.log | grep -i 'sai_status' -- check SAI return code for that route",
+        "show platform sai-profile (if available) -- verify SAI library version matches expected",
+        "redis-cli -n 1 monitor (in a separate shell) while re-adding a test route -- watch for SAI call and response",
+        "Use vendor diagnostic tools (e.g., 'bcmcmd l3 defip show' for Broadcom) to inspect ASIC hardware tables directly",
+        "show interfaces counters (look for RX OK but no TX on expected egress ports -- ASIC-level drop)"
+      ],
+      "resolution": [
+        "For silent SDK failures: restart syncd (sudo systemctl restart syncd && swss) to force full reprogram; if recurring, file vendor bug with syncd.log and ASIC hardware dump",
+        "For dependency ordering: usually an orchagent bug; check orchagent.log for 'retry' entries; typically resolves after orchagent retry loop completes",
+        "For ASIC table corruption: platform-dependent; may require 'sudo syncd_reset' or platform reboot",
+        "For SAI version mismatch: verify with 'docker exec syncd syncd --version' and 'ls -la /usr/lib/libsai.so*'; reinstall correct SAI package"
+      ]
+    },
+    {
+      "issue": "Memory leak in syncd",
+      "symptoms": [
+        "syncd RSS memory grows continuously over hours or days without bound",
+        "show processes memory | grep syncd shows steadily increasing memory usage across checks",
+        "System free memory decreases over time even under stable routing table",
+        "Eventually syncd is OOM-killed, causing full ASIC reset and traffic outage",
+        "Memory growth correlates with route churn events (BGP reconvergence, link flaps) or counter polling activity"
+      ],
+      "causes": [
+        "Route churn (mass withdraw/re-add cycles) causes SAI object create/delete pairs that leak internal SDK memory structures",
+        "Counter polling (flex-counter thread) accumulates OID list entries without cleanup when ports are removed or recreated",
+        "Large-scale deployments with many SAI objects exhaust syncd internal hash table memory over time",
+        "Vendor SAI library memory leak in specific API call paths (especially sai_route_entry or sai_next_hop_group_member APIs)",
+        "ASIC_DB subscriber thread leaking redis reply objects on high-churn key notification streams"
+      ],
+      "diagnosis": [
+        "watch -n 30 'show processes memory | grep syncd' -- observe trend over time",
+        "redis-cli -n 1 dbsize -- check if ASIC_DB is growing unexpectedly (orphaned objects)",
+        "redis-cli -n 5 keys '*' | wc -l -- check FLEX_COUNTER_DB for orphaned counter entries",
+        "redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER*' | wc -l -- ECMP member leak is common",
+        "grep -c 'sai_route_entry' /var/log/syncd.log -- high SAI route call count may indicate churn-driven leak",
+        "valgrind --tool=massif (only in lab) or use vendor SAI diagnostic memory dump tools"
+      ],
+      "resolution": [
+        "Immediate: if OOM is imminent, schedule a maintenance window and restart syncd during low-traffic period",
+        "Reduce route churn: investigate BGP instability with 'show bgp summary' and 'show bgp dampening parameters'; dampen flapping peers",
+        "For counter leak: audit FLEX_COUNTER_DB for orphaned entries: redis-cli -n 5 keys 'FLEX_COUNTER_TABLE*' | xargs -I{} redis-cli -n 5 del {} (remove stale entries); then restart syncd",
+        "For vendor SAI leak: upgrade SAI library to latest vendor-recommended version; document leak rate and file vendor bug",
+        "Long-term: implement scheduled syncd restart during maintenance window (config cron) if leak rate is known and bounded"
+      ]
+    },
+    {
+      "issue": "Counter collection stall (flex-counter thread hang)",
+      "symptoms": [
+        "show interfaces counters output shows the same values across repeated calls -- counters are frozen",
+        "COUNTERS_DB timestamps are not updating",
+        "Monitoring systems (Prometheus, SNMP) show flat-line counter graphs with no increments",
+        "CPU usage for syncd is either abnormally high (busy loop) or zero (thread stopped)",
+        "Other syncd functionality (SAI programming) may still work -- traffic forwarding is unaffected",
+        "redis-cli -n 2 hgetall 'COUNTERS:oid:0x*' returns stale values"
+      ],
+      "causes": [
+        "Vendor SAI sai_port_api->get_port_stats() call blocking indefinitely in SDK (firmware hang during counter read DMA)",
+        "FLEX_COUNTER_DB misconfiguration -- counter polling interval set to 0 or invalid value causing tight poll loop that starves syncd main thread",
+        "OID reference in FLEX_COUNTER_TABLE points to a deleted or invalid SAI object causing SAI to return SAI_STATUS_ITEM_NOT_FOUND in a tight retry loop",
+        "syncd main thread deadlocked with flex-counter thread over a shared SAI API mutex (SAI is not thread-safe on some platforms)",
+        "COUNTERS_DB redis connection timeout or backpressure from large counter write batch"
+      ],
+      "diagnosis": [
+        "redis-cli -n 2 hgetall COUNTERS_DB_VERSION -- check if COUNTERS_DB is being updated at all",
+        "date; redis-cli -n 2 hget 'COUNTERS:oid:0x1000000000002' SAI_PORT_STAT_IF_IN_OCTETS; sleep 10; redis-cli -n 2 hget 'COUNTERS:oid:0x1000000000002' SAI_PORT_STAT_IF_IN_OCTETS -- compare two values to confirm stale",
+        "docker exec syncd top -b -n 1 | grep syncd -- check CPU consumption of syncd process",
+        "redis-cli -n 5 hgetall 'FLEX_COUNTER_GROUP_TABLE|PORT_STAT_COUNTER_POLLING_INTERVAL' -- verify polling interval is reasonable (default 1000ms)",
+        "redis-cli -n 5 keys 'FLEX_COUNTER_TABLE*' | wc -l -- check for OID list bloat",
+        "strace -p $(pgrep syncd) -e trace=futex,nanosleep (lab only) -- detect deadlock or spin-wait"
+      ],
+      "resolution": [
+        "Immediate relief: docker exec syncd supervisorctl restart syncd -- resets flex-counter thread state; NOTE: this also resets ASIC and triggers full reprogram",
+        "For tight poll loop: redis-cli -n 5 hset 'FLEX_COUNTER_GROUP_TABLE|PORT_STAT_COUNTER_POLLING_INTERVAL' POLL_INTERVAL 1000 -- reset to 1000ms default",
+        "For orphaned OIDs: redis-cli -n 5 keys 'FLEX_COUNTER_TABLE*PORT*' | xargs redis-cli -n 5 del -- remove stale counter entries, then let orchagent repopulate",
+        "For vendor SAI blocking in get_port_stats: reduce counter polling frequency as workaround; file vendor bug with syncd.log showing last SAI call before hang",
+        "To monitor after fix: watch -n 5 'show interfaces counters | head -20' -- verify counters are incrementing"
+      ]
+    }
+  ],
+  "scale_considerations": {
+    "max_sai_objects": "Platform-dependent hard limit enforced by vendor SAI. syncd returns SAI_STATUS_TABLE_FULL when exceeded. Check 'show platform sai-profile' and vendor capacity documentation. Common limits: 32k IPv4 routes (low-end), 256k+ (high-end datacenter ASICs).",
+    "counter_polling_overhead": "Each polled counter requires a SAI get_stats() call. On systems with 128+ ports and 100+ counters per port, each poll cycle issues 12,800+ SAI calls. Default 1-second polling on large systems can create measurable SAI bus contention. Tune FLEX_COUNTER_GROUP_TABLE polling intervals if SAI latency increases.",
+    "asic_db_size": "ASIC_DB grows proportionally with programmed objects. Redis memory usage of 500MB+ is normal on 400k-route deployments. Monitor with 'redis-cli -n 1 info memory'. Unexplained growth indicates orphaned SAI objects from a prior crash.",
+    "warm_boot_timing": "SAI warm boot reconciliation time scales with ASIC_DB size. 400k routes may take 30+ seconds for syncd to fully reconcile. orchagent will stall on ASIC_DB subscription during this window -- normal behavior, not a hang."
+  },
+  "related_subsystems": [
+    "database-container",
+    "swss-container"
+  ]
+}

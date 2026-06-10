@@ -214,5 +214,29 @@
     "sonic_default": "20s",
     "sonic_config_path": "CONFIG_DB:STP|GLOBAL:max_age",
     "sonic_frr_path": "Not applicable — managed by SONiC STP container"
+  },
+  {
+    "def_id": "timer:mclag-keepalive",
+    "name": "MC-LAG Keepalive Interval",
+    "protocol": "mclag",
+    "default": "1s",
+    "range": "1–60s",
+    "on_expiry": "A keepalive message is sent to the MC-LAG peer over the keepalive link (separate from the peer link). If the peer does not respond within the session-timeout, it is declared dead and failover begins.",
+    "tuning_advice": "1s is the recommended default. Lower values (sub-second) are not supported by SONiC iccpd. Higher values increase failover time. The keepalive link should be a dedicated L3 connection (not over the peer link) for independent failure detection.",
+    "sonic_default": "1s",
+    "sonic_config_path": "CONFIG_DB:MCLAG_DOMAIN|<domain-id>:keepalive_interval",
+    "sonic_frr_path": "Not applicable — managed by iccpd"
+  },
+  {
+    "def_id": "timer:mclag-session-timeout",
+    "name": "MC-LAG Session Timeout",
+    "protocol": "mclag",
+    "default": "15s",
+    "range": "3–3600s",
+    "on_expiry": "MC-LAG peer declared dead. The surviving peer assumes sole ownership of all MC-LAG port-channels, withdraws the peer's MAC addresses, and begins forwarding traffic as a standalone device. Orphan ports on the failed peer lose connectivity.",
+    "tuning_advice": "Session timeout must be at least 3x the keepalive interval. 15s provides a balance between false-positive avoidance and fast failover. In stable environments with dedicated keepalive links, 10s is reasonable. Never set below 3s.",
+    "sonic_default": "15s",
+    "sonic_config_path": "CONFIG_DB:MCLAG_DOMAIN|<domain-id>:session_timeout",
+    "sonic_frr_path": "Not applicable — managed by iccpd"
   }
 ]

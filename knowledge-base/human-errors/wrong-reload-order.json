@@ -1,0 +1,115 @@
+{
+  "error_id": "wrong-reload-order",
+  "display_name": "Restarting SONiC containers in wrong dependency order",
+  "severity": "HIGH",
+  "category": "operational-error",
+  "sonic_version": "202511",
+  "pattern": "Operator restarts one or more SONiC containers without respecting the startup dependency chain. Common patterns: restarting the 'database' container while swss, syncd, bgp, teamd, lldp, or pmon are still running; restarting 'swss' before 'syncd' is healthy; or issuing 'docker restart swss' and 'docker restart syncd' in quick succession without waiting for full initialization. The dependency chain in SONiC 202511 is: database -> syncd -> swss -> bgp/teamd/lldp/pmon.",
+  "what_goes_wrong": "Every SONiC daemon subscribes to Redis databases (CONFIG_DB, APPL_DB, ASIC_DB, STATE_DB) at startup using swsscommon SubscriberStateTable or ProducerStateTable. If the 'database' container is restarted while dependent containers are still running, those containers lose their Redis socket connections instantly. swsscommon's connection pool does not transparently reconnect — daemons either crash with a Redis connection error, enter a reconnect retry loop, or silently drop pending write batches. Even if Redis comes back, orphaned SubscriberStateTable listeners miss all key-space notifications that fired during the outage, leaving APPL_DB and ASIC_DB in a stale or inconsistent state relative to CONFIG_DB. When 'swss' is restarted before 'syncd' is ready, orchagent initializes and begins replaying CONFIG_DB entries into APPL_DB but syncd's SAI proxy is not yet accepting calls, causing orchagent to log SAI API errors and place ports or routes in a FAILED state. Those FAILED entries are not automatically retried once syncd recovers — a subsequent swss restart is required to clear them. Restarting 'syncd' while 'swss' is running causes orchagent to lose the SAI channel; orchagent enters an error state and stops programming the ASIC, leaving traffic forwarding frozen at whatever the hardware state was at the moment of the restart.",
+  "symptoms": [
+    "'docker ps' shows containers as 'Up' but 'show interface status' reports all interfaces as down or unknown",
+    "orchagent log shows 'Failed to perform SAI operation' or 'SAI_STATUS_FAILURE' errors after syncd was restarted while swss was running",
+    "'redis-cli -n 1 KEYS *' returns empty or stale APPL_DB entries after a database container restart with other containers still up",
+    "swsscommon-based daemons (orchagent, neighsyncd, portsyncd) log 'FATAL: RedisClient exception: Connection refused' or 'redis_client: unable to connect' following a database restart",
+    "BGP sessions are down and 'show bgp summary' shows 'Idle' even though the bgp container is running, because fpmsyncd lost its APPL_DB connection during a database restart",
+    "'show interface counters' returns no output or all-zero counters after a syncd restart, indicating counters_db was reset and syncd has not re-populated it",
+    "teamd reports 'LACP PDU send failed' and port-channels go down after teamd container was started before swss had finished initializing LAG entries in APPL_DB",
+    "System remains stuck in a partial state even after the restarted container reports 'healthy' because dependent daemons never re-subscribed to the databases",
+    "journalctl shows a rapid sequence of container exit/start events indicating crash-loop caused by failed Redis connections"
+  ],
+  "detection_commands": [
+    {
+      "command": "docker ps --format 'table {{.Names}}\\t{{.Status}}\\t{{.RunningFor}}' | grep -E '(database|syncd|swss|bgp|teamd|lldp|pmon)'",
+      "purpose": "Show current status and uptime of all critical SONiC containers. Containers with very recent start times (seconds or low minutes) next to older containers indicate an out-of-order restart scenario."
+    },
+    {
+      "command": "for c in database syncd swss bgp teamd lldp pmon; do echo \"=== $c ===\"; docker inspect $c --format '{{.State.StartedAt}} status={{.State.Status}} restarts={{.RestartCount}}' 2>/dev/null; done",
+      "purpose": "Show the exact start timestamp and restart count for each container in dependency order. A 'database' StartedAt more recent than 'swss' or 'syncd' confirms the database was restarted after dependents were already running."
+    },
+    {
+      "command": "journalctl --since '30 minutes ago' | grep -E '(docker|containerd).*(database|syncd|swss|bgp|teamd)' | grep -E '(start|stop|kill|die|exit|restart)' | head -40",
+      "purpose": "Audit container lifecycle events from the system journal to reconstruct the restart sequence and identify ordering violations."
+    },
+    {
+      "command": "docker logs swss --since 30m 2>&1 | grep -E '(Connection refused|RedisClient|unable to connect|FATAL|orchagent.*SAI|SAI_STATUS)' | head -30",
+      "purpose": "Check orchagent and swss daemon logs for Redis connection errors or SAI failures that indicate the container started before its dependencies were ready."
+    },
+    {
+      "command": "docker logs syncd --since 30m 2>&1 | grep -E '(ERROR|FATAL|SAI|syncd_main|initialize|bcm|sai_api)' | head -30",
+      "purpose": "Check syncd startup logs for SAI initialization errors. syncd must complete SAI init before swss/orchagent can make any SAI calls."
+    },
+    {
+      "command": "redis-cli -n 1 KEYS 'PORT_TABLE:*' | wc -l && redis-cli -n 1 KEYS 'LAG_TABLE:*' | wc -l && redis-cli -n 1 KEYS 'ROUTE_TABLE:*' | wc -l",
+      "purpose": "Count APPL_DB entries for ports, LAGs, and routes. After a database restart with dependents still running, these counts may be zero or stale because orchagent did not replay CONFIG_DB into APPL_DB."
+    },
+    {
+      "command": "redis-cli -n 2 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_PORT:*' | wc -l",
+      "purpose": "Count port objects in ASIC_DB. A count of zero after swss appears healthy means syncd was not ready when orchagent tried to program ports, or syncd's ASIC_DB state was wiped during restart."
+    },
+    {
+      "command": "redis-cli -n 6 HGET 'SWITCH_CAPABILITY|switch' 'PORT_LIST' 2>/dev/null | tr ',' '\\n' | wc -l",
+      "purpose": "Check STATE_DB for port capability entries. Missing entries indicate syncd did not finish capability discovery before swss tried to initialize, which happens when swss starts too early."
+    },
+    {
+      "command": "docker exec swss supervisorctl status 2>/dev/null || docker exec swss bash -c 'ps aux | grep -E \"(orchagent|portsyncd|neighsyncd|intfmgrd|vlanmgrd)\"'",
+      "purpose": "Verify all daemons inside the swss container are running. A database restart that caused swss daemons to crash may leave the container running (supervisord alive) while the daemons inside are dead."
+    }
+  ],
+  "correct_procedure": "To restart a single container safely: (1) Stop dependent containers first in reverse dependency order before stopping the target. To restart 'database': run 'sudo systemctl stop swss bgp teamd lldp pmon syncd' in that order, then 'sudo systemctl restart database', then start in forward order: syncd, swss, bgp, teamd, lldp, pmon. Wait for each container to reach a healthy state before starting the next. (2) To check health before proceeding: 'docker exec syncd syncdctl status' or watch 'redis-cli -n 2 KEYS ASIC_STATE:SAI_OBJECT_TYPE_PORT:*' for port objects to appear. (3) For a full system reload, use 'sudo config reload' which handles ordering internally, or 'sudo reboot' to let systemd bring services up in the correct order via /etc/sonic/sonic.target dependencies. (4) If only swss needs a restart and syncd is healthy, it is safe to run 'sudo systemctl restart swss' alone — but verify with 'show interface status' and 'show bgp summary' afterward.",
+  "why_it_breaks": [
+    "swsscommon does not transparently reconnect after a Redis server restart. Daemons that lose their socket connection at the OS level do not re-establish SubscriberStateTable listeners automatically; they crash or stop processing events, leaving APPL_DB in whatever state it was before the outage.",
+    "Restarting the 'database' container destroys all volatile Redis state. APPL_DB, ASIC_DB, STATE_DB, and COUNTERS_DB are all stored in memory (unless Redis persistence is enabled, which it is not by default in SONiC). When database restarts, these databases are empty. Dependent daemons must replay their full CONFIG_DB state into APPL_DB before traffic can be restored, but they only do this during their own startup sequence — not when database alone restarts.",
+    "orchagent in the swss container performs a full ASIC programming pass at startup by reading CONFIG_DB and writing to APPL_DB, which then triggers syncd to call into the SAI API. If syncd is not ready at the time orchagent starts, those SAI calls fail and the corresponding objects (ports, VLANs, routes, ACLs) are never programmed into the ASIC. orchagent does not retry failed SAI object creation on its own.",
+    "syncd initializes the SAI API and loads platform-specific SAI libraries at startup. This process can take 15-60 seconds on some platforms. swss daemons that start during this window receive SAI_STATUS_UNINITIALIZED or connection-refused errors and may abort their initialization sequences, resulting in an ASIC state that does not match CONFIG_DB.",
+    "The bgp container's fpmsyncd writes FIB routes into APPL_DB's ROUTE_TABLE. If APPL_DB was wiped by a database restart and fpmsyncd was not restarted, fpmsyncd does not replay existing FRR routes — it only pushes incremental updates from FRR. The ROUTE_TABLE stays empty until FRR sends a new route update (e.g., after a BGP peer flap), leaving the kernel FIB and ASIC route tables out of sync."
+  ],
+  "prevention": "Never restart the 'database' container in isolation on a live system — always perform a full 'config reload' or reboot instead. For planned maintenance requiring a single container restart (e.g., swss for a code upgrade), document and script the stop/start sequence with health-check gates between each step. Add a pre-restart check script that runs 'docker ps' and warns if the target container's dependents are still running. Consider using 'sudo systemctl' instead of 'docker restart' so systemd dependency ordering (Before=/After= directives in sonic.target) is honored.",
+  "related_errors": ["direct-redis-write", "manual-config-db-json-edit"],
+  "ref_daemons": [
+    "daemon:orchagent",
+    "daemon:syncd",
+    "daemon:portsyncd",
+    "daemon:neighsyncd",
+    "daemon:portmgrd",
+    "daemon:intfmgrd",
+    "daemon:vlanmgrd",
+    "daemon:teammgrd",
+    "daemon:teamsyncd",
+    "daemon:fpmsyncd",
+    "daemon:bgpcfgd",
+    "daemon:lldpsyncd",
+    "daemon:redis-server"
+  ],
+  "ref_dbs": [
+    "db:config_db",
+    "db:appl_db",
+    "db:asic_db",
+    "db:state_db",
+    "db:counters_db"
+  ],
+  "keywords": [
+    "container restart order",
+    "docker restart database",
+    "docker restart swss",
+    "docker restart syncd",
+    "dependency order",
+    "wrong order",
+    "out of order restart",
+    "redis connection refused",
+    "database container",
+    "startup sequence"
+  ],
+  "context_keywords": [
+    "restart",
+    "container",
+    "database",
+    "syncd",
+    "swss",
+    "dependency",
+    "order",
+    "redis",
+    "orchagent",
+    "SAI",
+    "initialization"
+  ]
+}

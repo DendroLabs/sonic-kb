@@ -1,0 +1,250 @@
+{
+  "subsystem_id": "database-container",
+  "display_name": "Database Container",
+  "container_name": "database",
+  "purpose": "Central Redis engine hosting all 15 SONiC databases for inter-container communication. Every other container depends on this one being healthy. Provides the shared state bus (pub/sub + keyspace notifications) that drives the entire SONiC config-to-ASIC pipeline. Without this container, no other SONiC service can start or operate.",
+  "startup_order": 1,
+  "depends_on_containers": [],
+  "def_refs": [
+    "daemon:redis-server",
+    "db:config_db",
+    "db:appl_db",
+    "db:asic_db",
+    "db:state_db",
+    "db:counters_db",
+    "db:flex_counter_db",
+    "db:loglevel_db",
+    "db:snmp_overlay_db",
+    "db:restapi_db",
+    "db:chassis_app_db",
+    "db:chassis_state_db",
+    "db:appl_state_db"
+  ],
+  "daemons": [
+    {
+      "name": "redis-server",
+      "role": "Single Redis instance hosting all 15 SONiC logical databases (DB 0-14) on a UNIX socket (/var/run/redis/redis.sock) and TCP port 6379. Each logical DB is dedicated to a specific data plane: CONFIG_DB (DB4) holds persistent switch configuration, APPL_DB (DB0) is the application-level state bus, ASIC_DB (DB1) holds SAI object state, STATE_DB (DB6) holds operational status, COUNTERS_DB (DB2) holds interface/ACL counters. Uses RDB persistence for CONFIG_DB durability. Pub/sub keyspace notifications on all DBs drive the *syncd/*mgrd daemon pipeline.",
+      "critical": true,
+      "db_interactions": {
+        "reads": ["CONFIG_DB (DB4): all tables on startup from /etc/sonic/config_db.json RDB snapshot"],
+        "writes": ["All 15 DBs: accepts writes from all containers; persists CONFIG_DB to /etc/sonic/config_db.json via redis-dump or config save"]
+      }
+    },
+    {
+      "name": "redis-sentinel",
+      "role": "Optional Redis Sentinel process used only in multi-ASIC chassis deployments. Monitors redis-server health, triggers failover if the primary Redis instance becomes unavailable. Not present in single-ASIC deployments. When active, listens on port 26379 and coordinates with remote chassis supervisor processes.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["CHASSIS_APP_DB (DB12), CHASSIS_STATE_DB (DB13): chassis-wide shared state"],
+        "writes": ["Sentinel-internal metadata; does not write application DBs directly"]
+      }
+    }
+  ],
+  "key_data_flows": [
+    {
+      "flow": "Config load -> CONFIG_DB (boot path)",
+      "path": "config load /etc/sonic/config_db.json -> sonic-cfggen parses JSON -> redis-cli writes to CONFIG_DB (DB4) -> keyspace notifications published -> all *mgrd daemons in swss/bgp/lldp/etc receive notifications and apply config",
+      "notes": "This is the authoritative config bootstrap path. If CONFIG_DB is empty or corrupt after reboot, all containers start but apply no configuration -- switch behaves as unconfigured."
+    },
+    {
+      "flow": "APPL_DB pub/sub pipeline (orchestration bus)",
+      "path": "Any producer (fpmsyncd, portmgrd, vlanmgrd, etc.) writes to APPL_DB (DB0) -> Redis keyspace notification published on DB0 -> orchagent ConsumerStateTable wakes up -> orchagent processes entry -> writes SAI objects to ASIC_DB (DB1) -> syncd notified",
+      "notes": "The entire config-to-ASIC pipeline is event-driven via Redis pub/sub. A slow or backlogged Redis causes all producers to block on publish acknowledgement, stalling the pipeline."
+    },
+    {
+      "flow": "config save / config reload (persistence)",
+      "path": "User runs 'config save' -> sonic-cfggen reads CONFIG_DB (DB4) via redis-cli -> serializes to JSON -> writes /etc/sonic/config_db.json -> survives reboot",
+      "notes": "Changes written directly to CONFIG_DB via redis-cli or config commands are live immediately but NOT persistent until 'config save' is run. Reboot without save discards changes."
+    },
+    {
+      "flow": "Counter polling (COUNTERS_DB)",
+      "path": "syncd flex-counter thread reads ASIC counters via SAI -> writes to COUNTERS_DB (DB2) at configured polling interval -> SNMP agent / CLI (show interfaces counters) reads COUNTERS_DB",
+      "notes": "Counter DB is write-heavy. On high port-count platforms, counter data can accumulate rapidly. COUNTERS_DB is not persisted across reboots -- all counters reset to zero on restart."
+    }
+  ],
+  "warm_restart": {
+    "supported": false,
+    "mechanism": "Redis server does not participate in SONiC warm restart. The database container must remain running continuously during warm restart of other containers. If the database container itself restarts, all in-memory DB state (APPL_DB, ASIC_DB, STATE_DB, etc.) is lost and all dependent containers must perform a cold restart to repopulate state.",
+    "enable_command": "N/A -- database container warm restart not supported",
+    "verify_command": "show warm_restart config",
+    "caveat": "Never restart the database container during a network warm restart window. Doing so will cause all containers to lose their DB connection and trigger full cold re-initialization."
+  },
+  "restart_impact": "Catastrophic -- restarting the database container drops all Redis connections simultaneously. Every running SONiC container (swss, syncd, bgp, teamd, lldp, etc.) loses its DB handle and will either crash or enter a reconnect loop. APPL_DB, ASIC_DB, and STATE_DB are fully cleared (non-persistent). The ASIC continues forwarding with its last-programmed state until syncd reconnects and reconciles. Full recovery requires all dependent containers to restart in dependency order, which systemd/supervisord handles automatically but takes 30-120 seconds on typical platforms.",
+  "restart_commands": {
+    "full_restart": "sudo systemctl restart database",
+    "check_status": "docker exec database supervisorctl status",
+    "redis_only": "docker exec database supervisorctl restart redis",
+    "check_redis_port": "redis-cli -p 6379 ping",
+    "check_redis_socket": "redis-cli -s /var/run/redis/redis.sock ping"
+  },
+  "health_check_commands": [
+    "sudo systemctl status database",
+    "docker exec database supervisorctl status",
+    "redis-cli -p 6379 ping",
+    "redis-cli -s /var/run/redis/redis.sock ping",
+    "redis-cli -p 6379 info server | grep -E 'redis_version|uptime_in_seconds|connected_clients'",
+    "redis-cli -p 6379 info memory | grep -E 'used_memory_human|maxmemory_human|mem_fragmentation_ratio'",
+    "show system-health summary"
+  ],
+  "state_verification_commands": [
+    "redis-cli -p 6379 info keyspace (show all DBs with key counts)",
+    "redis-cli -n 4 dbsize (CONFIG_DB key count -- should be non-zero after config load)",
+    "redis-cli -n 0 dbsize (APPL_DB key count)",
+    "redis-cli -n 1 dbsize (ASIC_DB key count)",
+    "redis-cli -n 2 dbsize (COUNTERS_DB key count)",
+    "redis-cli -n 6 dbsize (STATE_DB key count)",
+    "redis-cli -p 6379 client list | wc -l (connected client count)",
+    "redis-cli -p 6379 info stats | grep -E 'total_commands_processed|rejected_connections|blocked_clients'",
+    "sonic-db-cli CONFIG_DB keys '*' | wc -l"
+  ],
+  "log_locations": {
+    "redis_server": "/var/log/redis/redis-server.log",
+    "redis_sentinel": "/var/log/redis/redis-sentinel.log",
+    "container_supervisor": "/var/log/supervisor/supervisord.log (inside container)",
+    "syslog": "/var/log/syslog (tagged database#redis or database#redis-sentinel)",
+    "rdb_dump": "/var/lib/redis/dump.rdb (RDB snapshot if persistence enabled)"
+  },
+  "common_issues": [
+    {
+      "issue": "Redis memory exhaustion",
+      "symptoms": [
+        "redis-cli -p 6379 info memory shows used_memory approaching maxmemory",
+        "OOM killer terminates redis-server process (dmesg shows 'redis-server killed')",
+        "redis-cli commands return 'OOM command not allowed when used memory > maxmemory'",
+        "COUNTERS_DB or ASIC_DB writes start failing -- new counter keys rejected",
+        "orchagent or syncd log shows Redis ENOMEM errors on write attempts"
+      ],
+      "causes": [
+        "Large routing table (100k+ routes) causing ASIC_DB and APPL_DB to grow proportionally",
+        "Counter accumulation in COUNTERS_DB -- high port-count platform with many ACL/flow entries",
+        "Memory leak in a producer daemon writing duplicate or unreferenced keys",
+        "FLEX_COUNTER_DB accumulation from high polling frequency on many objects",
+        "maxmemory not set (default unlimited) but system RAM exhausted by all SONiC processes combined"
+      ],
+      "diagnosis": [
+        "redis-cli -p 6379 info memory | grep -E 'used_memory_human|maxmemory_human|mem_fragmentation_ratio'",
+        "redis-cli -p 6379 info keyspace -- identify which DB has unexpectedly large key count",
+        "redis-cli -n 2 dbsize -- COUNTERS_DB; redis-cli -n 1 dbsize -- ASIC_DB",
+        "redis-cli -n 1 keys '*' | awk -F: '{print $2}' | sort | uniq -c | sort -rn | head -20 -- find top object types in ASIC_DB",
+        "dmesg | grep -i 'oom\\|killed\\|redis' -- check for OOM kills",
+        "show processes memory -- check total system memory consumption"
+      ],
+      "resolution": [
+        "If COUNTERS_DB bloated: reduce flex-counter polling frequency in CONFIG_DB FLEX_COUNTER_TABLE or disable unused counter groups",
+        "If ASIC_DB / APPL_DB growing due to route scale: reduce BGP table size, use 'maximum-paths' or route filtering in FRR",
+        "Set Redis maxmemory-policy to 'noeviction' (default) and set maxmemory to 75% of available RAM in redis.conf to trigger explicit errors rather than silent OOM",
+        "Flush stale counters: redis-cli -n 2 FLUSHDB (WARNING: resets all counters to zero; non-persistent so safe)",
+        "If OOM-killed: add swap space temporarily to survive until table scale is reduced"
+      ]
+    },
+    {
+      "issue": "CONFIG_DB persistence failure -- changes lost on reboot",
+      "symptoms": [
+        "Switch reboots and comes up with default/empty configuration",
+        "Interfaces and routing config absent after reboot",
+        "'config show' or 'show running-configuration' reflects previous session changes but 'show startup-configuration' does not",
+        "/etc/sonic/config_db.json timestamp is old (predates recent config changes)",
+        "'config save' command returns error or hangs"
+      ],
+      "causes": [
+        "Operator made config changes via CLI but did not run 'config save' before reboot",
+        "Filesystem /etc/sonic is read-only due to disk fault or out-of-space condition",
+        "sonic-cfggen fails during config save due to corrupt CONFIG_DB state (unexpected key format)",
+        "Redis RDB persistence disabled and operator assumed changes were auto-saved",
+        "config save process killed mid-write, leaving corrupt config_db.json"
+      ],
+      "diagnosis": [
+        "diff <(redis-cli -n 4 --no-auth-warning keys '*' | sort) <(python3 -c \"import json; print('\\n'.join(json.load(open('/etc/sonic/config_db.json')).keys()))\" | sort) -- compare live DB vs saved file",
+        "ls -la /etc/sonic/config_db.json -- check modification timestamp",
+        "df -h /etc/sonic -- check for full filesystem",
+        "config save 2>&1 -- attempt save and capture error output",
+        "cat /etc/sonic/config_db.json | python3 -m json.tool > /dev/null -- validate JSON syntax of saved file"
+      ],
+      "resolution": [
+        "Always run 'config save' after making configuration changes: sudo config save -y",
+        "If filesystem full: identify and remove large files (find /var/core -name '*.core' -size +100M), then retry config save",
+        "If config_db.json corrupt: restore from backup at /etc/sonic/config_db.json.bak (if exists) or reconstruct from golden config",
+        "To auto-save on change: consider adding a post-change hook or periodic cron calling 'config save'",
+        "Verify persistence after save: python3 -m json.tool /etc/sonic/config_db.json | grep -c '\"' -- should return non-zero"
+      ]
+    },
+    {
+      "issue": "Redis pub/sub backlog -- daemons miss or delay processing updates",
+      "symptoms": [
+        "Config changes applied via CLI but take abnormally long to take effect (minutes instead of seconds)",
+        "redis-cli -p 6379 info stats shows growing 'blocked_clients' count",
+        "orchagent or mgrd logs show timestamps far behind wall clock on received notifications",
+        "redis-cli -p 6379 client list shows clients with 'cmd=subscribe' and large 'multi' values",
+        "Redis CPU usage high while application throughput is low"
+      ],
+      "causes": [
+        "A slow consumer daemon (e.g., orchagent under heavy SAI load) not draining its notification queue fast enough",
+        "Notification storm -- mass config push (loading full config_db.json) generates thousands of keyspace events simultaneously",
+        "Orchagent stuck in a retry loop on a failing SAI operation, blocking its main select() loop from processing new notifications",
+        "High counter polling frequency in FLEX_COUNTER_DB generating excessive pub/sub traffic on COUNTERS_DB channel",
+        "Redis client-output-buffer-limit exceeded causing client disconnection and reconnect storms"
+      ],
+      "diagnosis": [
+        "redis-cli -p 6379 info clients | grep -E 'blocked_clients|connected_clients'",
+        "redis-cli -p 6379 info stats | grep -E 'pubsub_channels|pubsub_patterns|total_commands_processed'",
+        "redis-cli -p 6379 client list | grep -v 'cmd=ping' -- identify slow/blocked clients by name and pending buffer size",
+        "redis-cli -p 6379 monitor (use briefly -- high overhead) -- observe notification rate",
+        "grep -E 'Select|timeout|retry' /var/log/swss/orchagent.log | tail -50 -- check orchagent select loop health",
+        "redis-cli -p 6379 info stats | grep 'client_recent_max_output_buffer'"
+      ],
+      "resolution": [
+        "Identify the slow consumer via 'client list' output; restart the specific daemon if it is stuck",
+        "If notification storm from bulk config load: spread config pushes across time or use config reload which batches writes",
+        "Reduce FLEX_COUNTER polling frequency: redis-cli -n 4 hset 'FLEX_COUNTER_TABLE|PORT_STAT_COUNTER' POLL_INTERVAL 10000 (10s instead of 1s default)",
+        "If orchagent retry loop: check orchagent.log for repeated 'SAI_STATUS' errors on same object; resolve underlying SAI issue",
+        "Increase client-output-buffer-limit in redis.conf if buffer overflow is root cause: client-output-buffer-limit pubsub 64mb 32mb 60"
+      ]
+    },
+    {
+      "issue": "Database container startup failure -- Redis fails to bind, all dependent containers cannot start",
+      "symptoms": [
+        "sudo systemctl status database shows 'failed' or 'activating' indefinitely",
+        "docker ps shows database container not running or in restart loop",
+        "All other containers (swss, syncd, bgp, teamd, etc.) fail to start with 'connection refused' to Redis",
+        "redis-cli -p 6379 ping returns 'Connection refused'",
+        "Journalctl shows: 'Creating Server TCP listening socket 127.0.0.1:6379: bind: Address already in use'",
+        "Full system comes up but 'show ip route' and 'show interfaces' return empty output"
+      ],
+      "causes": [
+        "Stale Redis process holding port 6379 from a previous unclean shutdown",
+        "Corrupt RDB dump file (/var/lib/redis/dump.rdb) preventing Redis from loading -- Redis exits on parse error",
+        "Insufficient file descriptor limit (ulimit -n) preventing Redis from opening enough socket connections",
+        "Another process (rogue redis-server or test process) bound to port 6379",
+        "UNIX socket file /var/run/redis/redis.sock left over from prior crash with wrong permissions"
+      ],
+      "diagnosis": [
+        "sudo systemctl status database -- check exit code and last error message",
+        "journalctl -u database -n 50 --no-pager -- detailed startup error sequence",
+        "docker logs database 2>&1 | tail -50 -- Redis startup output inside container",
+        "ss -tlnp | grep 6379 -- check if port is already in use",
+        "ls -la /var/run/redis/redis.sock -- check socket file existence and permissions",
+        "ls -la /var/lib/redis/dump.rdb -- check RDB file size and modification time",
+        "sudo -u redis redis-check-rdb /var/lib/redis/dump.rdb -- validate RDB file integrity"
+      ],
+      "resolution": [
+        "If stale process: kill $(lsof -t -i:6379) then sudo systemctl start database",
+        "If stale socket: rm /var/run/redis/redis.sock then sudo systemctl start database",
+        "If corrupt RDB: mv /var/lib/redis/dump.rdb /var/lib/redis/dump.rdb.corrupt && sudo systemctl start database (Redis starts empty -- you must reload config: config load /etc/sonic/config_db.json)",
+        "If file descriptor limit: verify /etc/security/limits.conf has 'redis soft nofile 65536' and 'redis hard nofile 65536'",
+        "After database container recovers: sudo systemctl restart swss syncd bgp teamd lldp -- force all dependent containers to reconnect"
+      ]
+    }
+  ],
+  "scale_considerations": {
+    "key_count_limits": "Redis itself has no hard key limit but memory is the practical constraint. A fully loaded spine router with 1M FIB entries will have ASIC_DB and APPL_DB holding 3-5M keys combined. Monitor 'redis-cli info keyspace' regularly on high-scale deployments.",
+    "memory_sizing": "Rule of thumb: allocate 512MB Redis maxmemory for moderate scale (100k routes, 1k neighbors), 2GB for high scale (1M routes, 50k+ ACL entries). Set maxmemory in /etc/redis/redis.conf and restart database container.",
+    "counter_db_growth": "COUNTERS_DB grows with port count * counter types * polling frequency. On a 128-port platform with 1-second polling, COUNTERS_DB can exceed 200MB. Set FLEX_COUNTER polling interval to 10s or higher for monitoring use cases.",
+    "connection_count": "Each daemon maintains 2-4 Redis connections (one per subscribed DB). A fully deployed SONiC switch has 50-100 Redis clients. Monitor 'connected_clients' in 'redis-cli info clients'.",
+    "pub_sub_channels": "Each keyspace-notified DB creates one channel per key on modification. High-churn tables (COUNTERS_DB, FLEX_COUNTER_DB) can create thousands of simultaneous pub/sub events. Reduce polling frequency if pubsub_channels count stays persistently high."
+  },
+  "related_subsystems": [
+    "swss-container",
+    "syncd-container",
+    "bgp-container"
+  ]
+}

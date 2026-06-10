@@ -1,0 +1,182 @@
+{
+  "tree_id": "route-missing-hardware",
+  "display_name": "Route missing from hardware forwarding table",
+  "entry_symptom": "Route visible in control plane (show ip route) but traffic not being forwarded",
+  "related_protocol": "bgp-4",
+  "related_errors": [],
+  "related_code_paths": ["route-install-bgp"],
+
+  "nodes": [
+    {
+      "node_id": "n1",
+      "node_type": "branch",
+      "question": "Is the route present in the kernel FIB?",
+      "commands": ["ip route show <prefix>", "ip route show <prefix> table all"],
+      "branches": {
+        "yes": "n2",
+        "no": "n13"
+      }
+    },
+    {
+      "node_id": "n2",
+      "node_type": "branch",
+      "question": "Is the route present in APPL_DB ROUTE_TABLE?",
+      "commands": [
+        "redis-cli -n 0 keys 'ROUTE_TABLE:<prefix>*'",
+        "redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix>'"
+      ],
+      "branches": {
+        "yes": "n3",
+        "no": "n8"
+      }
+    },
+    {
+      "node_id": "n3",
+      "node_type": "branch",
+      "question": "Is the route programmed in ASIC_DB (orchagent has created a SAI route entry)?",
+      "commands": [
+        "redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep <prefix>",
+        "docker exec syncd redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep <prefix>"
+      ],
+      "branches": {
+        "yes": "n4",
+        "no": "n7"
+      }
+    },
+    {
+      "node_id": "n4",
+      "node_type": "branch",
+      "question": "Is the next-hop resolved (ARP or NDP entry exists for the gateway)?",
+      "commands": [
+        "show arp | grep <gateway_ip>",
+        "redis-cli -n 0 HGETALL 'NEIGH_TABLE:<interface>:<gateway_ip>'",
+        "ip neigh show <gateway_ip>"
+      ],
+      "branches": {
+        "yes": "n5",
+        "no": "n6"
+      }
+    },
+    {
+      "node_id": "n5",
+      "node_type": "branch",
+      "question": "Is the route table full or is there a resource exhaustion alarm in STATE_DB?",
+      "commands": [
+        "redis-cli -n 6 HGETALL 'ROUTE_TABLE|state'",
+        "redis-cli -n 6 keys 'THRESHOLD_TABLE_INFO|*ROUTE*'",
+        "docker exec orchagent bash -c 'cat /var/log/syslog | grep -i \"route.*limit\\|table.*full\\|resource.*exhaust\" | tail -20'"
+      ],
+      "branches": {
+        "yes (resource alarm present)": "n11",
+        "no (no alarm)": "n12"
+      }
+    },
+    {
+      "node_id": "n6",
+      "node_type": "leaf",
+      "finding": "Next-hop not resolved -- ARP or NDP entry missing for the gateway IP",
+      "action": "The route is programmed in hardware but the next-hop group points to an unresolved neighbor. Hardware cannot forward without a valid MAC mapping. Steps: (1) Verify gateway reachability: ping <gateway_ip>, (2) Trigger ARP resolution: arping -I <interface> <gateway_ip>, (3) Check neighsyncd logs for failures: journalctl -u swss | grep neighsyncd | tail -30, (4) Verify the NEIGH_TABLE entry exists in APPL_DB: redis-cli -n 0 HGETALL 'NEIGH_TABLE:<interface>:<gateway_ip>', (5) Check if the interface is up: show interfaces status. If ARP resolves but entry is not synced, restart neighsyncd: docker exec swss supervisorctl restart neighsyncd.",
+      "commands": [
+        "show arp",
+        "arping -c 3 -I <interface> <gateway_ip>",
+        "redis-cli -n 0 HGETALL 'NEIGH_TABLE:<interface>:<gateway_ip>'",
+        "journalctl -u swss | grep neighsyncd | tail -30"
+      ]
+    },
+    {
+      "node_id": "n7",
+      "node_type": "leaf",
+      "finding": "orchagent failed to program route into ASIC_DB -- route is in APPL_DB but not in hardware",
+      "action": "The route is in APPL_DB but orchagent did not create the SAI route entry. This indicates orchagent failed during programming. Steps: (1) Check orchagent logs for SAI errors or resource exhaustion: journalctl -u swss | grep orchagent | grep -i 'error\\|SAI\\|fail' | tail -50, (2) Check if route table is full: redis-cli -n 6 keys 'THRESHOLD_TABLE_INFO|*', (3) Check if the next-hop OID exists in ASIC_DB: redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_NEXT_HOP*', (4) Verify the VRF OID is valid if using non-default VRF: redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_VIRTUAL_ROUTER*', (5) If orchagent is stuck, restart: systemctl restart swss (note: this clears all ASIC state -- use with caution).",
+      "commands": [
+        "journalctl -u swss | grep orchagent | grep -iE 'error|SAI|fail|resource' | tail -50",
+        "redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_NEXT_HOP*' | wc -l",
+        "redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | wc -l"
+      ]
+    },
+    {
+      "node_id": "n8",
+      "node_type": "branch",
+      "question": "Is fpmsyncd running and connected to the zebra FPM socket?",
+      "commands": [
+        "docker exec bgp supervisorctl status fpmsyncd",
+        "docker exec bgp bash -c 'ss -xp | grep fpm'",
+        "journalctl -u bgp | grep fpmsyncd | tail -20"
+      ],
+      "branches": {
+        "yes": "n9",
+        "no": "n10"
+      }
+    },
+    {
+      "node_id": "n9",
+      "node_type": "leaf",
+      "finding": "fpmsyncd is running but the route was not written to APPL_DB -- possible route filtering or VRF mismatch",
+      "action": "fpmsyncd is connected to zebra but did not write the route to APPL_DB ROUTE_TABLE. Common causes: (1) Route is in a non-default VRF but fpmsyncd is only syncing default VRF, (2) Route has administrative distance higher than a more-specific local route (zebra selected different route), (3) fpmsyncd is filtering the route due to nexthop type (e.g., blackhole or recursive). Steps: (1) Check FRR RIB to confirm zebra selected this route: docker exec bgp vtysh -c 'show ip route <prefix>', (2) Check fpmsyncd logs for filtering: journalctl -u bgp | grep fpmsyncd | grep -i 'skip\\|filter\\|drop' | tail -30, (3) Check if route is in a specific VRF: docker exec bgp vtysh -c 'show ip route vrf all <prefix>', (4) Verify zebra FPM is enabled: docker exec bgp vtysh -c 'show running-config' | grep fpm.",
+      "commands": [
+        "docker exec bgp vtysh -c 'show ip route <prefix>'",
+        "docker exec bgp vtysh -c 'show ip route vrf all <prefix>'",
+        "journalctl -u bgp | grep fpmsyncd | tail -30",
+        "docker exec bgp vtysh -c 'show running-config' | grep fpm"
+      ]
+    },
+    {
+      "node_id": "n10",
+      "node_type": "leaf",
+      "finding": "fpmsyncd is down or disconnected from the zebra FPM socket -- routes are not reaching APPL_DB",
+      "action": "fpmsyncd is the bridge between FRR/zebra and the SONiC APPL_DB. If it is down, no routes learned by BGP will be programmed to hardware. Steps: (1) Check fpmsyncd status: docker exec bgp supervisorctl status fpmsyncd, (2) Restart fpmsyncd: docker exec bgp supervisorctl restart fpmsyncd, (3) If restart fails, restart the bgp container: systemctl restart bgp, (4) After restart, verify reconnection: docker exec bgp bash -c 'ss -xp | grep fpm', (5) Confirm routes are now appearing in APPL_DB: redis-cli -n 0 keys 'ROUTE_TABLE:*' | head -20. Note: restarting the bgp container will temporarily drop all BGP sessions.",
+      "commands": [
+        "docker exec bgp supervisorctl status fpmsyncd",
+        "docker exec bgp supervisorctl restart fpmsyncd",
+        "redis-cli -n 0 keys 'ROUTE_TABLE:*' | wc -l"
+      ]
+    },
+    {
+      "node_id": "n11",
+      "node_type": "leaf",
+      "finding": "Hardware route table is full -- resource exhaustion preventing new routes from being installed",
+      "action": "The ASIC route table has reached its capacity limit. orchagent will log SAI_STATUS_TABLE_FULL errors when this occurs. Steps: (1) Check orchagent logs for table-full errors: journalctl -u swss | grep orchagent | grep -i 'table.full\\|resource\\|SAI_STATUS' | tail -30, (2) Check current route count vs ASIC capacity: redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | wc -l, (3) Check MEMORY/ROUTE threshold alarms: redis-cli -n 6 keys 'THRESHOLD_TABLE_INFO|*', (4) Review route policy to reduce the number of routes: consider summarization or filtering inbound BGP routes, (5) On some platforms, LPM resource can be reconfigured via profile -- check /etc/sonic/sai.profile.",
+      "commands": [
+        "journalctl -u swss | grep orchagent | grep -iE 'table.full|resource|SAI_STATUS_TABLE' | tail -30",
+        "redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | wc -l",
+        "redis-cli -n 6 keys 'THRESHOLD_TABLE_INFO|*'",
+        "cat /etc/sonic/sai.profile"
+      ]
+    },
+    {
+      "node_id": "n12",
+      "node_type": "leaf",
+      "finding": "Route is in ASIC_DB with a resolved next-hop but hardware is still not forwarding -- possible syncd or SAI layer failure",
+      "action": "The route and next-hop are both correctly programmed in ASIC_DB, but the ASIC is not forwarding traffic. This points to a syncd or SAI driver issue. Steps: (1) Check syncd logs for SAI errors on route programming: journalctl -u syncd | grep -i 'SAI\\|error\\|fail' | tail -50, (2) Verify the SAI route entry attributes (especially SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID): redis-cli -n 1 HGETALL 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:<vrf>:<prefix>', (3) Verify the next-hop group and its members are valid: redis-cli -n 1 HGETALL 'ASIC_STATE:SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER:<oid>', (4) Check if the egress port is operationally up: show interfaces status, (5) Run a hardware-level packet trace if the platform supports it. Consider syncd restart as a last resort.",
+      "commands": [
+        "journalctl -u syncd | grep -iE 'SAI|error|fail' | tail -50",
+        "redis-cli -n 1 keys 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY*' | grep <prefix>",
+        "show interfaces status",
+        "docker exec syncd supervisorctl status syncd"
+      ]
+    },
+    {
+      "node_id": "n13",
+      "node_type": "leaf",
+      "finding": "Route is not in the kernel FIB -- the control plane has not selected or installed this route",
+      "action": "The route never made it to the Linux kernel routing table, meaning FRR/zebra did not install it. This is a control plane issue upstream of the hardware programming pipeline. Steps: (1) Check if the route exists in the FRR RIB at all: docker exec bgp vtysh -c 'show ip route <prefix>', (2) If visible in FRR but not in kernel, check zebra logs for installation failures: docker exec bgp bash -c 'cat /var/log/frr/zebra.log | tail -50', (3) If not in FRR RIB, check if BGP received the prefix: docker exec bgp vtysh -c 'show bgp ipv4 unicast <prefix>', (4) Check BGP session state: show bgp summary, (5) Verify no inbound route-map is filtering the prefix: docker exec bgp vtysh -c 'show bgp neighbors <peer_ip> received-routes | grep <prefix>', (6) Check for maximum-prefix limit: docker exec bgp vtysh -c 'show bgp neighbors <peer_ip>' | grep -i 'maximum'.",
+      "commands": [
+        "docker exec bgp vtysh -c 'show ip route <prefix>'",
+        "docker exec bgp vtysh -c 'show bgp ipv4 unicast <prefix>'",
+        "show bgp summary",
+        "docker exec bgp bash -c 'cat /var/log/frr/zebra.log | tail -50'"
+      ]
+    },
+    {
+      "node_id": "n14",
+      "node_type": "leaf",
+      "finding": "Route table full check or STATE_DB MEMORY alarm -- see n11 for detailed remediation",
+      "action": "Check STATE_DB for any resource or memory alarms that could indicate the hardware forwarding table is near capacity. Commands: redis-cli -n 6 keys 'MEMORY_STATISTICS*'; redis-cli -n 6 keys 'THRESHOLD_TABLE_INFO|*'; check orchagent logs for any SAI_STATUS_INSUFFICIENT_RESOURCES. Also check if BUFFER_PG or BUFFER_QUEUE tables show resource pressure.",
+      "commands": [
+        "redis-cli -n 6 keys 'MEMORY_STATISTICS*'",
+        "redis-cli -n 6 keys 'THRESHOLD_TABLE_INFO|*'",
+        "journalctl -u swss | grep orchagent | grep -iE 'resource|insufficient|limit' | tail -20"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,220 @@
+{
+  "procedure_id": "warm-reboot",
+  "procedure_name": "Warm Reboot",
+  "category": "system-operations",
+  "risk_level": "medium",
+  "purpose": "Reboot with minimal traffic disruption by preserving forwarding state in ASIC",
+  "def_refs": ["daemon:orchagent", "daemon:syncd", "daemon:bgpd", "daemon:zebra", "daemon:fpmsyncd", "daemon:redis-server", "db:config_db", "db:appl_db", "db:asic_db", "db:state_db"],
+  "prerequisites": [
+    "SONiC image built with warm reboot support (most 202005+ images include this)",
+    "All critical containers running: database, swss, syncd, bgp, teamd",
+    "BGP graceful-restart configured on the device and on BGP peers",
+    "Sufficient disk space on /host (>500MB free for dump.rdb checkpoint file)",
+    "No stale warmboot files from a previous failed warm reboot",
+    "Warm restart feature not currently blocked by an active config-change in progress",
+    "ASIC SDK version compatible between current image and next boot image"
+  ],
+  "warnings": [
+    "Warm reboot preserves forwarding state but traffic may still be impacted for 1-10 seconds depending on BGP GR convergence.",
+    "If warm reboot fails mid-sequence, the switch falls back to a cold reboot — full traffic outage will occur.",
+    "Do NOT modify CONFIG_DB while warm reboot is in progress; it will corrupt the checkpoint.",
+    "BGP peers must support graceful-restart; otherwise sessions will drop and routes will be withdrawn.",
+    "Warm reboot does NOT tolerate ASIC SDK incompatibilities between images — verify SDK versions match before cross-version reboot.",
+    "LAG/LACP partners must tolerate the brief hello gap during reboot or the LAG will go down.",
+    "Some platform SAI implementations do not support warm reboot — check vendor documentation."
+  ],
+  "steps": [
+    {
+      "step_id": "step-1",
+      "step": 1,
+      "action": "Verify platform supports warm reboot and check system readiness",
+      "command": "show platform summary && show system status",
+      "verification": {
+        "command": "show platform summary | grep -iE 'platform|hwsku'; docker ps --filter status=running --format '{{.Names}}' | grep -cE 'database|swss|syncd|bgp|teamd'",
+        "look_for": "All five critical containers running (count=5) and platform identified",
+        "confirms_if": "System is healthy and all critical containers are in running state"
+      },
+      "next_step_id": "step-2",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "If any critical container is down, resolve that issue first. Warm reboot with unhealthy containers will fall back to cold reboot or abort entirely."
+    },
+    {
+      "step_id": "step-2",
+      "step": 2,
+      "action": "Check for stale warmboot files and state from a previous failed warm reboot",
+      "command": "ls -la /host/warmboot/ 2>/dev/null; redis-cli -n 6 keys 'WARM_RESTART*'",
+      "verification": {
+        "command": "redis-cli -n 6 HGETALL 'WARM_RESTART_TABLE|system'; ls /host/warmboot/dump.rdb 2>/dev/null && echo STALE_FILE_EXISTS || echo NO_STALE_FILE",
+        "look_for": "No stale warmboot files. WARM_RESTART_TABLE|system state should be empty or 'DISABLED'.",
+        "confirms_if": "No residual state from a previous failed warm reboot"
+      },
+      "next_step_id": "step-3",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "If stale files exist, remove them before proceeding: sudo rm -f /host/warmboot/dump.rdb. If WARM_RESTART_TABLE shows a non-idle state, a previous warm reboot did not complete cleanly — investigate with 'show warm_restart state' before continuing."
+    },
+    {
+      "step_id": "step-3",
+      "step": 3,
+      "action": "Enable warm restart if not already enabled",
+      "command": "show warm_restart config",
+      "verification": {
+        "command": "redis-cli -n 4 HGETALL 'WARM_RESTART_ENABLE_TABLE|system'",
+        "look_for": "enable field set to 'true'",
+        "confirms_if": "Warm restart is enabled at system level"
+      },
+      "next_step_id": "step-4",
+      "rollback_step_id": null,
+      "daemon_impact": [
+        {"daemon": "orchagent", "impact": "Will use warm restart reconciliation path on next boot"},
+        {"daemon": "syncd", "impact": "Will initialize in warm mode on next boot, skipping ASIC full reset"}
+      ],
+      "notes": "If not enabled, run: config warm_restart enable system. To enable per-daemon: config warm_restart enable swss. Individual daemon timers can be set with: config warm_restart timer bgp <seconds>. Default BGP timer is 300s."
+    },
+    {
+      "step_id": "step-4",
+      "step": 4,
+      "action": "Verify BGP graceful-restart is configured",
+      "command": "show runningconfiguration bgp | grep -A5 'graceful-restart'",
+      "verification": {
+        "command": "docker exec bgp vtysh -c 'show bgp neighbors' | grep -i 'graceful-restart'",
+        "look_for": "graceful-restart capability advertised and received from peers",
+        "confirms_if": "BGP GR is active with at least one peer supporting it"
+      },
+      "next_step_id": "step-5",
+      "rollback_step_id": null,
+      "daemon_impact": [
+        {"daemon": "bgpd", "impact": "Will advertise graceful-restart capability to peers; restart time determines route retention window"},
+        {"daemon": "zebra", "impact": "Maintains RIB during BGP restart window"}
+      ],
+      "warning": "If BGP peers do not support graceful-restart, routes will be withdrawn when sessions drop during reboot — this causes a full traffic outage equivalent to cold reboot.",
+      "notes": "To enable BGP GR in FRR config: 'bgp graceful-restart' under the router bgp block. The restart timer should exceed the expected warm reboot duration (typically 60-120 seconds). Check peer GR support: docker exec bgp vtysh -c 'show bgp neighbors <peer> | grep -i graceful'"
+    },
+    {
+      "step_id": "step-5",
+      "step": 5,
+      "action": "Save running configuration to config_db.json",
+      "command": "sudo config save -y",
+      "verification": {
+        "command": "ls -la /etc/sonic/config_db.json",
+        "look_for": "File modification timestamp is current (just updated)",
+        "confirms_if": "CONFIG_DB saved to disk successfully"
+      },
+      "next_step_id": "step-6",
+      "rollback_step_id": null,
+      "daemon_impact": [
+        {"daemon": "redis-server", "impact": "CONFIG_DB flushed to /etc/sonic/config_db.json on disk"}
+      ],
+      "notes": "config save writes the in-memory CONFIG_DB to /etc/sonic/config_db.json. This ensures post-reboot config matches the pre-reboot state. Also capture a timestamped backup: sudo sonic-cfggen -d --print-data > /tmp/config_backup_$(date +%Y%m%d_%H%M%S).json"
+    },
+    {
+      "step_id": "step-6",
+      "step": 6,
+      "action": "Verify no pending unsaved config changes and check disk space",
+      "command": "df -h /host && sudo diff <(redis-cli -n 4 --no-auth-warning SAVE; cat /etc/sonic/config_db.json | python3 -m json.tool) /dev/null 2>&1 | head -5",
+      "verification": {
+        "command": "df /host | awk 'NR==2 {print $4}'; ls -lh /etc/sonic/config_db.json",
+        "look_for": "At least 500MB free on /host; config_db.json recently modified",
+        "confirms_if": "Sufficient disk space for warmboot checkpoint and config is saved"
+      },
+      "next_step_id": "step-7",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "dump.rdb size scales with route and FDB table sizes. A switch with 100k+ routes may need 500MB or more. Warm reboot will abort if /host runs out of space during checkpoint write."
+    },
+    {
+      "step_id": "step-7",
+      "step": 7,
+      "action": "Initiate warm reboot",
+      "command": "sudo warm-reboot -v",
+      "verification": {
+        "command": null,
+        "look_for": "Script progresses through: freeze orchagent, dump redis checkpoint, SAI warm shutdown, kexec. No ERROR lines in verbose output.",
+        "confirms_if": "Switch reboots and comes back up; no pre-shutdown abort errors logged"
+      },
+      "next_step_id": "step-8",
+      "rollback_step_id": "rollback-1",
+      "daemon_impact": [
+        {"daemon": "orchagent", "impact": "Frozen, then checkpointed. On boot-up, replays APPL_DB entries and reconciles against ASIC_DB"},
+        {"daemon": "syncd", "impact": "SAI warm shutdown preserves ASIC forwarding state. Warm init on boot-up skips ASIC full reset"},
+        {"daemon": "bgpd", "impact": "Triggers graceful-restart notification to peers; sessions are held by peers for the GR timer duration"},
+        {"daemon": "zebra", "impact": "RIB preserved in memory; fpmsyncd reconnects post-reboot to re-sync routes"},
+        {"daemon": "fpmsyncd", "impact": "Reconnects to zebra after boot and pushes routes back to APPL_DB for orchagent reconciliation"},
+        {"daemon": "redis-server", "impact": "Performs BGSAVE to /host/warmboot/dump.rdb checkpoint before shutdown"}
+      ],
+      "notes": "Flags: -v (verbose), -f (force, skip some checks), -s <seconds> (override reboot timeout). The warm-reboot script is at /usr/bin/warm-reboot. The -v flag logs each phase to stdout. After kexec, monitor from the console or poll SSH reconnection."
+    },
+    {
+      "step_id": "step-8",
+      "step": 8,
+      "action": "Post-reboot: verify reboot cause and warm restart state",
+      "command": "show reboot-cause && show warm_restart state",
+      "verification": {
+        "command": "show reboot-cause | head -3; show warm_restart state",
+        "look_for": "Reboot cause shows 'warm-reboot'. Warm restart state table shows 'reconciled' for swss, syncd, and bgp",
+        "confirms_if": "Warm reboot completed and all components reconciled successfully"
+      },
+      "next_step_id": "step-9",
+      "rollback_step_id": "rollback-2",
+      "daemon_impact": [],
+      "notes": "Run after SSH reconnects (typically 30-90 seconds post-reboot). If reboot-cause shows 'cold-reboot', the warm reboot failed and fell back — check /var/log/warm-reboot.log for the failure reason. Reconciliation may take 1-3 minutes on large route tables."
+    },
+    {
+      "step_id": "step-9",
+      "step": 9,
+      "action": "Verify all containers are running and orchagent/syncd reconciliation is complete",
+      "command": "docker ps --format '{{.Names}} {{.Status}}'",
+      "verification": {
+        "command": "redis-cli -n 6 HGET 'WARM_RESTART_TABLE|orchagent' 'state'; redis-cli -n 6 HGET 'WARM_RESTART_TABLE|syncd' 'state'; docker ps --filter status=running --format '{{.Names}}' | wc -l",
+        "look_for": "orchagent state = 'reconciled', syncd state = 'reconciled', all expected containers running",
+        "confirms_if": "Full reconciliation completed; ASIC state is consistent with CONFIG_DB"
+      },
+      "next_step_id": "step-10",
+      "rollback_step_id": "rollback-2",
+      "daemon_impact": [],
+      "notes": "If orchagent or syncd state is stuck in 'initialized' or 'restored' after 3+ minutes, reconciliation has stalled. Check logs: sudo journalctl -u swss -n 100 --no-pager; docker exec swss cat /var/log/swss/orchagent.log | tail -50"
+    },
+    {
+      "step_id": "step-10",
+      "step": 10,
+      "action": "Verify BGP sessions re-established and routes preserved in ASIC",
+      "command": "show bgp summary; show ip route summary; show interfaces status",
+      "verification": {
+        "command": "show bgp summary | grep -c Established; show ip route summary | grep -E 'Total|Connected|BGP'; redis-cli -n 1 HLEN 'ROUTE_TABLE:default'",
+        "look_for": "BGP established session count matches pre-reboot baseline; route count in APPL_DB matches pre-reboot; all interfaces in expected state",
+        "confirms_if": "Control plane fully restored, traffic forwarding at pre-reboot parity"
+      },
+      "next_step_id": null,
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "Compare counts against pre-reboot baseline captured before step-7. If BGP session count is lower, check: 'show bgp neighbors <peer>' for GR negotiation. If routes are missing, check fpmsyncd: docker exec bgp supervisorctl status fpmsyncd. ASIC route count: redis-cli -n 1 HLEN ASIC_DB may differ until orchagent completes full reconciliation."
+    }
+  ],
+  "rollback": [
+    {
+      "step_id": "rollback-1",
+      "action": "If warm-reboot script aborted before kexec (pre-shutdown failure), verify the switch is still running normally",
+      "command": "docker ps --format '{{.Names}} {{.Status}}'; show bgp summary; show warm_restart state",
+      "notes": "If the warm-reboot script encounters an error before the kexec step, it exits without rebooting. The switch remains operational. Check the abort reason in the script output or: sudo journalctl -u warm-reboot -n 50 --no-pager. Common abort causes: insufficient disk space, missing warm_restart enable, stale checkpoint files. Resolve the issue and retry from step-1."
+    },
+    {
+      "step_id": "rollback-2",
+      "action": "If warm reboot fell back to cold reboot (reboot-cause shows cold-reboot), check the warm reboot log for the failure stage",
+      "command": "cat /var/log/warm-reboot.log | tail -100; show reboot-cause history",
+      "notes": "A cold reboot fallback means forwarding state was lost. Wait for full cold boot convergence (2-5 minutes). After containers are up, check: show warm_restart state for stuck entries. Clear any stuck state: redis-cli -n 6 DEL 'WARM_RESTART_TABLE|orchagent'. Do NOT attempt warm reboot again until the root cause is identified."
+    },
+    {
+      "step_id": "rollback-3",
+      "action": "If post-reboot reconciliation is stuck (orchagent or syncd not reaching 'reconciled' state), force swss restart to trigger cold reconciliation",
+      "command": "sudo systemctl restart swss",
+      "notes": "This triggers a cold restart of the swss container, which will re-program the ASIC from CONFIG_DB. Traffic will be briefly interrupted during ASIC re-programming (typically 5-30 seconds). After restart, warm_restart state entries will be cleared. Verify with: show warm_restart state; docker exec swss cat /var/log/swss/orchagent.log | tail -20"
+    },
+    {
+      "step_id": "rollback-4",
+      "action": "If checkpoint files are stale or corrupted from a failed warm reboot, clear them before next attempt",
+      "command": "sudo rm -f /host/warmboot/dump.rdb; redis-cli -n 6 DEL 'WARM_RESTART_TABLE|system' 'WARM_RESTART_TABLE|orchagent' 'WARM_RESTART_TABLE|syncd' 'WARM_RESTART_TABLE|bgp'",
+      "notes": "Stale dump.rdb from a failed warm reboot can cause the next warm reboot to restore incorrect state. Always clear checkpoint files after a failed warm reboot. Verify cleared: ls /host/warmboot/ 2>/dev/null && echo FILES_REMAIN || echo CLEARED; redis-cli -n 6 keys 'WARM_RESTART*'"
+    }
+  ]
+}

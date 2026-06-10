@@ -33,5 +33,40 @@
     "category": "operational-error",
     "keywords": ["dump.rdb", "sai-warmboot.bin", "stale", "warmboot files", "old state", "failed reboot", "leftover"],
     "context_keywords": ["reboot", "warm", "express", "fast", "warmboot", "checkpoint", "restore"]
+  },
+  "wrong-reload-order": {
+    "display_name": "Restarting SONiC containers in wrong dependency order",
+    "severity": "HIGH",
+    "category": "operational-error",
+    "keywords": ["restart order", "dependency order", "wrong order", "container order", "swss before database", "service restart"],
+    "context_keywords": ["restart", "reload", "order", "sequence", "container", "systemctl", "service"]
+  },
+  "restart-swss-during-traffic": {
+    "display_name": "Restarting swss container while production traffic is flowing",
+    "severity": "HIGH",
+    "category": "operational-error",
+    "keywords": ["restart swss", "swss restart", "traffic loss", "production traffic", "forwarding interruption", "ASIC reprogram"],
+    "context_keywords": ["restart", "swss", "traffic", "production", "forwarding", "outage", "service impact"]
+  },
+  "wrong-frr-restart": {
+    "display_name": "Restarting FRR processes incorrectly, breaking bgpcfgd synchronization",
+    "severity": "HIGH",
+    "category": "config-integrity",
+    "keywords": ["kill bgpd", "kill zebra", "killall", "pkill frr", "restart frr", "supervisorctl restart", "frr restart wrong"],
+    "context_keywords": ["frr", "bgpd", "zebra", "restart", "kill", "process", "bgpcfgd", "desync"]
+  },
+  "manual-ip-link": {
+    "display_name": "Using ip link/ip addr commands directly instead of SONiC config CLI",
+    "severity": "MEDIUM",
+    "category": "config-integrity",
+    "keywords": ["ip link set", "ip addr add", "ifconfig", "ip route add", "manual ip", "ip link"],
+    "context_keywords": ["ip", "link", "addr", "interface", "manual", "linux", "kernel", "netlink"]
+  },
+  "dpkg-force-install": {
+    "display_name": "Force-installing Debian packages on SONiC, breaking the immutable image model",
+    "severity": "HIGH",
+    "category": "system-integrity",
+    "keywords": ["dpkg", "apt-get install", "dpkg --force", "pip install", "apt install", "force install", "package install"],
+    "context_keywords": ["install", "package", "dpkg", "apt", "pip", "debian", "dependency", "image"]
   }
 }

@@ -1,0 +1,169 @@
+{
+  "tree_id": "vlan-not-programming",
+  "display_name": "VLAN not programming into ASIC",
+  "entry_symptom": "VLAN configured but traffic not forwarding on VLAN members",
+  "related_protocol": "stp",
+  "related_errors": [],
+  "related_code_paths": [],
+
+  "nodes": [
+    {
+      "node_id": "n1",
+      "node_type": "branch",
+      "question": "Is the VLAN present in CONFIG_DB?",
+      "commands": [
+        "redis-cli -n 4 KEYS 'VLAN|*'",
+        "redis-cli -n 4 HGETALL 'VLAN|Vlan<id>'"
+      ],
+      "branches": {
+        "yes": "n2",
+        "no": "n3"
+      }
+    },
+    {
+      "node_id": "n2",
+      "node_type": "branch",
+      "question": "Are VLAN members configured in CONFIG_DB?",
+      "commands": [
+        "redis-cli -n 4 KEYS 'VLAN_MEMBER|*'",
+        "redis-cli -n 4 HGETALL 'VLAN_MEMBER|Vlan<id>|<port>'"
+      ],
+      "branches": {
+        "yes": "n4",
+        "no": "n5"
+      }
+    },
+    {
+      "node_id": "n3",
+      "node_type": "leaf",
+      "finding": "VLAN is not configured in CONFIG_DB",
+      "action": "The VLAN does not exist at the config layer. Create it with: config vlan add <id>. Then add member ports: config vlan member add <id> <port>. Verify with: show vlan brief. If the VLAN was recently deleted and not recreated, this is the root cause of all downstream forwarding failures.",
+      "commands": [
+        "show vlan brief",
+        "redis-cli -n 4 KEYS 'VLAN|*'"
+      ]
+    },
+    {
+      "node_id": "n4",
+      "node_type": "branch",
+      "question": "Is the VLAN present in APPL_DB VLAN_TABLE?",
+      "commands": [
+        "redis-cli -n 0 KEYS 'VLAN_TABLE:*'",
+        "redis-cli -n 0 HGETALL 'VLAN_TABLE:Vlan<id>'"
+      ],
+      "branches": {
+        "yes": "n6",
+        "no": "n7"
+      }
+    },
+    {
+      "node_id": "n5",
+      "node_type": "leaf",
+      "finding": "No VLAN members assigned in CONFIG_DB",
+      "action": "The VLAN exists but has no member ports. Add member ports with: config vlan member add <id> <port> [--untagged]. For a trunk port use tagged mode (default). For an access port use --untagged. Verify members with: show vlan brief. Check that the port itself is operationally up: show interfaces status <port>.",
+      "commands": [
+        "show vlan brief",
+        "show interfaces status",
+        "redis-cli -n 4 KEYS 'VLAN_MEMBER|*'"
+      ]
+    },
+    {
+      "node_id": "n6",
+      "node_type": "branch",
+      "question": "Is the VLAN programmed in ASIC_DB (SAI VLAN object present)?",
+      "commands": [
+        "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_VLAN:*'",
+        "redis-cli -n 1 HGETALL $(redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_VLAN:*' | head -1)"
+      ],
+      "branches": {
+        "yes": "n8",
+        "no": "n9"
+      }
+    },
+    {
+      "node_id": "n7",
+      "node_type": "leaf",
+      "finding": "vlanmgrd has not propagated VLAN from CONFIG_DB to APPL_DB",
+      "action": "vlanmgrd reads CONFIG_DB and writes to APPL_DB. If the VLAN_TABLE entry is missing, vlanmgrd has not processed the config. Diagnose: (1) Check vlanmgrd process: docker exec swss supervisorctl status vlanmgrd, (2) Check vlanmgrd logs: docker exec swss cat /var/log/swss/vlanmgrd.log or journalctl -u swss | grep vlanmgrd, (3) Verify port readiness in STATE_DB: redis-cli -n 6 HGETALL 'PORT_TABLE|<port>' -- vlanmgrd waits for ports to be ready before programming VLANs, (4) If vlanmgrd is crashed, restart: docker exec swss supervisorctl restart vlanmgrd.",
+      "commands": [
+        "docker exec swss supervisorctl status vlanmgrd",
+        "docker exec swss cat /var/log/swss/vlanmgrd.log | tail -50",
+        "redis-cli -n 6 HGETALL 'PORT_TABLE|<port>'"
+      ]
+    },
+    {
+      "node_id": "n8",
+      "node_type": "branch",
+      "question": "Are the member ports correctly added to the SAI VLAN in ASIC_DB?",
+      "commands": [
+        "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_VLAN_MEMBER:*'",
+        "redis-cli -n 0 KEYS 'VLAN_MEMBER_TABLE:*'"
+      ],
+      "branches": {
+        "yes": "n10",
+        "no": "n11"
+      }
+    },
+    {
+      "node_id": "n9",
+      "node_type": "leaf",
+      "finding": "orchagent VLAN programming failure -- VLAN in APPL_DB but not in ASIC_DB",
+      "action": "orchagent reads APPL_DB and programs ASIC_DB via SAI. The VLAN is stuck between these layers. Diagnose: (1) Check orchagent logs for SAI errors: docker exec swss cat /var/log/swss/orchagent.log | grep -i 'vlan\\|error\\|fail', (2) Check for SAI resource exhaustion (VLAN table full): the ASIC has a hardware limit on VLAN count -- check with: show platform summary and vendor ASIC limits, (3) Check syncd for SAI-level errors: docker exec syncd cat /var/log/syncd/syncd.log | tail -50, (4) If orchagent is in a bad state: docker exec swss supervisorctl restart orchagent (WARNING: may cause brief traffic disruption).",
+      "commands": [
+        "docker exec swss cat /var/log/swss/orchagent.log | grep -i 'vlan' | tail -50",
+        "docker exec syncd cat /var/log/syncd/syncd.log | tail -50",
+        "docker exec swss supervisorctl status orchagent"
+      ]
+    },
+    {
+      "node_id": "n10",
+      "node_type": "branch",
+      "question": "Is STP blocking the port? Check STP port state for the relevant VLAN.",
+      "commands": [
+        "show spanning_tree",
+        "show spanning_tree bpdu_guard",
+        "redis-cli -n 6 HGETALL 'STP_PORT_STATE_TABLE|<vlan>|<port>'"
+      ],
+      "branches": {
+        "yes": "n12",
+        "no": "n13"
+      }
+    },
+    {
+      "node_id": "n11",
+      "node_type": "leaf",
+      "finding": "VLAN member port programming failure -- VLAN programmed but member ports not added to SAI VLAN",
+      "action": "The VLAN exists in ASIC_DB but its member ports are missing from SAI. Diagnose: (1) Verify VLAN_MEMBER_TABLE in APPL_DB: redis-cli -n 0 KEYS 'VLAN_MEMBER_TABLE:*', (2) Check orchagent logs for member add errors: docker exec swss cat /var/log/swss/orchagent.log | grep -i 'vlan_member\\|error', (3) Check that the physical port SAI object exists in ASIC_DB: redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_PORT:*', (4) Port may not be in STATE_DB ready state -- vlanmgrd will not add it as a member until it is: redis-cli -n 6 HGETALL 'PORT_TABLE|<port>', (5) If the port was recently added or the interface was reset, wait for port reconciliation to complete.",
+      "commands": [
+        "redis-cli -n 0 KEYS 'VLAN_MEMBER_TABLE:*'",
+        "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_VLAN_MEMBER:*'",
+        "redis-cli -n 6 HGETALL 'PORT_TABLE|<port>'",
+        "docker exec swss cat /var/log/swss/orchagent.log | grep -i 'vlan_member' | tail -30"
+      ]
+    },
+    {
+      "node_id": "n12",
+      "node_type": "leaf",
+      "finding": "STP is blocking the port on this VLAN",
+      "action": "The VLAN is fully programmed in hardware but STP has put the port in Blocking state, preventing traffic forwarding. Diagnose: (1) Check STP topology: show spanning_tree -- identify root bridge and port roles, (2) Check for loops or unexpected topology: a port in Blocking state is STP working correctly to prevent loops, (3) If this is an access port that should not run STP, consider enabling PortFast/edge port: config spanning_tree interface portfast enable <port>, (4) If the root bridge is wrong, adjust STP priority: config spanning_tree priority <bridge_priority>, (5) Check BPDU guard: show spanning_tree bpdu_guard -- if enabled and a BPDU was received, the port is in err-disabled state. Re-enable with: config spanning_tree interface bpdu_guard disable <port> and bring up the interface.",
+      "commands": [
+        "show spanning_tree",
+        "show spanning_tree bpdu_guard",
+        "redis-cli -n 6 KEYS 'STP_PORT_STATE_TABLE|*'",
+        "docker exec swss supervisorctl status stpmgrd"
+      ]
+    },
+    {
+      "node_id": "n13",
+      "node_type": "leaf",
+      "finding": "VLAN fully programmed in ASIC, STP not blocking -- check tagged/untagged mode, PVID, and MAC learning",
+      "action": "The VLAN is programmed end-to-end and STP is not blocking. Check data-plane details: (1) Verify port tagging mode matches expectations: redis-cli -n 4 HGETALL 'VLAN_MEMBER|Vlan<id>|<port>' -- 'tagging_mode' should be 'tagged' or 'untagged', (2) Verify PVID for untagged ports: untagged traffic on an access port uses the PVID -- check: redis-cli -n 1 HGETALL on the SAI port object for SAI_PORT_ATTR_PORT_VLAN_ID, (3) Check MAC learning is enabled on the VLAN: redis-cli -n 1 HGETALL on the SAI VLAN object for SAI_VLAN_ATTR_LEARN_DISABLE -- should be false, (4) Check FDB table for expected MACs: show mac or redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY:*', (5) Verify physical layer: show interfaces counters <port> for TX/RX errors or drops.",
+      "commands": [
+        "redis-cli -n 4 HGETALL 'VLAN_MEMBER|Vlan<id>|<port>'",
+        "show mac",
+        "show interfaces counters <port>",
+        "redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_FDB_ENTRY:*' | head -20"
+      ]
+    }
+  ]
+}

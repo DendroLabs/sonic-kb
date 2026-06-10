@@ -1,0 +1,321 @@
+{
+  "subsystem_id": "pmon-container",
+  "display_name": "Platform Monitor Container",
+  "container_name": "pmon",
+  "purpose": "Hardware monitoring container. Polls and manages fans, PSUs, transceivers, temperatures, and LEDs on the physical platform. Bridges vendor-specific platform APIs (sonic-platform Python plugins) with STATE_DB so that the rest of SONiC can observe hardware health without platform-specific knowledge. Executes thermal control policy (fan speed curves) and raises syslog alerts on hardware faults.",
+  "startup_order": 7,
+  "depends_on_containers": ["database-container"],
+  "def_refs": [
+    "daemon:psud",
+    "daemon:thermalctld",
+    "daemon:syseepromd",
+    "daemon:xcvrd",
+    "db:config_db",
+    "db:state_db"
+  ],
+  "daemons": [
+    {
+      "name": "xcvrd",
+      "role": "Transceiver daemon. Polls all physical transceiver slots via the platform API to detect insertion/removal events and read EEPROM data (type, vendor, serial, DOM thresholds). Writes transceiver presence, type, and DOM (Digital Optical Monitoring) data to STATE_DB TRANSCEIVER_INFO_TABLE and TRANSCEIVER_DOM_SENSOR_TABLE. Also handles CMIS (Common Management Interface Specification) state machine for 400G+ modules.",
+      "critical": true,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: PORT_TABLE (transceiver config)", "STATE_DB: TRANSCEIVER_INFO_TABLE (presence check)"],
+        "writes": ["STATE_DB: TRANSCEIVER_INFO_TABLE, TRANSCEIVER_DOM_SENSOR_TABLE, TRANSCEIVER_STATUS_TABLE, TRANSCEIVER_PM_TABLE"]
+      }
+    },
+    {
+      "name": "thermalctld",
+      "role": "Thermal control daemon. Reads all temperature sensors and fan tachometers via the platform API on a polling interval. Executes a thermal control algorithm (vendor-supplied policy or SONiC default) to set fan speeds proportionally to thermal load. Writes current temperature and fan state to STATE_DB. Triggers emergency thermal shutdown if any sensor exceeds its critical threshold.",
+      "critical": true,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: DEVICE_METADATA (platform name, hwsku for policy selection)"],
+        "writes": ["STATE_DB: FAN_INFO_TABLE, TEMPERATURE_INFO_TABLE, FAN_DRAWER_INFO_TABLE"]
+      }
+    },
+    {
+      "name": "psud",
+      "role": "PSU daemon. Polls all PSU slots via the platform API for presence, operational status, input/output voltage, current, and power. Raises syslog CRIT alerts on PSU absence or failure. Writes PSU health data to STATE_DB PSU_INFO_TABLE. Required for 'show platform psu' output.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["CONFIG_DB: DEVICE_METADATA (expected PSU count)"],
+        "writes": ["STATE_DB: PSU_INFO_TABLE"]
+      }
+    },
+    {
+      "name": "syseepromd",
+      "role": "System EEPROM daemon. Reads the chassis EEPROM once at startup using the platform API (platform-specific I2C/SPI path). Writes EEPROM fields (serial number, hardware revision, manufacture date, MAC base address, etc.) to STATE_DB EEPROM_INFO table and to /proc/sonic-platform/eeprom. Required for 'show platform syseeprom'.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["Platform hardware EEPROM (I2C/SPI, vendor-specific)"],
+        "writes": ["STATE_DB: EEPROM_INFO"]
+      }
+    },
+    {
+      "name": "ledd",
+      "role": "LED daemon. Controls front-panel port LEDs to reflect link and activity state. Reads port oper_status from STATE_DB and calls the platform LED API to set LED color and blink pattern. Not present on all platforms -- vendor platform plugin must implement the chassis LED API.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["STATE_DB: PORT_TABLE (oper_status)"],
+        "writes": ["Platform hardware LED registers (via platform API)"]
+      }
+    },
+    {
+      "name": "ledmgrd",
+      "role": "LED manager. Complements ledd by managing system-level LEDs (STATUS, MASTER, FAN, PSU) based on overall system health signals. Reads health status from STATE_DB and sets chassis-level LEDs via the platform API. Provides visual indication of system health on the front panel.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["STATE_DB: FAN_INFO_TABLE, PSU_INFO_TABLE, TEMPERATURE_INFO_TABLE"],
+        "writes": ["Platform hardware system LED registers (via platform API)"]
+      }
+    },
+    {
+      "name": "pcied",
+      "role": "PCIe health daemon. Scans all PCIe devices on the platform against an expected device list (pcieinfo.yaml in the platform directory). Reports missing or unexpected PCIe devices to STATE_DB and syslog. Detects hardware errors on the PCIe bus that may indicate partial platform initialization or hardware failure.",
+      "critical": false,
+      "db_interactions": {
+        "reads": ["Platform PCIe bus (via lspci/sysfs)", "Platform-specific pcieinfo.yaml device list"],
+        "writes": ["STATE_DB: PCIE_DEVICE_TABLE"]
+      }
+    }
+  ],
+  "key_data_flows": [
+    {
+      "flow": "Transceiver detection and DOM (EEPROM -> STATE_DB)",
+      "path": "Physical transceiver insertion -> xcvrd platform API poll -> vendor platform plugin reads SFP/QSFP EEPROM (I2C) -> xcvrd writes STATE_DB:TRANSCEIVER_INFO_TABLE + TRANSCEIVER_DOM_SENSOR_TABLE -> 'show interfaces transceiver' reads STATE_DB",
+      "notes": "If transceiver shows as absent in STATE_DB, the failure is in xcvrd's EEPROM read or the platform plugin. Check xcvrd log for I2C errors before assuming a bad module."
+    },
+    {
+      "flow": "Thermal control loop (sensors -> fan speed)",
+      "path": "thermalctld polls platform API (temperature sensors + fan tachometers) -> applies thermal policy algorithm -> calls platform API fan.set_speed() -> writes STATE_DB:FAN_INFO_TABLE + TEMPERATURE_INFO_TABLE -> 'show platform temperature/fan' reads STATE_DB",
+      "notes": "If a sensor read fails, thermalctld enters fallback mode and drives fans to 100%. Persistent fallback mode indicates a broken platform API or hardware sensor fault."
+    },
+    {
+      "flow": "PSU health monitoring (hardware -> syslog + STATE_DB)",
+      "path": "psud polls platform API for each PSU slot -> reads presence, status, voltage, current -> writes STATE_DB:PSU_INFO_TABLE -> on fault: raises syslog CRIT alert -> 'show platform psu' reads STATE_DB",
+      "notes": "psud does not take corrective action -- it only monitors and reports. Alerting depends on syslog. If PSU failure is not generating alerts, check psud health first."
+    },
+    {
+      "flow": "System EEPROM read (hardware -> STATE_DB, one-time at startup)",
+      "path": "syseepromd starts -> reads chassis EEPROM via platform API (I2C address vendor-specific) -> parses TLV fields -> writes STATE_DB:EEPROM_INFO -> 'show platform syseeprom' reads STATE_DB",
+      "notes": "This is a one-shot read at daemon start. If EEPROM data is stale or missing, restart syseepromd -- it will re-read from hardware."
+    }
+  ],
+  "warm_restart": {
+    "supported": false,
+    "mechanism": "pmon daemons are stateless pollers; no ASIC state to reconcile. Container restart causes a brief gap in monitoring but no traffic impact. Transceiver DOM and platform sensor data repopulates within one polling cycle (typically 60 seconds) after restart.",
+    "enable_command": "N/A -- warm restart not applicable to pmon",
+    "verify_command": "show warm_restart config",
+    "caveat": "xcvrd restart may briefly clear TRANSCEIVER_INFO_TABLE entries, causing flaps in monitoring systems that watch transceiver presence. Not traffic-impacting but may generate false alarms."
+  },
+  "restart_impact": "No traffic impact. pmon only reads hardware sensors and writes to STATE_DB. Restarting pmon causes a monitoring gap: fan speeds hold at their last set value (hardware retains the last commanded speed), temperature alerts are suspended, and transceiver DOM data goes stale until daemons repopulate STATE_DB. The thermalctld fan control loop resumes within seconds of restart and re-reads all sensors.",
+  "restart_commands": {
+    "full_restart": "sudo systemctl restart pmon",
+    "single_daemon": "docker exec pmon supervisorctl restart <daemon_name>",
+    "check_status": "docker exec pmon supervisorctl status",
+    "xcvrd_only": "docker exec pmon supervisorctl restart xcvrd",
+    "thermalctld_only": "docker exec pmon supervisorctl restart thermalctld",
+    "psud_only": "docker exec pmon supervisorctl restart psud"
+  },
+  "health_check_commands": [
+    "sudo systemctl status pmon",
+    "docker exec pmon supervisorctl status",
+    "show platform summary",
+    "show system-health summary",
+    "docker exec pmon ps aux"
+  ],
+  "state_verification_commands": [
+    "show platform temperature (reads STATE_DB:TEMPERATURE_INFO_TABLE)",
+    "show platform fan (reads STATE_DB:FAN_INFO_TABLE)",
+    "show platform psu (reads STATE_DB:PSU_INFO_TABLE)",
+    "show platform syseeprom (reads STATE_DB:EEPROM_INFO)",
+    "show interfaces transceiver presence (reads STATE_DB:TRANSCEIVER_INFO_TABLE)",
+    "show interfaces transceiver eeprom (full EEPROM dump from STATE_DB)",
+    "show interfaces transceiver dom (DOM sensor readings from STATE_DB)",
+    "redis-cli -n 6 keys 'TRANSCEIVER_INFO*' (STATE_DB transceiver entries)",
+    "redis-cli -n 6 hgetall 'TRANSCEIVER_INFO|Ethernet0' (per-port transceiver detail)",
+    "redis-cli -n 6 keys 'FAN_INFO*' (fan health entries)",
+    "redis-cli -n 6 keys 'PSU_INFO*' (PSU health entries)",
+    "redis-cli -n 6 hgetall 'TEMPERATURE_INFO|ASIC' (ASIC die temperature)"
+  ],
+  "log_locations": {
+    "xcvrd": "/var/log/pmon/xcvrd.log",
+    "thermalctld": "/var/log/pmon/thermalctld.log",
+    "psud": "/var/log/pmon/psud.log",
+    "syseepromd": "/var/log/pmon/syseepromd.log",
+    "ledd": "/var/log/pmon/ledd.log",
+    "ledmgrd": "/var/log/pmon/ledmgrd.log",
+    "pcied": "/var/log/pmon/pcied.log",
+    "syslog": "/var/log/syslog (tagged pmon#<daemon>)",
+    "crash_dumps": "/var/core/ (pmon daemon core files)"
+  },
+  "common_issues": [
+    {
+      "issue": "xcvrd fails to detect transceiver -- module absent in STATE_DB",
+      "symptoms": [
+        "show interfaces transceiver presence shows 'Not present' for a populated port",
+        "redis-cli -n 6 hgetall 'TRANSCEIVER_INFO|EthernetX' returns empty",
+        "show interfaces status shows port as down despite module inserted",
+        "xcvrd log contains 'EEPROM read failed' or 'platform_chassis.get_sfp() raised exception'"
+      ],
+      "causes": [
+        "Vendor platform plugin not implementing get_sfp() or read_eeprom() correctly",
+        "I2C bus error or transceiver EEPROM page read timeout (bad or marginal module)",
+        "xcvrd process crashed or stuck in a retry loop on a different port",
+        "Module type mismatch -- CMIS module on a port with xcvrd lacking CMIS state machine support",
+        "Physical: module not fully seated, dirty connector, or hardware I2C bus fault"
+      ],
+      "diagnosis": [
+        "docker exec pmon tail -100 /var/log/pmon/xcvrd.log -- look for 'EEPROM read error', 'exception', 'failed to get SFP'",
+        "docker exec pmon supervisorctl status xcvrd -- confirm daemon is running, not in FATAL state",
+        "show interfaces transceiver presence -- identify which ports are affected (single port vs all ports)",
+        "If single port: reseat the transceiver module. Try the module in a different port to isolate hardware vs software",
+        "If all ports: platform plugin likely broken -- check 'show platform summary' for platform detection",
+        "docker exec pmon python3 -c \"import sonic_platform; p = sonic_platform.platform.Platform(); c = p.get_chassis(); print(c.get_sfp(0).get_presence())\" -- test platform API directly",
+        "journalctl -u pmon --since '10 minutes ago' | grep xcvrd -- broader syslog view"
+      ],
+      "resolution": [
+        "Single bad module: replace transceiver; re-run 'show interfaces transceiver presence' to confirm",
+        "Platform plugin exception: update sonic-platform-modules package for the platform (vendor BSP update)",
+        "I2C bus error: 'docker exec pmon supervisorctl restart xcvrd' to clear xcvrd state and retry EEPROM reads",
+        "CMIS module: verify SONiC version supports CMIS for this platform; check vendor release notes",
+        "If xcvrd in crash loop: 'sudo systemctl restart pmon' -- full container restart resets all platform API state"
+      ]
+    },
+    {
+      "issue": "thermalctld triggers thermal shutdown -- system powers off unexpectedly",
+      "symptoms": [
+        "System powers off without warning or with very short notice in syslog",
+        "syslog shows 'CRITICAL: Temperature X exceeds critical threshold' immediately before shutdown",
+        "show platform temperature (after reboot) shows high temperature watermarks if persisted",
+        "thermalctld log contains 'Thermal shutdown' or 'Emergency shutdown initiated'",
+        "All fans running at 100% prior to or after restart"
+      ],
+      "causes": [
+        "Genuine overtemperature: blocked airflow, failed fans, high ambient, overloaded chassis",
+        "Sensor miscalibration or stuck sensor reading a falsely high value",
+        "Platform plugin returning incorrect temperature values (vendor bug)",
+        "Thermal policy thresholds set too low for the operating environment",
+        "thermalctld bug causing it to act on stale or invalid sensor data"
+      ],
+      "diagnosis": [
+        "After reboot: show platform temperature -- check current temps vs thresholds for all sensors",
+        "show platform fan -- verify all fans present, spinning, and at reasonable speed (not 100% at idle)",
+        "docker exec pmon tail -200 /var/log/pmon/thermalctld.log -- find the sensor name and temperature that triggered shutdown",
+        "Check physical: verify no blocked airflow vents, all fan modules seated, ambient temperature in spec",
+        "redis-cli -n 6 hgetall 'TEMPERATURE_INFO|<sensor_name>' -- inspect high_threshold and critical_high_threshold values",
+        "If one specific sensor: compare its reading to adjacent sensors; outlier = suspect sensor or plugin bug"
+      ],
+      "resolution": [
+        "Genuine overtemperature: resolve physical cause (clear airflow, replace failed fans, reduce load)",
+        "Suspect sensor: 'redis-cli -n 6 hset TEMPERATURE_INFO|<sensor> high_threshold <value>' to temporarily adjust threshold while investigating (NOT a permanent fix)",
+        "Platform plugin returning bad data: update sonic-platform-modules BSP package from vendor",
+        "If thermal policy too aggressive: vendor platform plugin may expose thermal policy configuration -- consult vendor docs",
+        "After fix: monitor 'watch -n 5 show platform temperature' to confirm stability before leaving unattended"
+      ]
+    },
+    {
+      "issue": "PSU failure not detected -- no syslog alert for failed PSU",
+      "symptoms": [
+        "show platform psu shows a PSU as absent or failed but no syslog CRIT message was generated",
+        "PSU amber LED visible on chassis hardware but SONiC generated no alert",
+        "redis-cli -n 6 hgetall 'PSU_INFO|PSU 1' shows empty or stale data",
+        "psud log shows no polling activity or daemon is stopped"
+      ],
+      "causes": [
+        "psud process crashed or was never started (check supervisorctl status)",
+        "Platform plugin get_psu() not implemented or raising exception silently",
+        "psud polling interval too long relative to alert requirement (default varies by platform)",
+        "syslog not configured to forward CRIT-level messages to monitoring system",
+        "PSU slot numbering mismatch between platform plugin and physical slot"
+      ],
+      "diagnosis": [
+        "docker exec pmon supervisorctl status psud -- confirm daemon running",
+        "docker exec pmon tail -50 /var/log/pmon/psud.log -- look for 'exception', 'failed', or absence of regular poll log lines",
+        "redis-cli -n 6 keys 'PSU_INFO*' -- confirm entries exist (absent = psud not writing)",
+        "redis-cli -n 6 hgetall 'PSU_INFO|PSU 1' -- inspect status, presence, voltage, current fields",
+        "docker exec pmon python3 -c \"import sonic_platform; p = sonic_platform.platform.Platform(); c = p.get_chassis(); psu = c.get_psu(0); print(psu.get_presence(), psu.get_status())\" -- test platform API directly",
+        "grep -i 'psu\\|power' /var/log/syslog | tail -50 -- search for any PSU-related log entries"
+      ],
+      "resolution": [
+        "psud stopped: 'docker exec pmon supervisorctl start psud' to restart daemon",
+        "Platform plugin exception: update BSP package; check vendor support for your hardware revision",
+        "Missing PSU_INFO keys: 'docker exec pmon supervisorctl restart psud' -- daemon will repopulate STATE_DB on restart",
+        "Confirm fix: 'show platform psu' should show correct presence and status; physically remove and reinsert a PSU to test alert generation",
+        "For monitoring: ensure syslog forwarding is configured; psud alerts are syslog CRIT level tagged 'pmon#psud'"
+      ]
+    },
+    {
+      "issue": "Fan speed stuck at 100% -- thermalctld fallback mode",
+      "symptoms": [
+        "show platform fan shows all fans at 100% speed regardless of temperature",
+        "Audible: fans running at maximum RPM constantly",
+        "thermalctld log shows 'Failed to read temperature sensor' or 'Sensor read error'",
+        "show platform temperature shows one or more sensors with empty or invalid readings",
+        "System is otherwise functional (not shutting down)"
+      ],
+      "causes": [
+        "One or more temperature sensors returning read errors via platform API",
+        "Platform plugin sensor method raising exception that thermalctld catches and treats as fault",
+        "Hardware sensor failure (I2C device offline, sensor chip powered down)",
+        "thermalctld entered safety fallback: when sensor state is unknown, drive fans to 100% to prevent overtemp",
+        "Platform API version mismatch after SONiC upgrade (new thermalctld, old platform plugin)"
+      ],
+      "diagnosis": [
+        "show platform temperature -- identify which sensor(s) show empty, N/A, or error readings",
+        "docker exec pmon tail -100 /var/log/pmon/thermalctld.log -- look for 'sensor read error', 'exception', 'fallback mode'",
+        "redis-cli -n 6 keys 'TEMPERATURE_INFO*' -- list all known sensors",
+        "redis-cli -n 6 hgetall 'TEMPERATURE_INFO|<suspect_sensor>' -- inspect temperature value field for anomalies",
+        "docker exec pmon python3 -c \"import sonic_platform; p = sonic_platform.platform.Platform(); c = p.get_chassis(); t = c.get_thermal(0); print(t.get_temperature(), t.get_name())\" -- test sensor read directly",
+        "dmesg | grep -i 'i2c\\|smbus\\|thermal' -- check for kernel-level I2C bus errors"
+      ],
+      "resolution": [
+        "Platform plugin exception: update sonic-platform-modules to latest BSP release for the platform",
+        "Hardware sensor fault: identify the failing sensor from thermalctld log, check I2C connectivity ('i2cdetect -y <bus_number>')",
+        "API mismatch: ensure sonic-platform-modules version matches SONiC image version (check 'show version' and vendor BSP release notes)",
+        "Workaround while investigating: fans at 100% is safe -- do not attempt to manually reduce fan speed while sensor health is unknown",
+        "After fix: 'docker exec pmon supervisorctl restart thermalctld' -- daemon re-reads all sensors and exits fallback mode if sensors are healthy"
+      ]
+    },
+    {
+      "issue": "Platform API not implemented -- pmon daemon crashes at startup",
+      "symptoms": [
+        "docker exec pmon supervisorctl status shows xcvrd, thermalctld, or psud in FATAL state",
+        "daemon log contains 'NotImplementedError' or 'AttributeError' immediately after start",
+        "show platform temperature / psu / fan returns empty output or errors",
+        "pmon container repeatedly restarting (systemctl status pmon shows high restart count)"
+      ],
+      "causes": [
+        "Vendor sonic-platform-modules package not installed or wrong version for the hardware",
+        "Platform plugin class inheriting from PlatformBase but not overriding required abstract methods",
+        "New SONiC feature using a platform API method not present in older vendor plugin",
+        "Running SONiC on unsupported or community-ported hardware lacking a complete platform plugin",
+        "sonic_platform Python package installed but pointing to wrong platform directory"
+      ],
+      "diagnosis": [
+        "docker exec pmon supervisorctl status -- identify which specific daemons are in FATAL state",
+        "docker exec pmon tail -50 /var/log/pmon/xcvrd.log (or thermalctld.log, psud.log) -- find 'NotImplementedError' traceback",
+        "show platform summary -- verify platform name and HWSKU are correctly detected",
+        "docker exec pmon python3 -c \"import sonic_platform; print(sonic_platform.__file__)\" -- verify platform module path",
+        "ls /usr/lib/python3/dist-packages/sonic_platform* -- check installed platform package",
+        "dpkg -l | grep sonic-platform -- verify platform plugin package name and version"
+      ],
+      "resolution": [
+        "Install correct BSP: 'sudo apt-get install sonic-platform-<vendor>-<hwsku>' -- obtain package from vendor or SONiC community",
+        "After install: 'sudo systemctl restart pmon' -- container will pick up new platform plugin",
+        "If vendor plugin incomplete: identify which methods raise NotImplementedError from log traceback; file bug with vendor",
+        "Temporary workaround for non-critical daemons (ledd, pcied): disable in /etc/supervisor/conf.d/pmon.conf if causing container restart loop",
+        "Confirm fix: 'show platform summary' should show correct platform; 'docker exec pmon supervisorctl status' all daemons should be RUNNING"
+      ]
+    }
+  ],
+  "scale_considerations": {
+    "transceiver_count": "xcvrd scales linearly with port count. On 128-port platforms, initial EEPROM scan at startup takes 30-90 seconds. DOM polling adds per-port I2C overhead. On dense platforms, xcvrd startup delay is normal -- allow 2 minutes before declaring a transceiver missing.",
+    "polling_intervals": "thermalctld default polling interval is 60 seconds. psud default is 60 seconds. On chassis with many sensors (>50 thermals), polling may take longer than the interval -- check thermalctld log for 'poll time exceeded interval' warnings.",
+    "i2c_bus_contention": "xcvrd, thermalctld, psud, and syseepromd all share the platform I2C bus via the platform API. Simultaneous polling can cause I2C contention on platforms with slow or shared I2C controllers. Vendor platform plugins should serialize access; if not, intermittent read errors may appear under load.",
+    "memory_pressure": "pmon daemons are lightweight compared to swss/syncd. Total pmon container RSS is typically under 200MB. Not a concern on production hardware."
+  },
+  "related_subsystems": [
+    "database-container",
+    "syncd-container"
+  ]
+}

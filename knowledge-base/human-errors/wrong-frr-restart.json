@@ -1,0 +1,68 @@
+{
+  "error_id": "wrong-frr-restart",
+  "display_name": "Restarting FRR processes incorrectly, breaking bgpcfgd synchronization",
+  "severity": "HIGH",
+  "category": "config-integrity",
+  "sonic_version": "202511",
+  "pattern": "Operator kills or restarts individual FRR daemons directly -- using 'kill $(pidof bgpd)', 'pkill zebra', 'docker exec bgp supervisorctl restart bgpd', or 'docker exec bgp kill -9 <pid>' -- instead of restarting the bgp container via 'systemctl restart bgp'. The individual FRR daemon restarts but bgpcfgd is not involved in or notified of the restart, so the daemon re-reads its on-disk startup config rather than receiving a fresh config generated from the live CONFIG_DB state.",
+  "what_goes_wrong": "In SONiC 202511, bgpcfgd is the authoritative owner of FRR daemon configuration. On bgp container startup, bgpcfgd reads CONFIG_DB (BGP_GLOBALS, BGP_NEIGHBOR, BGP_PEER_RANGE, DEVICE_METADATA, etc.) and renders the FRR configuration by applying Jinja2 templates (frr.conf.j2, bgpd.conf.j2) via sonic-cfggen, writing the result to /etc/frr/frr.conf, then calling 'vtysh -f /etc/frr/frr.conf' to load it into FRR. When an individual daemon such as bgpd or zebra is killed and restarts on its own (supervised by supervisord inside the bgp container), FRR reads the on-disk /etc/frr/frr.conf that was last written by bgpcfgd -- which may be stale if CONFIG_DB was modified since the last container start. More critically, bgpcfgd does not re-run its full initialization or re-apply the config when it detects a daemon restart; it only fires config pushes in response to CONFIG_DB change events. If no CONFIG_DB event occurs after the daemon restart, bgpcfgd will never push the current desired state, leaving FRR running with the stale on-disk config. Subsequent config changes via the SONiC CLI may be processed by bgpcfgd incrementally, but the base config mismatch can cause conflicts, duplicate stanza errors in vtysh, or missing policy objects that were expected to already be present.",
+  "symptoms": [
+    "BGP sessions do not re-establish after 'pkill bgpd' or 'kill bgpd' even though CONFIG_DB shows neighbors are configured",
+    "'show bgp summary' shows fewer or different neighbors than 'redis-cli -n 4 KEYS BGP_NEIGHBOR|*' would suggest",
+    "docker logs bgp shows bgpd restarting (supervisor log: 'bgpd: stopped', 'bgpd: started') but no 'Generating FRR config' or 'vtysh -f' line from bgpcfgd immediately after",
+    "After killing zebra, 'show ip route' returns empty or stale routes that do not match APPL_DB ROUTE_TABLE entries",
+    "A SONiC config CLI change made after the incorrect restart takes effect, but earlier config that should already be present (e.g., previously configured neighbors) is missing -- bgpcfgd applied the delta but not the full base config",
+    "vtysh inside the bgp container shows FRR running config that matches /etc/frr/frr.conf on disk but diverges from current CONFIG_DB state",
+    "fpmsyncd loses its Netlink/FPM connection to zebra when zebra is killed, and zebra does not re-establish the FPM connection automatically without a bgpcfgd-driven restart",
+    "BFD sessions (bfdd) go down and do not recover after pkill bfdd, because bfdd peer config is injected by bgpcfgd on startup"
+  ],
+  "detection_commands": [
+    {
+      "command": "docker logs bgp --since 2h 2>&1 | grep -E '(stopped|started|exited|FATAL|bgpd|zebra|bfdd|staticd)' | grep -v 'show\\|vtysh -c' | tail -40",
+      "purpose": "Identify supervisord-level daemon restart events inside the bgp container. A 'bgpd: stopped' followed by 'bgpd: started' without a surrounding 'Generating FRR config' from bgpcfgd indicates the daemon was restarted outside of bgpcfgd control."
+    },
+    {
+      "command": "docker logs bgp --since 2h 2>&1 | grep -E '(Generating FRR config|vtysh -f|frr.conf|template|bgpcfgd.*INFO)' | tail -20",
+      "purpose": "Check whether bgpcfgd performed a full config render after the restart. If daemon restart log lines appear but no 'Generating FRR config' follows within a few seconds, bgpcfgd did not re-apply the CONFIG_DB state."
+    },
+    {
+      "command": "diff <(docker exec bgp vtysh -c 'show running-config' 2>/dev/null | grep -vE '^(Building|Current|!|\\s*$)' | sort) <(sonic-cfggen -d -t /usr/share/sonic/templates/frr.conf.j2 2>/dev/null | grep -vE '^(Building|Current|!|\\s*$)' | sort)",
+      "purpose": "Diff the live FRR running config against what bgpcfgd should have generated from current CONFIG_DB. Lines missing from the live config (marked '>') are the desired state that was never applied because bgpcfgd did not run a full render after the daemon restart."
+    },
+    {
+      "command": "redis-cli -n 4 HGETALL 'BGP_GLOBALS|default' && redis-cli -n 4 KEYS 'BGP_NEIGHBOR|*' | sort",
+      "purpose": "Show the current BGP desired state in CONFIG_DB. Compare neighbor keys against 'docker exec bgp vtysh -c show bgp neighbors' to identify neighbors CONFIG_DB expects to be configured but that are absent from the restarted bgpd."
+    },
+    {
+      "command": "docker exec bgp supervisorctl status",
+      "purpose": "Show the current state and uptime of each FRR daemon supervised by supervisord inside the bgp container. A daemon with a very recent start time relative to others indicates it was individually restarted."
+    },
+    {
+      "command": "docker exec bgp cat /etc/frr/frr.conf | grep -E '^(router bgp|neighbor|bfd|route-map|prefix-list)' | sort",
+      "purpose": "Show the on-disk frr.conf that bgpcfgd last wrote. If this file is older than the last CONFIG_DB change (check file mtime with 'stat /var/run/docker/...') it is stale and the daemon is running stale config."
+    },
+    {
+      "command": "docker exec bgp vtysh -c 'show ip route summary' && docker exec bgp vtysh -c 'show bgp summary'",
+      "purpose": "Quick operational state snapshot. Missing routes and absent BGP neighbors after a daemon kill confirm the FRR state did not recover to match CONFIG_DB."
+    },
+    {
+      "command": "redis-cli -n 6 KEYS 'FPM_TABLE|*' 2>/dev/null | wc -l && redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l",
+      "purpose": "Compare the FPM route count (zebra -> fpmsyncd -> APPL_DB) against APPL_DB ROUTE_TABLE entries. A large discrepancy after a zebra kill indicates fpmsyncd lost its FPM socket connection and routes are not being forwarded to orchagent."
+    }
+  ],
+  "correct_procedure": "To restart FRR on a SONiC switch, always restart the entire bgp container via the host systemd unit: 'sudo systemctl restart bgp'. This tears down and re-creates the container, causing bgpcfgd to run its full initialization sequence, re-read CONFIG_DB, render fresh FRR config templates, and call 'vtysh -f' to load the authoritative config. Do not kill or restart individual FRR daemons (bgpd, zebra, staticd, bfdd, etc.) directly inside the container. If a targeted restart is truly required for debugging, first run 'systemctl restart bgp' to establish a clean baseline, then note that any individual daemon restart afterward will require a follow-up 'systemctl restart bgp' to resynchronize bgpcfgd. For planned BGP maintenance (graceful restart), use 'config bgp graceful-restart ...' and the SONiC warm-restart framework ('warm-reboot' or 'fast-reboot') rather than killing daemons.",
+  "why_it_breaks": [
+    "bgpcfgd performs its full CONFIG_DB-to-FRR config render only during its own initialization (i.e., when the bgp container starts). It does not detect or respond to individual FRR daemon restarts by re-running the full render.",
+    "When bgpd restarts under supervisord supervision, it reads /etc/frr/frr.conf from disk. If bgpcfgd has not written that file since the last CONFIG_DB change, bgpd starts with stale config -- missing new neighbors, updated timers, or changed policies.",
+    "bgpcfgd's incremental CONFIG_DB change handlers assume the FRR base config is already correctly applied. When bgpd restarts missing that base config, incremental updates from bgpcfgd may produce vtysh errors (duplicate commands, missing context) or silently fail.",
+    "Killing zebra breaks the FPM socket connection between zebra and fpmsyncd. fpmsyncd does not automatically reconnect when zebra restarts; it requires a container restart to re-establish the Netlink/FPM channel. Until reconnected, route changes from FRR are not forwarded to orchagent and ASIC_DB.",
+    "bfdd peer configuration is injected by bgpcfgd during startup. If bfdd is killed and restarts, it has no peer config until bgpcfgd pushes it -- which only happens on a CONFIG_DB event or container restart. BFD sessions remain down silently.",
+    "The SONiC warm-restart and fast-reboot frameworks have specific checkpoint and reconciliation logic that assumes the bgp container is restarted as a unit. Killing individual daemons bypasses these reconciliation steps, potentially leaving STATE_DB in an inconsistent state."
+  ],
+  "prevention": "Document and enforce in runbooks that FRR restarts must always go through 'systemctl restart bgp'. Add shell aliases or wrapper scripts that intercept 'docker exec bgp supervisorctl restart' and redirect operators to the correct command. If monitoring detects individual daemon restart events (supervisord FATAL or unexpected stop) without a corresponding container restart event, alert on it as a potential bgpcfgd desync. Consider restricting 'docker exec' access to the bgp container for non-admin roles.",
+  "related_errors": ["direct-frr-vtysh", "manual-config-db-json-edit"],
+  "ref_daemons": ["daemon:bgpcfgd", "daemon:bgpd", "daemon:zebra", "daemon:fpmsyncd", "daemon:bfdd", "daemon:staticd"],
+  "ref_dbs": ["db:config_db", "db:appl_db", "db:state_db"],
+  "keywords": ["pkill bgpd", "kill bgpd", "supervisorctl restart bgpd", "kill zebra", "frr restart", "bgpd restart", "individual daemon restart", "bgp container", "fpm socket", "bgpcfgd desync"],
+  "context_keywords": ["bgp", "frr", "bgpd", "zebra", "restart", "kill", "supervisorctl", "bgpcfgd", "fpmsyncd", "bfdd", "config desync"]
+}

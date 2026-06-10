@@ -1,4 +1,60 @@
 {
+  "wrong-reload-order": {
+    "display_name": "Restarting SONiC containers in wrong dependency order",
+    "severity": "HIGH",
+    "keywords": [
+      "container restart order",
+      "docker restart database",
+      "docker restart swss",
+      "docker restart syncd",
+      "dependency order",
+      "wrong order",
+      "out of order restart",
+      "redis connection refused",
+      "database container",
+      "startup sequence"
+    ],
+    "context_keywords": [
+      "restart",
+      "container",
+      "database",
+      "syncd",
+      "swss",
+      "dependency",
+      "order",
+      "redis",
+      "orchagent",
+      "SAI",
+      "initialization"
+    ]
+  },
+  "manual-ip-link": {
+    "display_name": "Using ip link/ip addr commands directly instead of SONiC config CLI",
+    "severity": "MEDIUM",
+    "keywords": [
+      "ip link set",
+      "ip addr add",
+      "ip addr del",
+      "ip route add",
+      "ifconfig",
+      "manual kernel",
+      "netlink",
+      "iproute2",
+      "direct interface config"
+    ],
+    "context_keywords": [
+      "interface",
+      "ip address",
+      "admin status",
+      "shutdown",
+      "startup",
+      "route",
+      "kernel",
+      "netlink",
+      "portmgrd",
+      "intfmgrd"
+    ]
+  },
   "stale-warmboot-files": {
     "display_name": "Stale warmboot files from a previous failed reboot causing boot-up to use outdated state",
     "severity": "HIGH",
@@ -66,6 +122,97 @@
       "config_db",
       "appl_db",
       "database"
+    ]
+  },
+  "dpkg-force-install": {
+    "display_name": "Force-installing Debian packages on SONiC, breaking the immutable image model",
+    "severity": "HIGH",
+    "keywords": [
+      "apt-get install",
+      "dpkg -i",
+      "dpkg --force",
+      "pip install",
+      "immutable image",
+      "overlayfs",
+      "squashfs",
+      "sonic-installer",
+      "package manager",
+      "package database",
+      "dpkg status",
+      "force-overwrite",
+      "force-all",
+      "break-system-packages"
+    ],
+    "context_keywords": [
+      "package",
+      "install",
+      "apt",
+      "dpkg",
+      "pip",
+      "library",
+      "overlay",
+      "image upgrade",
+      "lost after upgrade",
+      "shared library",
+      "ImportError",
+      "dist-packages"
+    ]
+  },
+  "wrong-frr-restart": {
+    "display_name": "Restarting FRR processes incorrectly, breaking bgpcfgd synchronization",
+    "severity": "HIGH",
+    "keywords": [
+      "pkill bgpd",
+      "kill bgpd",
+      "supervisorctl restart bgpd",
+      "kill zebra",
+      "frr restart",
+      "bgpd restart",
+      "individual daemon restart",
+      "bgp container",
+      "fpm socket",
+      "bgpcfgd desync"
+    ],
+    "context_keywords": [
+      "bgp",
+      "frr",
+      "bgpd",
+      "zebra",
+      "restart",
+      "kill",
+      "supervisorctl",
+      "bgpcfgd",
+      "fpmsyncd",
+      "bfdd",
+      "config desync"
+    ]
+  },
+  "restart-swss-during-traffic": {
+    "display_name": "Restarting swss container while production traffic is flowing",
+    "severity": "HIGH",
+    "keywords": [
+      "systemctl restart swss",
+      "docker restart swss",
+      "orchagent restart",
+      "swss container",
+      "traffic loss",
+      "forwarding interruption",
+      "SAI flush",
+      "ASIC clear",
+      "cold restart",
+      "warm restart"
+    ],
+    "context_keywords": [
+      "swss",
+      "orchagent",
+      "restart",
+      "traffic",
+      "forwarding",
+      "SAI",
+      "ASIC_DB",
+      "outage",
+      "production",
+      "replay"
     ]
   },
   "manual-config-db-json-edit": {

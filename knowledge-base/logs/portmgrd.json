@@ -1,0 +1,167 @@
+{
+  "daemon": "portmgrd",
+  "log_file": "/var/log/syslog",
+  "container": "swss",
+  "messages": [
+    {
+      "log_id": "log:portmgrd:mtu-set",
+      "pattern": "Port MTU set to \\d+",
+      "meaning": "portmgrd successfully applied an MTU value to a kernel network interface via ip link set mtu",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "Operator applied 'interface mtu <value>' in CONFIG_DB",
+        "Automated provisioning pushed a new MTU via RESTAPI or sonic-cfggen"
+      ],
+      "next_steps": [
+        "Confirm the MTU is active on the kernel interface: ip link show <interface> | grep mtu",
+        "Verify CONFIG_DB entry: redis-cli -n 4 HGET 'PORT|<interface>' mtu",
+        "Check APPL_DB was updated: redis-cli -n 0 HGET 'PORT_TABLE:<interface>' mtu",
+        "If traffic issues persist after MTU change, check end-to-end path MTU: ping -s <size> -M do <peer>"
+      ],
+      "related_code_path": "port-config",
+      "source_ref": "sonic-swss:cfgmgr/portmgr.cpp"
+    },
+    {
+      "log_id": "log:portmgrd:admin-state-change",
+      "pattern": "Port admin state.*changed.*(up|down)|ip link set .*(up|down)",
+      "meaning": "portmgrd applied an admin-up or admin-down to the kernel interface in response to a CONFIG_DB change",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "Operator ran 'interface shutdown' or 'no shutdown' via CLI or SONiC config",
+        "Automated rollout toggling ports during provisioning",
+        "Warm restart replay of admin state from CONFIG_DB"
+      ],
+      "next_steps": [
+        "Verify the kernel state matches intent: ip link show <interface>",
+        "Check CONFIG_DB admin_status: redis-cli -n 4 HGET 'PORT|<interface>' admin_status",
+        "Confirm orchagent propagated the change to ASIC: redis-cli -n 0 HGET 'PORT_TABLE:<interface>' admin_status",
+        "If port should be up but kernel shows DOWN, check physical link: show interfaces status <interface>",
+        "Review recent config changes: show logging | grep portmgrd | tail -20"
+      ],
+      "related_code_path": "port-config",
+      "source_ref": "sonic-swss:cfgmgr/portmgr.cpp"
+    },
+    {
+      "log_id": "log:portmgrd:mtu-set-fail",
+      "pattern": "Failed to set.*MTU|Failed to set port MTU|error.*mtu.*EOPNOTSUPP|EINVAL.*mtu",
+      "meaning": "portmgrd attempted to apply an MTU value to a kernel interface but the kernel or driver rejected it",
+      "severity": "ERROR",
+      "likely_causes": [
+        "Requested MTU exceeds the driver maximum for this NIC/ASIC (common above 9216 bytes)",
+        "Interface is in a bonded/LAG group whose master has a lower MTU",
+        "Kernel module does not support jumbo frames",
+        "Race condition: interface does not exist in kernel yet when portmgrd tried to configure it"
+      ],
+      "next_steps": [
+        "Check kernel error details: journalctl -u portmgrd | grep -i mtu | tail -30",
+        "Verify driver MTU limits: ip link show <interface> | grep mtu; ethtool -i <interface>",
+        "Check if interface is in a portchannel: show interfaces portchannel",
+        "If LAG member, set MTU on the portchannel itself, not the member",
+        "Confirm platform MTU support in platform.json or hwsku.json",
+        "Fallback: set MTU manually to confirm kernel accepts it: ip link set <intf> mtu <value>; if rejected, the value exceeds hardware capability"
+      ],
+      "related_code_path": "port-config",
+      "source_ref": "sonic-swss:cfgmgr/portmgr.cpp"
+    },
+    {
+      "log_id": "log:portmgrd:speed-applied",
+      "pattern": "Port speed.*applied|speed.*configured|set.*speed.*\\d+",
+      "meaning": "portmgrd wrote a new port speed (or autoneg setting) to the kernel interface or notified orchagent via APPL_DB",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "Operator set interface speed via CLI or config_db.json",
+        "Autoneg mode changed alongside speed hint"
+      ],
+      "next_steps": [
+        "Verify speed is visible: show interfaces status <interface>",
+        "Check APPL_DB: redis-cli -n 0 HGET 'PORT_TABLE:<interface>' speed",
+        "Check ASIC_DB to confirm SAI programmed it: redis-cli -n 1 KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_PORT:*' | xargs -I{} redis-cli -n 1 HGET {} SAI_PORT_ATTR_SPEED",
+        "If speed mismatch persists, verify autoneg setting: show interfaces autoneg status <interface>",
+        "Check transceiver supports requested speed: show interfaces transceiver eeprom <interface>"
+      ],
+      "related_code_path": "port-config",
+      "source_ref": "sonic-swss:cfgmgr/portmgr.cpp"
+    },
+    {
+      "log_id": "log:portmgrd:fec-changed",
+      "pattern": "FEC.*changed|FEC.*configured|set.*fec",
+      "meaning": "portmgrd applied a Forward Error Correction mode change to the port, writing it to APPL_DB for orchagent/syncd to program into the ASIC",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "Operator set 'interface fec <mode>' (none, rs, fc) via CLI",
+        "Autoneg negotiated a new FEC mode with the peer"
+      ],
+      "next_steps": [
+        "Verify current FEC mode: show interfaces fec status <interface>",
+        "Check APPL_DB: redis-cli -n 0 HGET 'PORT_TABLE:<interface>' fec",
+        "Confirm orchagent programmed the SAI attribute: docker exec swss grep -i fec /var/log/swss/orchagent.log | tail -20",
+        "If BER increases after FEC change, check cable quality: show interfaces transceiver eeprom <interface>",
+        "RS-FEC required for 100G+ ports on most platforms -- do not disable without careful testing"
+      ],
+      "related_code_path": "port-config",
+      "source_ref": "sonic-swss:cfgmgr/portmgr.cpp"
+    },
+    {
+      "log_id": "log:portmgrd:config-fail",
+      "pattern": "Failed to configure port|netlink.*error|RTNETLINK.*error|configure.*port.*failed",
+      "meaning": "portmgrd issued a netlink request to configure the port but received an error response from the kernel",
+      "severity": "ERROR",
+      "likely_causes": [
+        "Interface does not exist in the kernel at the time of the netlink call (timing/ordering issue)",
+        "Kernel returned ENODEV -- interface was deleted or renamed",
+        "Insufficient privileges (should not happen inside swss container but can after custom hardening)",
+        "Conflicting configuration from another daemon or script running outside SONiC orchestration"
+      ],
+      "next_steps": [
+        "Check if interface exists in kernel: ip link show <interface>",
+        "Review portmgrd logs for the preceding context: docker exec swss grep portmgrd /var/log/syslog | tail -50",
+        "Restart portmgrd if interface is present but state is stale: docker exec swss supervisorctl restart portmgrd",
+        "If interface is missing entirely, check if swss orchagent created it: redis-cli -n 0 HGETALL 'PORT_TABLE:<interface>'",
+        "Verify no external scripts are managing the same interface: ps aux | grep 'ip link'",
+        "As last resort, restart swss container: sudo systemctl restart swss (causes brief traffic disruption)"
+      ],
+      "related_code_path": "port-config",
+      "source_ref": "sonic-swss:cfgmgr/portmgr.cpp"
+    },
+    {
+      "log_id": "log:portmgrd:waiting-port-ready",
+      "pattern": "waiting for port ready|port.*not ready|port state check.*wait",
+      "meaning": "portmgrd is polling STATE_DB waiting for orchagent to mark the port as ready before applying further configuration -- a normal but time-bounded wait state",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "orchagent has not yet created the SAI port object and written 'ok' to STATE_DB:PORT_TABLE",
+        "syncd is slow to respond during bootup or warm restart, delaying orchagent",
+        "portmgrd started before orchagent finished initializing ports (race at container start)",
+        "Port was removed and re-added (e.g., breakout reconfiguration) and portmgrd picked up the CONFIG_DB entry before orchagent reprovisioned it"
+      ],
+      "next_steps": [
+        "Check if the port is ready in STATE_DB: redis-cli -n 6 HGET 'PORT_TABLE|<interface>' state",
+        "Check orchagent is running: docker exec swss supervisorctl status orchagent",
+        "Check if orchagent is stuck: docker exec swss grep -i 'error\\|fatal' /var/log/swss/orchagent.log | tail -20",
+        "Monitor STATE_DB for port readiness: watch -n 1 'redis-cli -n 6 KEYS PORT_TABLE*'",
+        "If wait exceeds 60 seconds, check syncd: docker exec syncd supervisorctl status syncd",
+        "If after breakout reconfiguration, allow extra time -- portmgrd retries on a timer and will proceed once orchagent completes"
+      ],
+      "related_code_path": "port-config",
+      "source_ref": "sonic-swss:cfgmgr/portmgr.cpp"
+    },
+    {
+      "log_id": "log:portmgrd:description-updated",
+      "pattern": "Interface description.*updated|alias.*applied|description.*written",
+      "meaning": "portmgrd applied an interface description or alias to the kernel interface (written to /sys/class/net/<intf>/ifalias or via netlink)",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "Operator set 'interface description <text>' in CONFIG_DB",
+        "Bulk provisioning script updated interface descriptions via sonic-cfggen or config reload"
+      ],
+      "next_steps": [
+        "Verify alias was applied to kernel: cat /sys/class/net/<interface>/ifalias",
+        "Check CONFIG_DB description field: redis-cli -n 4 HGET 'PORT|<interface>' description",
+        "Confirm APPL_DB reflects description: redis-cli -n 0 HGET 'PORT_TABLE:<interface>' description",
+        "If description is blank but CONFIG_DB has a value, restart portmgrd: docker exec swss supervisorctl restart portmgrd"
+      ],
+      "related_code_path": "port-config",
+      "source_ref": "sonic-swss:cfgmgr/portmgr.cpp"
+    }
+  ]
+}

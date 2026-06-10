@@ -1,0 +1,176 @@
+{
+  "daemon": "fpmsyncd",
+  "log_file": "/var/log/syslog",
+  "container": "bgp",
+  "messages": [
+    {
+      "log_id": "log:fpmsyncd:fpm-connected",
+      "pattern": "FPM.*connected|Connected to.*FPM|fpm_connect.*success",
+      "meaning": "fpmsyncd successfully established a TCP socket connection to zebra's FPM server; route programming pipeline between FRR and APPL_DB is now active",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "Normal startup sequence after bgp container starts",
+        "zebra restarted and fpmsyncd reconnected",
+        "Warm restart reconciliation beginning"
+      ],
+      "next_steps": [
+        "Verify FPM connection is stable: docker exec bgp supervisorctl status fpmsyncd",
+        "Confirm zebra is running: docker exec bgp supervisorctl status zebra",
+        "Check route table is populating: show ip route summary",
+        "Verify APPL_DB is receiving routes: redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l"
+      ],
+      "related_code_path": "route-install-bgp",
+      "source_ref": "sonic-frr:fpmsyncd/fpmsyncd.cpp"
+    },
+    {
+      "log_id": "log:fpmsyncd:fpm-disconnected",
+      "pattern": "FPM.*disconnect|fpm.*closed|Lost connection.*FPM|FPM socket closed",
+      "meaning": "fpmsyncd lost its TCP connection to zebra's FPM server; new routes from FRR will not reach APPL_DB or the ASIC until reconnection",
+      "severity": "ERROR",
+      "likely_causes": [
+        "zebra process crashed or was restarted",
+        "bgp container OOM kill or supervisord restart",
+        "FPM port 2620 blocked by iptables or namespace issue",
+        "fpmsyncd itself hit an exception and tore down the socket"
+      ],
+      "next_steps": [
+        "Check zebra status: docker exec bgp supervisorctl status zebra",
+        "Check fpmsyncd status: docker exec bgp supervisorctl status fpmsyncd",
+        "Look for zebra crash in logs: docker exec bgp cat /var/log/frr/frr.log | grep -i 'crash\\|assert\\|abort' | tail -20",
+        "Check FPM port is listening: docker exec bgp ss -tnlp | grep 2620",
+        "Verify routes are stale by comparing kernel to APPL_DB: ip route show | wc -l vs redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l",
+        "Restart fpmsyncd if zebra is healthy: docker exec bgp supervisorctl restart fpmsyncd"
+      ],
+      "related_code_path": "route-install-bgp",
+      "source_ref": "sonic-frr:fpmsyncd/fpmsyncd.cpp"
+    },
+    {
+      "log_id": "log:fpmsyncd:route-add",
+      "pattern": "RouteSync.*add|ROUTE_TABLE.*SET|fpmsyncd.*Adding route|addRoute",
+      "meaning": "fpmsyncd is writing a route entry to ROUTE_TABLE in APPL_DB; this is the normal path for FRR-learned routes entering the SONiC pipeline",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "BGP session received a new prefix",
+        "Static route configured and activated",
+        "Warm restart reconciliation replaying routes"
+      ],
+      "next_steps": [
+        "Confirm route reached APPL_DB: redis-cli -n 0 HGETALL 'ROUTE_TABLE:<prefix>'",
+        "Check orchagent picked up the route: redis-cli -n 1 HGETALL 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:{\"dest\":\"<prefix>\"}'",
+        "Verify end-to-end: show ip route <prefix>"
+      ],
+      "related_code_path": "route-install-bgp",
+      "source_ref": "sonic-frr:fpmsyncd/routesync.cpp"
+    },
+    {
+      "log_id": "log:fpmsyncd:route-delete",
+      "pattern": "RouteSync.*del|ROUTE_TABLE.*DEL|fpmsyncd.*Deleting route|deleteRoute",
+      "meaning": "fpmsyncd is removing a route entry from ROUTE_TABLE in APPL_DB; orchagent will subsequently withdraw the route from the ASIC",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "BGP withdrew the prefix (peer down, policy change, MED change)",
+        "Static route removed from config",
+        "Interface carrying the next-hop went down"
+      ],
+      "next_steps": [
+        "Confirm route was removed from APPL_DB: redis-cli -n 0 EXISTS 'ROUTE_TABLE:<prefix>'",
+        "Check if the BGP session is still up: show bgp summary",
+        "Check if next-hop interface is up: show interfaces status",
+        "Verify ASIC removal: show ip route <prefix> (should be absent or via different path)"
+      ],
+      "related_code_path": "route-install-bgp",
+      "source_ref": "sonic-frr:fpmsyncd/routesync.cpp"
+    },
+    {
+      "log_id": "log:fpmsyncd:redis-write-fail",
+      "pattern": "Failed to write.*APPL_DB|redis.*error|APPL_DB.*write.*fail|RedisReply.*error",
+      "meaning": "fpmsyncd could not write a route to APPL_DB due to a Redis error; routes are silently dropped and will not reach orchagent or the ASIC",
+      "severity": "ERROR",
+      "likely_causes": [
+        "redis-server process crashed or restarted mid-write",
+        "Redis memory limit hit (maxmemory policy evicting keys)",
+        "Unix socket /var/run/redis/redis.sock not accessible from bgp container",
+        "Redis AUTH mismatch after container restart"
+      ],
+      "next_steps": [
+        "Check redis-server health: docker exec database redis-cli ping",
+        "Check Redis memory: docker exec database redis-cli info memory | grep used_memory_human",
+        "Check Redis error log: docker exec database cat /var/log/redis/redis-server.log | tail -30",
+        "Verify socket is accessible from bgp container: docker exec bgp ls -la /var/run/redis/redis.sock",
+        "Check if routes are missing from APPL_DB: redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l",
+        "Restart fpmsyncd to force route replay from zebra: docker exec bgp supervisorctl restart fpmsyncd"
+      ],
+      "def_refs": ["daemon:fpmsyncd", "db:appl_db", "daemon:redis-server"],
+      "related_code_path": "route-install-bgp",
+      "source_ref": "sonic-frr:fpmsyncd/fpmsyncd.cpp"
+    },
+    {
+      "log_id": "log:fpmsyncd:fpm-parse-error",
+      "pattern": "Failed to parse.*FPM|fpm.*malformed|invalid FPM message|FPM msg.*length",
+      "meaning": "fpmsyncd received a FPM netlink message from zebra that it could not parse; the route update is discarded and will not reach APPL_DB",
+      "severity": "ERROR",
+      "likely_causes": [
+        "FRR version mismatch between zebra and fpmsyncd -- netlink message format incompatibility",
+        "Memory corruption in zebra causing garbled FPM output",
+        "Partial write to FPM socket (kernel buffer issue)",
+        "Custom FRR patch introducing new message fields fpmsyncd does not understand"
+      ],
+      "next_steps": [
+        "Check FRR version consistency: docker exec bgp vtysh -c 'show version'",
+        "Check fpmsyncd binary version: docker exec bgp fpmsyncd --version 2>&1",
+        "Look for zebra assertion failures near the timestamp: docker exec bgp cat /var/log/frr/frr.log | grep -i 'assert\\|FPM' | tail -30",
+        "Enable FPM debug in zebra: docker exec bgp vtysh -c 'debug zebra fpm'",
+        "Check if specific prefixes trigger parse errors by correlating BGP updates: show bgp ipv4 unicast",
+        "Restart both zebra and fpmsyncd to reset the FPM socket: docker exec bgp supervisorctl restart zebra fpmsyncd"
+      ],
+      "def_refs": ["daemon:fpmsyncd", "daemon:zebra"],
+      "related_code_path": "route-install-bgp",
+      "source_ref": "sonic-frr:fpmsyncd/fpmsyncd.cpp"
+    },
+    {
+      "log_id": "log:fpmsyncd:reconcile",
+      "pattern": "reconcil|RouteSync.*warm.*restart|fpmsyncd.*replay|reconciliation.*complet",
+      "meaning": "fpmsyncd is performing post-restart route reconciliation -- replaying all routes from zebra to APPL_DB to ensure consistency after a warm restart",
+      "severity": "NOTICE",
+      "likely_causes": [
+        "Warm restart enabled and bgp container restarted",
+        "fpmsyncd restarted while zebra remained up (partial restart scenario)",
+        "SONiC warm reboot sequence initiated"
+      ],
+      "next_steps": [
+        "Monitor reconciliation progress: show warm_restart state",
+        "Watch APPL_DB route count stabilize: watch -n 2 \"redis-cli -n 0 KEYS 'ROUTE_TABLE:*' | wc -l\"",
+        "Do not make route policy changes until reconciliation completes",
+        "If reconciliation hangs: docker exec bgp supervisorctl status fpmsyncd",
+        "Check reconciliation timer has not expired: journalctl -u bgp -n 50 | grep reconcil"
+      ],
+      "def_refs": ["daemon:fpmsyncd", "daemon:zebra", "db:appl_db"],
+      "related_code_path": "route-install-bgp",
+      "source_ref": "sonic-frr:fpmsyncd/routesync.cpp"
+    },
+    {
+      "log_id": "log:fpmsyncd:invalid-nexthop",
+      "pattern": "invalid.*nexthop|nexthop.*unresolvable|Received route.*invalid.*nh|bad nexthop",
+      "meaning": "fpmsyncd received a route from zebra with a next-hop that cannot be resolved to a valid interface or neighbor; the route is dropped and will not be programmed into the ASIC",
+      "severity": "WARN",
+      "likely_causes": [
+        "Recursive next-hop chain too deep or contains a loop",
+        "Next-hop IP is not reachable via any directly connected interface",
+        "Interface carrying the next-hop went down before zebra withdrew the route",
+        "ECMP next-hop group partially invalid (some members down)",
+        "VRF misconfiguration causing next-hop lookup in wrong table"
+      ],
+      "next_steps": [
+        "Identify the problematic prefix from logs and inspect next-hop: show ip route <prefix>",
+        "Check if next-hop is reachable: ping <nexthop-ip> from management or control plane",
+        "Verify neighbor resolution: show arp | grep <nexthop-ip>",
+        "Check zebra's view of the next-hop: docker exec bgp vtysh -c 'show ip nexthop'",
+        "Check if the upstream BGP peer is advertising reachable next-hops: show bgp neighbors <peer> advertised-routes",
+        "For VRF routes: verify next-hop VRF is correct with show ip route vrf <vrf-name>"
+      ],
+      "def_refs": ["daemon:fpmsyncd", "daemon:zebra", "daemon:bgpd"],
+      "related_code_path": "route-install-bgp",
+      "source_ref": "sonic-frr:fpmsyncd/routesync.cpp"
+    }
+  ]
+}

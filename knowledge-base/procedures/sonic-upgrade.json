@@ -1,0 +1,213 @@
+{
+  "procedure_id": "sonic-upgrade",
+  "procedure_name": "SONiC Image Upgrade",
+  "category": "system-operations",
+  "risk_level": "high",
+  "purpose": "Upgrade SONiC OS image to a new version with rollback capability",
+  "def_refs": ["daemon:redis-server", "daemon:orchagent", "daemon:syncd", "db:config_db", "db:state_db", "db:appl_db"],
+  "prerequisites": [
+    "Maintenance window scheduled — upgrade causes a full control/data plane outage unless warm reboot is used post-install",
+    "All critical containers healthy: docker ps | grep -E 'database|swss|syncd|bgp'",
+    "Sufficient disk space on /host (>2GB free: df -h /host)",
+    "Running configuration saved to disk: ls -la /etc/sonic/config_db.json",
+    "Pre-upgrade baseline captured: BGP peer count, route table size, interface states",
+    "New image URL or local file path available and accessible from the switch",
+    "Out-of-band (OOB) management access confirmed in case in-band access is lost post-reboot"
+  ],
+  "warnings": [
+    "A full reboot is required after sonic-installer install — the data plane will be down for the full boot cycle (typically 3-5 minutes).",
+    "SONiC dual-image layout keeps current and new image. If /host has <2GB free, the install will fail mid-write.",
+    "CONFIG_DB schema migrations are one-way. Rollback to the old image may restore the binary but config_db.json may have been migrated. Test config reload after rollback.",
+    "Do NOT interrupt power or connectivity during the install step — partial writes can corrupt the boot partition.",
+    "After setting next boot image, always run 'config save -y' before rebooting to ensure the latest CONFIG_DB state is persisted to /etc/sonic/config_db.json.",
+    "sonic-installer rollback is only available in some SONiC versions and may not be present in community builds — verify before relying on it.",
+    "Cross-major-version upgrades (e.g., 202205 to 202511) may introduce breaking CONFIG_DB schema changes. Review release notes before upgrading."
+  ],
+  "steps": [
+    {
+      "step_id": "step-1",
+      "step": 1,
+      "action": "Verify current image version and available disk space",
+      "command": "show boot; df -h /host",
+      "verification": {
+        "command": "sonic-installer list; df /host | awk 'NR==2 {avail=$4; unit=substr($4,length($4)); if (avail+0 > 2097152) print \"OK: \" avail \" free\"; else print \"WARN: insufficient space\"}'",
+        "look_for": "Current image identified and at least 2GB free on /host",
+        "confirms_if": "Disk has enough space for the new image and current image slot is known"
+      },
+      "next_step_id": "step-2",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "sonic-installer list shows both image slots and which is current/next. If only one slot is used and disk is tight, the old image will be removed automatically on install — this eliminates the fallback slot."
+    },
+    {
+      "step_id": "step-2",
+      "step": 2,
+      "action": "Capture pre-upgrade baseline (BGP, routes, interfaces)",
+      "command": "show bgp summary; show ip route summary; show interfaces status | grep -v 'admin down'",
+      "verification": {
+        "command": "show bgp summary | grep -c Established; show ip route summary | grep -E 'Total|connected|bgp'; show interfaces status | grep -c ' up '",
+        "look_for": "BGP peer count, total route count, and up interface count recorded for post-upgrade comparison",
+        "confirms_if": "Baseline numbers captured; discrepancies after upgrade are immediately detectable"
+      },
+      "next_step_id": "step-3",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "Save this output: show bgp summary > /tmp/pre_upgrade_bgp.txt && show ip route summary > /tmp/pre_upgrade_routes.txt. Compare after upgrade to confirm full recovery."
+    },
+    {
+      "step_id": "step-3",
+      "step": 3,
+      "action": "Save running configuration to disk",
+      "command": "sudo config save -y",
+      "verification": {
+        "command": "ls -la /etc/sonic/config_db.json; python3 -c \"import json,sys; json.load(open('/etc/sonic/config_db.json')); print('JSON valid')\"",
+        "look_for": "config_db.json exists, is non-zero, and parses as valid JSON",
+        "confirms_if": "Running CONFIG_DB state is persisted and will be loaded by the new image on boot"
+      },
+      "next_step_id": "step-4",
+      "rollback_step_id": null,
+      "daemon_impact": [
+        {"daemon": "redis-server", "impact": "CONFIG_DB read to disk — no service interruption"}
+      ],
+      "notes": "config save -y writes CONFIG_DB (db 4) to /etc/sonic/config_db.json. This file is the source of truth on next boot. Verify it is not empty or zero-length before proceeding."
+    },
+    {
+      "step_id": "step-4",
+      "step": 4,
+      "action": "Download or copy the new SONiC image to the switch",
+      "command": "sudo sonic-installer install <image-url-or-path>",
+      "verification": {
+        "command": "sonic-installer list",
+        "look_for": "New image appears in the list with the correct version string",
+        "confirms_if": "Install wrote the image to a boot slot without errors"
+      },
+      "next_step_id": "step-5",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "Accepts HTTP/HTTPS URLs or local file paths (e.g., /tmp/sonic-vs.bin). The installer writes to /host/image-<version>/. If disk space is insufficient mid-install, the boot partition may be left in a partially written state — verify with 'sonic-installer list' before proceeding. To pre-stage the file: curl -o /tmp/sonic.bin <url> then run sonic-installer install /tmp/sonic.bin."
+    },
+    {
+      "step_id": "step-5",
+      "step": 5,
+      "action": "Verify new image installed and identify its slot name",
+      "command": "sonic-installer list",
+      "verification": {
+        "command": "sonic-installer list | grep -v '^Current'",
+        "look_for": "New image version appears as a non-current entry",
+        "confirms_if": "Image is present in /host and indexed by sonic-installer"
+      },
+      "next_step_id": "step-6",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "Note the exact image name string (e.g., 'SONiC-OS-202511.1234-generic'). This is required for the set-next-boot and rollback commands. If the new image does not appear, check /host for partial files and re-run the install step."
+    },
+    {
+      "step_id": "step-6",
+      "step": 6,
+      "action": "Set new image as the next boot target",
+      "command": "sudo sonic-installer set-next-boot <new-image-name>",
+      "verification": {
+        "command": "sonic-installer list | grep -A1 'Next\\|next'",
+        "look_for": "Next boot entry points to the new image version",
+        "confirms_if": "GRUB/bootloader will load the new image on next reboot"
+      },
+      "next_step_id": "step-7",
+      "rollback_step_id": "rollback-1",
+      "daemon_impact": [],
+      "notes": "This command writes to the GRUB configuration. It does NOT reboot. Use the exact image name string from step-5. After this step, if you decide not to upgrade, run 'sudo sonic-installer set-default <current-image>' to undo."
+    },
+    {
+      "step_id": "step-7",
+      "step": 7,
+      "action": "Perform final config save and initiate reboot",
+      "command": "sudo config save -y && sudo reboot",
+      "verification": {
+        "command": null,
+        "look_for": "Switch powers down and begins boot sequence. SSH session will drop.",
+        "confirms_if": "Reboot initiated; switch will come up on new image"
+      },
+      "next_step_id": "step-8",
+      "rollback_step_id": "rollback-1",
+      "daemon_impact": [
+        {"daemon": "orchagent", "impact": "Stopped — full data plane outage begins"},
+        {"daemon": "syncd", "impact": "Stopped — ASIC programming halted"},
+        {"daemon": "redis-server", "impact": "CONFIG_DB flushed to disk before shutdown"}
+      ],
+      "notes": "The second config save guards against any CONFIG_DB writes that occurred between step-3 and now (e.g., interface flaps updating STATE_DB that bled into CONFIG_DB). Expect 3-5 minutes of downtime for a typical switch. Monitor reachability from OOB management."
+    },
+    {
+      "step_id": "step-8",
+      "step": 8,
+      "action": "Verify new image version after reboot",
+      "command": "show version",
+      "verification": {
+        "command": "show version | grep -E 'SONiC Software Version|Build Date'",
+        "look_for": "Version string matches the newly installed image",
+        "confirms_if": "Switch booted from the correct image slot"
+      },
+      "next_step_id": "step-9",
+      "rollback_step_id": "rollback-2",
+      "daemon_impact": [],
+      "notes": "If version does not match, GRUB may have fallen back to the old image due to a failed boot count check. Run 'show reboot-cause' to determine why the expected image was not loaded."
+    },
+    {
+      "step_id": "step-9",
+      "step": 9,
+      "action": "Verify all critical containers are running",
+      "command": "docker ps --format '{{.Names}} {{.Status}}'",
+      "verification": {
+        "command": "docker ps --filter status=running --format '{{.Names}}' | grep -cE 'database|swss|syncd|bgp|teamd|lldp'",
+        "look_for": "All critical containers in running state (count >= 6)",
+        "confirms_if": "Container startup completed and management plane is functional"
+      },
+      "next_step_id": "step-10",
+      "rollback_step_id": "rollback-2",
+      "daemon_impact": [
+        {"daemon": "orchagent", "impact": "Should be running and reconciling CONFIG_DB to APPL_DB"},
+        {"daemon": "syncd", "impact": "Should be running and programming ASIC via SAI"}
+      ],
+      "notes": "If containers are stuck in restarting state: 'docker logs <container> --tail 50' to diagnose. A CONFIG_DB schema migration failure is the most common cause on cross-version upgrades. Check journalctl -u sonic.target for systemd-level failures."
+    },
+    {
+      "step_id": "step-10",
+      "step": 10,
+      "action": "Verify BGP sessions, routes, and interfaces match pre-upgrade baseline",
+      "command": "show bgp summary; show ip route summary; show interfaces status",
+      "verification": {
+        "command": "show bgp summary | grep -c Established; show ip route summary | grep Total; show interfaces status | grep -c ' up '",
+        "look_for": "BGP peer count, route total, and up interface count match pre-upgrade baseline from step-2",
+        "confirms_if": "Full forwarding plane recovery confirmed; upgrade successful"
+      },
+      "next_step_id": null,
+      "rollback_step_id": "rollback-2",
+      "daemon_impact": [],
+      "notes": "Allow up to 5 minutes for BGP sessions to re-establish and routes to reconverge after boot. If BGP count is lower than baseline, check 'show bgp neighbors <peer> | grep -i state' and 'show log | grep bgpd'. If routes are missing, check 'show ip route' and orchagent logs: 'docker exec -it swss cat /var/log/swss/orchagent.log | tail -100'."
+    }
+  ],
+  "rollback": [
+    {
+      "step_id": "rollback-1",
+      "action": "Cancel upgrade before rebooting — revert next boot to current image",
+      "command": "sudo sonic-installer set-default <current-image-name>; sonic-installer list",
+      "notes": "If you have not yet rebooted, simply reset the default boot image to the currently running version. Use the image name from 'sonic-installer list'. The new image remains installed on disk and can be activated later."
+    },
+    {
+      "step_id": "rollback-2",
+      "action": "After booting new image: set old image as default and reboot back",
+      "command": "sudo sonic-installer set-default <old-image-name>; sudo config save -y; sudo reboot",
+      "notes": "If the new image fails (containers won't start, config migration broke, BGP unrecoverable), roll back by setting the old image as default and rebooting. The old image slot is preserved as long as disk space allowed dual-image layout. Verify old image is still listed: sonic-installer list."
+    },
+    {
+      "step_id": "rollback-3",
+      "action": "If sonic-installer rollback is available, use it as a shortcut",
+      "command": "sudo sonic-installer rollback; sudo config save -y; sudo reboot",
+      "notes": "Some SONiC builds include 'sonic-installer rollback' which atomically sets the previous image as default. Check availability: sonic-installer --help | grep rollback. If not available, use rollback-2 manually. After rollback boot, verify CONFIG_DB loaded correctly — schema migrations may not be reversible and config reload may be required."
+    },
+    {
+      "step_id": "rollback-4",
+      "action": "If config_db.json was migrated and is incompatible after rollback, restore from backup",
+      "command": "sudo cp /tmp/pre_upgrade_config_backup.json /etc/sonic/config_db.json; sudo config reload -y",
+      "notes": "If the rolled-back image fails to load config_db.json due to forward-only schema migration, restore the pre-upgrade backup (captured at step-3 equivalent: sudo sonic-cfggen -d --print-data > /tmp/pre_upgrade_config_backup.json). Then reload: 'sudo config reload -y'. This triggers a full config pipeline replay through CONFIG_DB -> orchagent -> syncd."
+    }
+  ]
+}
