@@ -19,5 +19,19 @@
     "category": "config-integrity",
     "keywords": ["redis-cli", "HSET", "HMSET", "direct redis", "redis write", "DB 4", "DB 0", "config_db redis", "appl_db redis", "redis -n 4", "redis -n 0"],
     "context_keywords": ["redis", "cli", "write", "direct", "bypass", "hset", "config_db", "appl_db", "database"]
+  },
+  "express-reboot-wrong-platform": {
+    "display_name": "Running express-reboot on a non-Cisco-8000 platform",
+    "severity": "MEDIUM",
+    "category": "operational-error",
+    "keywords": ["express-reboot", "platform not supported", "cisco 8000", "wrong platform", "not supported"],
+    "context_keywords": ["reboot", "express", "platform", "cisco", "broadcom", "mellanox"]
+  },
+  "stale-warmboot-files": {
+    "display_name": "Stale warmboot files from a previous failed reboot causing outdated state",
+    "severity": "HIGH",
+    "category": "operational-error",
+    "keywords": ["dump.rdb", "sai-warmboot.bin", "stale", "warmboot files", "old state", "failed reboot", "leftover"],
+    "context_keywords": ["reboot", "warm", "express", "fast", "warmboot", "checkpoint", "restore"]
   }
 }

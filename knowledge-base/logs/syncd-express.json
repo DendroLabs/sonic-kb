@@ -1,0 +1,110 @@
+{
+  "daemon": "syncd",
+  "log_file": "/var/log/syncd.log",
+  "container": "syncd",
+  "context": "express-reboot",
+  "messages": [
+    {
+      "log_id": "log:syncd:express-warm-start",
+      "pattern": "SAI_START_TYPE_EXPRESS_BOOT",
+      "meaning": "syncd detected express boot mode and is initializing SAI with express warm start (type 4). NPU will NOT be programmed until APPLY_VIEW is received.",
+      "severity": "INFO",
+      "likely_causes": [
+        "Normal express reboot boot-up sequence"
+      ],
+      "next_steps": [
+        "Monitor for APPLY_VIEW notification: docker logs syncd 2>&1 | grep APPLY_VIEW",
+        "This is expected -- no action needed unless NPU init never happens"
+      ],
+      "related_code_path": null,
+      "source_ref": "sonic-sairedis:syncd/Syncd.cpp"
+    },
+    {
+      "log_id": "log:syncd:fast-api-enable-fail",
+      "pattern": "SAI_SWITCH_ATTR_FAST_API_ENABLE.*fail|setFastAPIEnable.*fail",
+      "meaning": "syncd failed to set the FAST_API_ENABLE attribute on one or more ASICs during express reboot pre-shutdown. The express reboot will abort.",
+      "severity": "ERROR",
+      "likely_causes": [
+        "Vendor SAI does not support express boot (non-Cisco-8000 platform)",
+        "SDK internal error during the attribute set call",
+        "Multi-ASIC system where one ASIC's SAI rejected the call"
+      ],
+      "next_steps": [
+        "Check platform: show platform summary (must be Cisco 8000)",
+        "Check full syncd log: docker logs syncd 2>&1 | tail -50",
+        "If platform is correct, this may be an SDK bug -- check vendor SAI version",
+        "Fall back to warm-reboot instead"
+      ],
+      "related_code_path": null,
+      "source_ref": "sonic-sairedis:syncd/Syncd.cpp:setFastAPIEnableOnAllSwitches"
+    },
+    {
+      "log_id": "log:syncd:express-pre-shutdown",
+      "pattern": "syncd_request_shutdown.*-pxe|pre.shutdown.*express",
+      "meaning": "The express reboot script requested syncd pre-shutdown with the express flag (-pxe). syncd will set FAST_API_ENABLE on all ASICs and serialize state to sai-warmboot.bin.",
+      "severity": "INFO",
+      "likely_causes": [
+        "Normal express reboot shutdown sequence"
+      ],
+      "next_steps": [
+        "Monitor for successful completion: look for checkpoint completion messages",
+        "If this hangs, check: docker exec syncd supervisorctl status syncd"
+      ],
+      "related_code_path": null,
+      "source_ref": "sonic-sairedis:syncd/scripts/syncd_request_shutdown"
+    },
+    {
+      "log_id": "log:syncd:apply-view-received",
+      "pattern": "SAI_REDIS_NOTIFY_SYNCD_APPLY_VIEW|APPLY_VIEW",
+      "meaning": "syncd received the APPLY_VIEW notification from orchagent. This triggers NPU bulk programming in express boot mode. The NPU will now be initialized with the restored configuration.",
+      "severity": "INFO",
+      "likely_causes": [
+        "Normal express reboot boot-up -- orchagent finished reconciliation and signaled syncd"
+      ],
+      "next_steps": [
+        "Verify forwarding is working: show ip route, ping test",
+        "Check WARM_RESTART_TABLE state transitions to 'reconciled'"
+      ],
+      "related_code_path": null,
+      "source_ref": "sonic-sairedis:syncd/Syncd.cpp"
+    },
+    {
+      "log_id": "log:syncd:warmboot-bin-corrupt",
+      "pattern": "warm.*boot.*fail|SAI.*warm.*init.*fail|unable.*restore.*state",
+      "meaning": "syncd failed to initialize from sai-warmboot.bin during warm/express boot. The SAI layer could not deserialize the saved ASIC state. The switch will likely fall back to cold boot behavior.",
+      "severity": "ERROR",
+      "likely_causes": [
+        "sai-warmboot.bin is corrupt or incomplete (disk I/O error during save)",
+        "SDK version mismatch between the image that saved the file and the booting image",
+        "File was from a previous failed reboot attempt (stale)",
+        "Disk space ran out while writing the file"
+      ],
+      "next_steps": [
+        "Check if cold boot fallback occurred: cat /proc/cmdline | grep SONIC_BOOT_TYPE",
+        "Check file integrity: ls -la /host/warmboot/sai-warmboot.bin",
+        "If stale, clean up: sudo rm -f /host/warmboot/sai-warmboot.bin",
+        "Verify SDK versions match between images: show version on both images"
+      ],
+      "related_code_path": null,
+      "source_ref": "sonic-sairedis:syncd/Syncd.cpp"
+    },
+    {
+      "log_id": "log:syncd:punt-header-mismatch",
+      "pattern": "punt.*header.*mismatch|inject.*header.*invalid|packet.*format.*incompatible",
+      "meaning": "During the express boot V1-to-V2 transition window (~1-2s), punt/inject packet headers from the old software version are incompatible with the new NPU expectations. Packets may be dropped or corrupted.",
+      "severity": "WARNING",
+      "likely_causes": [
+        "Cross-version express reboot where the punt/inject header format changed between SDK versions",
+        "This is a known limitation of express reboot during major version transitions"
+      ],
+      "next_steps": [
+        "This is usually transient (1-2 seconds during transition)",
+        "If persistent, the SDK versions may be too far apart for express reboot",
+        "Consider using warm-reboot for major version transitions instead",
+        "Check: docker logs syncd 2>&1 | grep -i 'punt\\|inject' | tail -20"
+      ],
+      "related_code_path": null,
+      "source_ref": "sonic-sairedis:syncd/Syncd.cpp"
+    }
+  ]
+}

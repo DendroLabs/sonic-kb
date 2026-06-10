@@ -1,0 +1,42 @@
+{
+  "error_id": "stale-warmboot-files",
+  "display_name": "Stale warmboot files from a previous failed reboot causing boot-up to use outdated state",
+  "severity": "HIGH",
+  "category": "operational-error",
+  "sonic_version": "202511",
+  "pattern": "A previous warm/express/fast reboot failed or was interrupted. The checkpoint files (dump.rdb, sai-warmboot.bin) were saved but the reboot did not complete. On the next reboot attempt, the boot-up process finds these stale files and uses them instead of freshly checkpointed state, causing CONFIG_DB and ASIC state to be from a prior point in time.",
+  "what_goes_wrong": "The warm init path reads /host/warmboot/dump.rdb and /host/warmboot/sai-warmboot.bin from the previous failed attempt. CONFIG_DB is restored to the state at the time of the failed checkpoint -- any config changes made between the failed reboot and the current reboot are lost. The ASIC may be programmed with routes, ACLs, or FDB entries that no longer match the intended state. BGP sessions may flap as the restored config differs from what peers expect.",
+  "symptoms": [
+    "After reboot, CONFIG_DB is missing recent configuration changes",
+    "Routes or ACLs revert to an older state",
+    "BGP sessions flap due to config mismatch with peers",
+    "WARM_RESTART_TABLE in STATE_DB shows a non-DISABLED state before reboot was initiated",
+    "show reboot-cause history shows a previous failed warm/express reboot"
+  ],
+  "detection_commands": [
+    {
+      "command": "ls -la /host/warmboot/dump.rdb /host/warmboot/sai-warmboot.bin 2>/dev/null",
+      "purpose": "Check if warmboot checkpoint files exist from a previous attempt. If they exist and you have not just initiated a reboot, they are stale."
+    },
+    {
+      "command": "redis-cli -n 6 HGETALL 'WARM_RESTART_TABLE|system'",
+      "purpose": "Check if warmboot state is still set from a previous attempt. State should be empty or DISABLED between reboots."
+    },
+    {
+      "command": "show reboot-cause history",
+      "purpose": "Check for previous failed reboot attempts"
+    }
+  ],
+  "correct_procedure": "Before any warm/express/fast reboot, check for and remove stale warmboot files: sudo rm -f /host/warmboot/dump.rdb /host/warmboot/sai-warmboot.bin. Clear warmboot state: redis-cli -n 6 DEL 'WARM_RESTART_TABLE|system'. Then proceed with the reboot normally.",
+  "why_it_breaks": [
+    "The warm boot path is designed to restore state from checkpoint files. It has no way to know whether those files are from the current reboot or a previous failed one.",
+    "dump.rdb contains a full Redis snapshot. Restoring an old snapshot overwrites any CONFIG_DB changes made after that snapshot was taken.",
+    "sai-warmboot.bin contains serialized ASIC state. If this is outdated, the reconciliation phase will compute incorrect diffs, potentially removing valid entries or adding stale ones."
+  ],
+  "prevention": "Add a pre-reboot check to your runbook: always verify /host/warmboot/ is clean before initiating a reboot. The finalize-warmboot.sh script is supposed to clean these up after a successful reboot, but it may not run if the previous reboot failed early.",
+  "related_errors": ["express-reboot-wrong-platform"],
+  "ref_daemons": ["daemon:orchagent", "daemon:syncd"],
+  "ref_dbs": ["db:config_db", "db:state_db"],
+  "keywords": ["dump.rdb", "sai-warmboot.bin", "stale", "warmboot files", "old state", "failed reboot", "leftover"],
+  "context_keywords": ["reboot", "warm", "express", "fast", "warmboot", "checkpoint", "restore"]
+}

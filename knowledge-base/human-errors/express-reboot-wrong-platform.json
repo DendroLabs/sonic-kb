@@ -1,0 +1,36 @@
+{
+  "error_id": "express-reboot-wrong-platform",
+  "display_name": "Running express-reboot on a non-Cisco-8000 platform",
+  "severity": "MEDIUM",
+  "category": "operational-error",
+  "sonic_version": "202511",
+  "pattern": "Engineer runs 'express-reboot' on a Broadcom, Mellanox/NVIDIA, or Barefoot platform expecting sub-second downtime, not realizing it is only supported on Cisco 8000 hardware.",
+  "what_goes_wrong": "The express-reboot script checks the platform and rejects the command on non-Cisco-8000 hardware. The reboot does not proceed. If the engineer then tries to force it or work around the check, the ASIC/SAI layer does not support SAI_SWITCH_ATTR_FAST_API_ENABLE, and the result is an uncontrolled failure or cold boot with extended downtime.",
+  "symptoms": [
+    "express-reboot command exits immediately with 'platform not supported' error",
+    "If forced, syncd crashes during pre-shutdown with SAI_STATUS_NOT_SUPPORTED",
+    "Switch cold-boots with full data plane outage instead of sub-second downtime"
+  ],
+  "detection_commands": [
+    {
+      "command": "show platform summary",
+      "purpose": "Verify the hardware platform. Only Cisco 8000 supports express reboot."
+    },
+    {
+      "command": "show version | grep -i platform",
+      "purpose": "Check platform type in version output"
+    }
+  ],
+  "correct_procedure": "For non-Cisco-8000 platforms, use 'warm-reboot' for minimal data plane disruption (0-5s) or 'fast-reboot' for scheduled maintenance (~20-30s downtime). Check platform first: show platform summary.",
+  "why_it_breaks": [
+    "Express reboot relies on Cisco 8000 SDK features: skipping external PHY initialization and deferring NPU programming until config is restored via SAI_REDIS_NOTIFY_SYNCD_APPLY_VIEW.",
+    "Other vendors' SAI implementations do not support SAI_SWITCH_ATTR_FAST_API_ENABLE, which is required for the express boot path.",
+    "Forcing past the platform check results in SAI errors that crash syncd, causing an uncontrolled reboot."
+  ],
+  "prevention": "Always check platform before choosing reboot type. Document the supported reboot types per platform in runbooks.",
+  "related_errors": ["stale-warmboot-files"],
+  "ref_daemons": ["daemon:syncd"],
+  "ref_dbs": ["db:state_db"],
+  "keywords": ["express-reboot", "platform not supported", "cisco 8000", "wrong platform", "not supported"],
+  "context_keywords": ["reboot", "express", "platform", "cisco", "broadcom", "mellanox"]
+}

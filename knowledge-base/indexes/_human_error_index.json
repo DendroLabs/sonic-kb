@@ -1,4 +1,45 @@
 {
+  "stale-warmboot-files": {
+    "display_name": "Stale warmboot files from a previous failed reboot causing boot-up to use outdated state",
+    "severity": "HIGH",
+    "keywords": [
+      "dump.rdb",
+      "sai-warmboot.bin",
+      "stale",
+      "warmboot files",
+      "old state",
+      "failed reboot",
+      "leftover"
+    ],
+    "context_keywords": [
+      "reboot",
+      "warm",
+      "express",
+      "fast",
+      "warmboot",
+      "checkpoint",
+      "restore"
+    ]
+  },
+  "express-reboot-wrong-platform": {
+    "display_name": "Running express-reboot on a non-Cisco-8000 platform",
+    "severity": "MEDIUM",
+    "keywords": [
+      "express-reboot",
+      "platform not supported",
+      "cisco 8000",
+      "wrong platform",
+      "not supported"
+    ],
+    "context_keywords": [
+      "reboot",
+      "express",
+      "platform",
+      "cisco",
+      "broadcom",
+      "mellanox"
+    ]
+  },
   "direct-redis-write": {
     "display_name": "Direct redis-cli write to CONFIG_DB or APPL_DB bypassing mgrd validation",
     "severity": "HIGH",

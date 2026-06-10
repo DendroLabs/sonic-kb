@@ -13,9 +13,9 @@ def get_log_message(pattern: str, daemon: str | None = None) -> list[dict]:
     results = []
 
     if daemon:
-        catalog = load_log_catalog(daemon)
-        if catalog:
-            results.extend(_search_catalog(catalog, pattern_lower))
+        for catalog in load_all_log_catalogs():
+            if catalog.get("daemon", "").lower() == daemon.lower():
+                results.extend(_search_catalog(catalog, pattern_lower))
     else:
         for catalog in load_all_log_catalogs():
             results.extend(_search_catalog(catalog, pattern_lower))

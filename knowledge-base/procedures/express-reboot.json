@@ -1,0 +1,195 @@
+{
+  "procedure_id": "express-reboot",
+  "procedure_name": "Express Reboot",
+  "category": "system-operations",
+  "risk_level": "high",
+  "purpose": "Perform a sub-second data plane downtime reboot on Cisco 8000 platforms by skipping PHY init and deferring NPU programming until config is restored",
+  "def_refs": ["daemon:orchagent", "daemon:syncd", "daemon:bgpcfgd", "db:config_db", "db:state_db"],
+  "prerequisites": [
+    "Platform must be Cisco 8000 (only platform supporting express reboot)",
+    "All critical containers running: database, swss, syncd, bgp",
+    "Warm restart enabled: redis-cli -n 4 HGETALL 'WARM_RESTART_ENABLE_TABLE|system'",
+    "Sufficient disk space on /host (>1GB free for dump.rdb + sai-warmboot.bin)",
+    "No stale warmboot files from a previous failed reboot",
+    "Next boot image verified: sonic-installer list",
+    "ASIC config compatible between current and next image (MD5 match)"
+  ],
+  "warnings": [
+    "Express reboot is Cisco 8000 ONLY. Running on other platforms will be rejected.",
+    "Cross-version SDK upgrades may cause punt/inject header mismatches during the 1-2s transition window.",
+    "If the pre-shutdown checkpoint fails, the reboot aborts and the switch resumes normal operation.",
+    "Do NOT modify CONFIG_DB while a reboot is in progress.",
+    "Skipping the ASIC MD5 check (-i flag) risks incompatible ASIC state on boot-up."
+  ],
+  "steps": [
+    {
+      "step_id": "step-1",
+      "step": 1,
+      "action": "Verify platform is Cisco 8000",
+      "command": "show platform summary",
+      "verification": {
+        "command": "show platform summary | grep -i 'cisco\\|8000'",
+        "look_for": "Platform identifies as Cisco 8000 series",
+        "confirms_if": "Output contains Cisco 8000 platform identifier"
+      },
+      "next_step_id": "step-2",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "Express reboot requires hardware/SDK support only available on Cisco 8000."
+    },
+    {
+      "step_id": "step-2",
+      "step": 2,
+      "action": "Check critical container health",
+      "command": "docker ps --format '{{.Names}} {{.Status}}' | grep -E 'database|swss|syncd|bgp'",
+      "verification": {
+        "command": "docker ps --filter status=running --format '{{.Names}}' | grep -cE 'database|swss|syncd|bgp'",
+        "look_for": "Count should be 4 (all critical containers running)",
+        "confirms_if": "All four containers are in running state"
+      },
+      "next_step_id": "step-3",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "If any critical container is down, fix that first before attempting express reboot."
+    },
+    {
+      "step_id": "step-3",
+      "step": 3,
+      "action": "Check for stale warmboot state from previous failed reboot",
+      "command": "redis-cli -n 6 keys 'WARM_RESTART*'",
+      "verification": {
+        "command": "ls -la /host/warmboot/dump.rdb /host/warmboot/sai-warmboot.bin 2>/dev/null; redis-cli -n 6 HGETALL 'WARM_RESTART_TABLE|system'",
+        "look_for": "No stale files or state entries. If WARM_RESTART_TABLE shows a non-DISABLED state, previous reboot did not finalize.",
+        "confirms_if": "No stale warmboot files and state is clean"
+      },
+      "next_step_id": "step-4",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "Stale warmboot files from a failed reboot can cause boot-up to use outdated state. Remove them: sudo rm -f /host/warmboot/dump.rdb /host/warmboot/sai-warmboot.bin"
+    },
+    {
+      "step_id": "step-4",
+      "step": 4,
+      "action": "Verify disk space for warmboot files",
+      "command": "df -h /host",
+      "verification": {
+        "command": "df /host | awk 'NR==2 {print $4}'",
+        "look_for": "At least 1GB free space available",
+        "confirms_if": "Available space is sufficient for dump.rdb (~50-500MB) and sai-warmboot.bin (~10-100MB)"
+      },
+      "next_step_id": "step-5",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "dump.rdb size depends on route/FDB scale. Large deployments (100k+ routes) need more space."
+    },
+    {
+      "step_id": "step-5",
+      "step": 5,
+      "action": "Verify next boot image",
+      "command": "sonic-installer list",
+      "verification": {
+        "command": "sonic-installer list | grep 'Next'",
+        "look_for": "Next boot image is set and valid",
+        "confirms_if": "A valid SONiC image is configured as next boot"
+      },
+      "next_step_id": "step-6",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "If upgrading, ensure the next image was installed and set as default."
+    },
+    {
+      "step_id": "step-6",
+      "step": 6,
+      "action": "Backup running configuration",
+      "command": "sudo sonic-cfggen -d --print-data > /tmp/config_backup_$(date +%Y%m%d_%H%M%S).json",
+      "verification": {
+        "command": "ls -la /tmp/config_backup_*.json | tail -1",
+        "look_for": "File exists with non-zero size",
+        "confirms_if": "Backup file was created successfully"
+      },
+      "next_step_id": "step-7",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "Always backup before reboot. This captures running CONFIG_DB state."
+    },
+    {
+      "step_id": "step-7",
+      "step": 7,
+      "action": "Initiate express reboot",
+      "command": "sudo express-reboot -v",
+      "verification": {
+        "command": null,
+        "look_for": "Script proceeds through pre-checks, freeze, checkpoint, and kexec without errors",
+        "confirms_if": "No ERROR lines in verbose output; switch reboots"
+      },
+      "next_step_id": "step-8",
+      "rollback_step_id": "rollback-1",
+      "daemon_impact": [
+        {"daemon": "orchagent", "impact": "Frozen during checkpoint, reconciles on boot-up"},
+        {"daemon": "syncd", "impact": "Pre-shutdown with express flag (-pxe), warm init on boot-up"},
+        {"daemon": "bgpd", "impact": "Graceful restart triggered, sessions re-establish post-reboot"},
+        {"daemon": "teamd", "impact": "LAG keepalive packets sent during transition"}
+      ],
+      "notes": "Use -v for verbose output. The switch will kexec and come back up. Flags: -f (force), -d (skip DB check), -i (skip ASIC MD5 check)."
+    },
+    {
+      "step_id": "step-8",
+      "step": 8,
+      "action": "Verify reboot completed successfully (post-reboot)",
+      "command": "show reboot-cause",
+      "verification": {
+        "command": "show reboot-cause | head -5",
+        "look_for": "Reboot cause shows 'express-reboot'",
+        "confirms_if": "Express reboot was the recorded cause"
+      },
+      "next_step_id": "step-9",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "Run this after the switch comes back up."
+    },
+    {
+      "step_id": "step-9",
+      "step": 9,
+      "action": "Verify reconciliation completed",
+      "command": "redis-cli -n 6 HGETALL 'WARM_RESTART_TABLE|orchagent'",
+      "verification": {
+        "command": "redis-cli -n 6 HGET 'WARM_RESTART_TABLE|orchagent' 'state'; redis-cli -n 6 HGET 'WARM_RESTART_TABLE|syncd' 'state'",
+        "look_for": "Both orchagent and syncd state should be 'reconciled'",
+        "confirms_if": "Reconciliation completed for all components"
+      },
+      "next_step_id": "step-10",
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "If state is not 'reconciled' after 2-3 minutes, check orchagent and syncd logs for stalls."
+    },
+    {
+      "step_id": "step-10",
+      "step": 10,
+      "action": "Verify services and forwarding",
+      "command": "show bgp summary; show interfaces status; show ip route summary",
+      "verification": {
+        "command": "show bgp summary | grep -c Established",
+        "look_for": "BGP session count matches pre-reboot state",
+        "confirms_if": "All expected BGP sessions are re-established"
+      },
+      "next_step_id": null,
+      "rollback_step_id": null,
+      "daemon_impact": [],
+      "notes": "Compare BGP peer count, interface states, and route count against pre-reboot baseline."
+    }
+  ],
+  "rollback": [
+    {
+      "step_id": "rollback-1",
+      "action": "If express reboot aborted during pre-shutdown, the switch should still be running normally. Verify:",
+      "command": "docker ps --format '{{.Names}} {{.Status}}'; show bgp summary",
+      "notes": "Express reboot abort unfreezes orchagent and resumes normal operation. If containers are unhealthy, restart them: sudo systemctl restart swss syncd"
+    },
+    {
+      "step_id": "rollback-2",
+      "action": "If switch booted but reconciliation failed, restore config from backup",
+      "command": "sudo config load /tmp/config_backup_<timestamp>.json -y && sudo config reload -y",
+      "notes": "Replace <timestamp> with the backup file from step 6. This restores CONFIG_DB and triggers a full config reload."
+    }
+  ]
+}

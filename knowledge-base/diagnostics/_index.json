@@ -10,5 +10,9 @@
   "port-down": {
     "display_name": "Interface/port down",
     "entry_symptom": "Interface shows down or no link"
+  },
+  "express-reboot-failure": {
+    "display_name": "Express reboot failure",
+    "entry_symptom": "Express reboot failed, aborted, or switch came up in degraded state"
   }
 }

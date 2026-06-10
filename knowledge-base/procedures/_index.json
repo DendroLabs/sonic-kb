@@ -22,5 +22,11 @@
     "category": "system-operations",
     "risk_level": "varies",
     "purpose": "Restart a specific SONiC Docker container"
+  },
+  "express-reboot": {
+    "procedure_name": "Express Reboot",
+    "category": "system-operations",
+    "risk_level": "high",
+    "purpose": "Sub-second data plane downtime reboot on Cisco 8000 platforms"
   }
 }

@@ -1,0 +1,174 @@
+{
+  "tree_id": "express-reboot-failure",
+  "display_name": "Express reboot failure",
+  "entry_symptom": "Express reboot failed, aborted, or switch came up in degraded state after express reboot",
+  "related_protocol": "bgp-4",
+  "related_errors": ["stale-warmboot-files", "express-reboot-wrong-platform"],
+  "related_code_paths": [],
+  "nodes": [
+    {
+      "node_id": "n1",
+      "node_type": "branch",
+      "question": "At what phase did the failure occur?",
+      "commands": [
+        "show reboot-cause",
+        "cat /host/reboot-cause/reboot-cause.txt",
+        "journalctl -u express-reboot --no-pager | tail -50"
+      ],
+      "branches": {
+        "Reboot was rejected / never started": "n2",
+        "Failed during shutdown (before kexec)": "n5",
+        "Switch rebooted but came up degraded": "n9"
+      }
+    },
+    {
+      "node_id": "n2",
+      "node_type": "branch",
+      "question": "What error message was shown when express-reboot was rejected?",
+      "commands": ["sudo express-reboot -v 2>&1 | head -30"],
+      "branches": {
+        "Platform not supported / not Cisco 8000": "n3",
+        "Insufficient disk space": "n4a",
+        "Container not running": "n4b",
+        "DB integrity check failed": "n4c"
+      }
+    },
+    {
+      "node_id": "n3",
+      "node_type": "leaf",
+      "finding": "Express reboot is only supported on Cisco 8000 platforms",
+      "action": "Check platform: show platform summary. Express reboot requires Cisco 8000 hardware with SAI_SWITCH_ATTR_FAST_API_ENABLE support. For other platforms, use 'warm-reboot' (zero data plane loss but slower) or 'fast-reboot' (~20-30s downtime).",
+      "commands": ["show platform summary", "show version"]
+    },
+    {
+      "node_id": "n4a",
+      "node_type": "leaf",
+      "finding": "Insufficient disk space for warmboot checkpoint files",
+      "action": "Free space on /host partition. Express reboot needs ~1GB free for dump.rdb (50-500MB depending on route scale) and sai-warmboot.bin (10-100MB). Check: df -h /host. Clean old images: sonic-installer cleanup. Remove stale warmboot files: sudo rm -f /host/warmboot/dump.rdb /host/warmboot/sai-warmboot.bin",
+      "commands": ["df -h /host", "sonic-installer list", "ls -lh /host/warmboot/"]
+    },
+    {
+      "node_id": "n4b",
+      "node_type": "leaf",
+      "finding": "Critical container not running",
+      "action": "All four critical containers must be running: database, swss, syncd, bgp. Check: docker ps --format '{{.Names}} {{.Status}}'. Restart failed container: sudo systemctl restart <container>. Investigate why it went down before retrying the reboot.",
+      "commands": ["docker ps --format '{{.Names}} {{.Status}}'", "docker logs <container> | tail -30"]
+    },
+    {
+      "node_id": "n4c",
+      "node_type": "leaf",
+      "finding": "Redis database integrity check failed",
+      "action": "Run: redis-cli PING (should return PONG). Check for corrupted keys: redis-cli -n 4 DBSIZE. If DB is corrupted, consider config reload from backup: sudo config load <backup>.json -y. The -d flag skips this check but risks booting with corrupt state.",
+      "commands": ["redis-cli PING", "redis-cli -n 4 DBSIZE", "redis-cli INFO"]
+    },
+    {
+      "node_id": "n5",
+      "node_type": "branch",
+      "question": "What phase of shutdown failed?",
+      "commands": [
+        "journalctl -u express-reboot --no-pager | grep -iE 'error|fail|abort|timeout'",
+        "docker logs syncd 2>&1 | grep -iE 'fast_api|pre.shutdown|express' | tail -20"
+      ],
+      "branches": {
+        "Quiescence timeout (component did not freeze)": "n6",
+        "Syncd pre-shutdown / checkpoint failed": "n7",
+        "DB backup (dump.rdb) failed": "n8"
+      }
+    },
+    {
+      "node_id": "n6",
+      "node_type": "leaf",
+      "finding": "A component failed to reach quiescent state within the timeout",
+      "action": "The warmboot manager sends freeze notifications to all registered components. If one does not respond in time (~30-60s), the reboot aborts and an unfreeze notification is sent. Check which component timed out in the logs. Common causes: orchagent processing a large batch of updates, syncd stuck on an ASIC operation, or teamd waiting on LAG state. Retry after the batch completes, or use -f flag to force (skips orchagent validation).",
+      "commands": [
+        "docker logs swss 2>&1 | grep -iE 'freeze|quiescent|warm' | tail -20",
+        "docker logs syncd 2>&1 | grep -iE 'freeze|quiescent|warm' | tail -20"
+      ]
+    },
+    {
+      "node_id": "n7",
+      "node_type": "leaf",
+      "finding": "Syncd pre-shutdown with express flag failed",
+      "action": "The syncd_request_shutdown -pxe call sets SAI_SWITCH_ATTR_FAST_API_ENABLE on all switch ASICs. This can fail if: (1) the vendor SAI does not support express boot, (2) the SDK crashes during the call, or (3) a multi-ASIC system has one ASIC that fails. Check syncd logs for SAI_STATUS errors. If SAI returns NOT_SUPPORTED, this platform/SDK combination does not support express reboot -- use warm-reboot instead.",
+      "commands": [
+        "docker logs syncd 2>&1 | grep -iE 'fast_api|SAI_STATUS|setFastAPI|pre.shutdown' | tail -30",
+        "docker logs syncd 2>&1 | tail -50"
+      ]
+    },
+    {
+      "node_id": "n8",
+      "node_type": "leaf",
+      "finding": "Redis DB backup to dump.rdb failed",
+      "action": "The BGSAVE to /host/warmboot/dump.rdb failed. Causes: disk full, I/O error, filesystem corruption, or permission denied. Test Redis backup independently: redis-cli BGSAVE, then check: redis-cli LASTSAVE. Verify /host/warmboot/ is writable: touch /host/warmboot/test && rm /host/warmboot/test. Fix underlying I/O issue before retrying.",
+      "commands": [
+        "redis-cli BGSAVE",
+        "redis-cli LASTSAVE",
+        "ls -la /host/warmboot/",
+        "dmesg | grep -iE 'i/o error|ext4|readonly' | tail -10"
+      ]
+    },
+    {
+      "node_id": "n9",
+      "node_type": "branch",
+      "question": "What is degraded after the reboot?",
+      "commands": [
+        "show reboot-cause",
+        "redis-cli -n 6 HGETALL 'WARM_RESTART_TABLE|orchagent'",
+        "redis-cli -n 6 HGETALL 'WARM_RESTART_TABLE|syncd'",
+        "show bgp summary",
+        "show interfaces status | grep -c 'up'"
+      ],
+      "branches": {
+        "Reconciliation stuck / not completing": "n10",
+        "BGP sessions down": "n11",
+        "Routes or forwarding missing": "n12",
+        "Fell back to cold boot": "n13"
+      }
+    },
+    {
+      "node_id": "n10",
+      "node_type": "leaf",
+      "finding": "Orchagent or syncd reconciliation stalled",
+      "action": "Check WARM_RESTART_TABLE state for orchagent and syncd. If state is not 'reconciled' after 3 minutes, reconciliation is stalled. Check orchagent logs for errors during ASIC programming: docker logs swss 2>&1 | grep -iE 'reconcil|error|SAI' | tail -30. Common cause: non-idempotent SAI operations failing when orchagent replays config. If finalize-warmboot has not run, check: docker logs swss 2>&1 | grep finalize. As a last resort: sudo config reload -y to force a full config re-application.",
+      "commands": [
+        "redis-cli -n 6 HGETALL 'WARM_RESTART_TABLE|orchagent'",
+        "redis-cli -n 6 HGETALL 'WARM_RESTART_TABLE|syncd'",
+        "docker logs swss 2>&1 | grep -iE 'reconcil|error|SAI' | tail -30"
+      ]
+    },
+    {
+      "node_id": "n11",
+      "node_type": "leaf",
+      "finding": "BGP sessions did not re-establish after express reboot",
+      "action": "BGP uses graceful restart during express reboot. If sessions are down: (1) check if bgpd is running: docker exec bgp vtysh -c 'show bgp summary', (2) verify graceful restart was enabled: docker exec bgp vtysh -c 'show bgp neighbors <peer> json' | grep graceful, (3) check if the peer's graceful restart timer expired during the reboot (default is usually 120s, express reboot should complete well within that). If BGP config was lost, check if dump.rdb restored correctly: redis-cli -n 4 keys 'BGP_NEIGHBOR*'",
+      "commands": [
+        "docker exec bgp vtysh -c 'show bgp summary'",
+        "redis-cli -n 4 keys 'BGP_NEIGHBOR*'",
+        "docker logs bgp 2>&1 | grep -iE 'graceful|restart|established' | tail -20"
+      ]
+    },
+    {
+      "node_id": "n12",
+      "node_type": "leaf",
+      "finding": "Routes or forwarding entries missing after express reboot",
+      "action": "Check if NPU was programmed: the NPU only initializes after orchagent sends SAI_REDIS_NOTIFY_SYNCD_APPLY_VIEW. If this was never sent, the NPU has no forwarding entries. Check: docker logs syncd 2>&1 | grep APPLY_VIEW. Also verify ASIC_DB has entries: redis-cli -n 1 DBSIZE. If the dump.rdb was incomplete or corrupt, APPL_DB may be missing routes: redis-cli -n 0 keys 'ROUTE_TABLE*' | wc -l. Compare against pre-reboot baseline. If state is irrecoverable, do a config reload: sudo config reload -y",
+      "commands": [
+        "docker logs syncd 2>&1 | grep -i APPLY_VIEW",
+        "redis-cli -n 1 DBSIZE",
+        "redis-cli -n 0 keys 'ROUTE_TABLE*' | wc -l",
+        "show ip route summary"
+      ]
+    },
+    {
+      "node_id": "n13",
+      "node_type": "leaf",
+      "finding": "Switch fell back to cold boot instead of express boot",
+      "action": "Check boot type: cat /proc/cmdline | grep SONIC_BOOT_TYPE. If it does not show 'express', the warm init path was not taken. Causes: (1) sai-warmboot.bin was missing or corrupt -- the SAI layer falls back to cold init, (2) dump.rdb was not saved properly, (3) the kernel cmdline did not include the express flag. Check reboot-cause for the actual boot type: show reboot-cause. Data plane experienced a full outage in this case.",
+      "commands": [
+        "cat /proc/cmdline | grep SONIC_BOOT_TYPE",
+        "show reboot-cause",
+        "ls -la /host/warmboot/"
+      ]
+    }
+  ]
+}
