@@ -12,7 +12,12 @@ cd sonic-kb
 ./install.sh
 ```
 
-The install script creates a virtualenv, installs dependencies, and validates the KB. At the end it prints the `.mcp.json` snippet to wire it into Claude Code.
+The install script:
+1. Creates a virtualenv and installs dependencies
+2. Validates the KB
+3. Auto-detects Claude Code and/or OpenCode and configures the MCP server for whichever is installed
+
+If neither tool is found, it prints manual config snippets for both.
 
 ## Manual Setup
 
@@ -22,12 +27,9 @@ source .venv/bin/activate
 pip install -e '.[mcp]'
 ```
 
-## Usage
+Then configure your tool manually:
 
-### With Claude Code
-
-Add to your project's `.mcp.json` (or `~/.claude/.mcp.json` for global access):
-
+**Claude Code** -- add to `~/.claude/.mcp.json`:
 ```json
 {
   "mcpServers": {
@@ -40,20 +42,32 @@ Add to your project's `.mcp.json` (or `~/.claude/.mcp.json` for global access):
 }
 ```
 
-Then in Claude Code, the 19 tools are available automatically. Ask things like:
+**OpenCode** -- add to `~/.config/opencode/opencode.json`:
+```json
+{
+  "mcp": {
+    "sonic-kb": {
+      "type": "local",
+      "command": ["/path/to/sonic-kb/.venv/bin/python3", "/path/to/sonic-kb/run_mcp.py"]
+    }
+  }
+}
+```
+
+## Usage
+
+Once configured, the 19 tools are available automatically. Ask things like:
 
 - "Why is my BGP session stuck in ACTIVE?"
 - "What happens when I edit config_db.json directly?"
 - "Trace the config flow for a route install"
 - "What does this orchagent log message mean?"
 
-### Standalone
+To run standalone (JSON-RPC over stdio):
 
 ```bash
 python3 run_mcp.py
 ```
-
-Speaks JSON-RPC over stdio (MCP protocol).
 
 ## Tools
 
