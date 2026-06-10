@@ -83,6 +83,14 @@ python3 run_mcp.py
 1. Add/edit JSON files under `knowledge-base/`
 2. Rebuild indexes: `python3 scripts/build/05_build_indexes.py`
 3. Validate: `python3 scripts/build/20_validate_kb.py`
+4. (Recommended) Verify source references against real SONiC source:
+   `scripts/build/01_clone_repos.sh` once to clone the 202511 repos into
+   `build/repos/`, then `python3 scripts/build/21_verify_source_refs.py`
+
+`scripts/build/02_extract_db_schemas.py`, `03_extract_log_messages.py`, and
+`04_extract_source_refs.py` extract CONFIG_DB schemas, log message templates,
+and function locations from the cloned source into `build/artifacts/` for use
+when authoring new content.
 
 ## Requirements
 
