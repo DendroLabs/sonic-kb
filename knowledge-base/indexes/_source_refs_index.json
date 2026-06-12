@@ -52,7 +52,7 @@
     "source_file": "sonic-swss:cfgmgr/vlanmgr.cpp",
     "source_function": "VlanMgr::doVlanTask()",
     "actor": "vlanmgrd",
-    "action": "vlanmgrd main loop receives CONFIG_DB VLAN table notification via ConsumerStateTable. Dispatches to doVlanTask(), which calls addHostVlan() to create a Linux VLAN sub-interface ('ip link add link Bridge up name Vlan100 type vlan id 100' and 'bridge vlan add vid 100 dev Bridge self'), then publishes to APPL_DB VLAN_TABLE and sets STATE_DB VLAN_TABLE state=ok.",
+    "action": "vlanmgrd main loop receives CONFIG_DB VLAN table notification via ConsumerStateTable. Dispatches to doVlanTask(), which calls addHostVlan() to create a Linux VLAN sub-interface ('bridge vlan add vid 100 dev Bridge self && ip link add link Bridge up name Vlan100 address <device-mac> type vlan id 100', device MAC from DEVICE_METADATA), then publishes to APPL_DB VLAN_TABLE and sets STATE_DB VLAN_TABLE state=ok.",
     "code_path": "vlan-create"
   },
   "orchagent (PortsOrch)::PortsOrch::addVlan()": {
@@ -80,7 +80,7 @@
     "source_file": "sonic-swss:cfgmgr/vlanmgr.cpp",
     "source_function": "VlanMgr::doVlanMemberTask()",
     "actor": "vlanmgrd",
-    "action": "vlanmgrd receives CONFIG_DB VLAN_MEMBER table notification. doVlanMemberTask() checks that the member port is in STATE_DB (port is ready) and the VLAN state is ok. Calls addHostVlanMember() to run 'ip link set Ethernet0 master Bridge && bridge vlan add vid 100 dev Ethernet0'. Then publishes VLAN_MEMBER to APPL_DB VLAN_MEMBER_TABLE and sets STATE_DB VLAN_MEMBER_TABLE state=ok.",
+    "action": "vlanmgrd receives CONFIG_DB VLAN_MEMBER table notification. doVlanMemberTask() checks that the member port is in STATE_DB (port is ready) and the VLAN state is ok. Calls addHostVlanMember() to run 'ip link set Ethernet0 master Bridge && bridge vlan del vid 1 dev Ethernet0 && bridge vlan add vid 100 dev Ethernet0' (untagged/priority_tagged members get 'pvid untagged' appended). Then publishes VLAN_MEMBER to APPL_DB VLAN_MEMBER_TABLE and sets STATE_DB VLAN_MEMBER_TABLE state=ok.",
     "code_path": "vlan-create"
   },
   "orchagent (PortsOrch)::PortsOrch::addVlanMember()": {
