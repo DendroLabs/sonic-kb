@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "sonic-kb verification council log record",
+  "description": "One JSONL record per council finding (review/council-log.jsonl). All tiers log to the same file so trend review works across tiers.",
+  "type": "object",
+  "required": ["ts", "run_id", "tier", "content_file", "claim_id", "agent", "method", "verdict", "escalation_outcome"],
+  "properties": {
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the record was appended (stamped by the caller; workflow scripts have no clock)"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Workflow run id (wf_...) or 'tier0-interactive' for inline single-agent checks"
+    },
+    "tier": {
+      "enum": [0, 1, 2],
+      "description": "0 = interactive question (one routed agent), 1 = content entering the KB, 2 = deliberate audit / dispute"
+    },
+    "content_file": {
+      "type": "string",
+      "description": "Repo-relative path of the content under review (e.g. knowledge-base/code-paths/vlan-create.json)"
+    },
+    "claim_id": {
+      "type": "string",
+      "description": "Decomposer claim slug, or 'whole:completeness|consistency|entailment', or 'fault-finder:extra'"
+    },
+    "claim": {
+      "type": ["string", "null"],
+      "description": "The candidate assertion verified (null for whole-checks and extra concerns)"
+    },
+    "claim_type": {
+      "enum": ["config-syntax", "source-ref", "protocol-behavior", "internal-logic", "whole"],
+      "description": "Claim type; routing key to the domain agent"
+    },
+    "agent": {
+      "enum": ["config", "rfc", "architecture", "logic", "fault-finder"],
+      "description": "Which council member produced the verdict. Members differ by evidence source: config=db_schemas.json, architecture=build/repos clones, rfc=protocol specs, logic=internal reasoning only"
+    },
+    "method": {
+      "enum": ["blind-rederive", "whole-check", "fault-find", "re-exam"],
+      "description": "How the verdict was reached"
+    },
+    "verdict": {
+      "enum": ["match", "partial", "mismatch", "underivable", "pass", "fail", "concern"],
+      "description": "match/partial/mismatch/underivable = blind-rederive diff; pass/fail = whole-check; concern = fault-finder extra"
+    },
+    "detail": {
+      "type": "string",
+      "description": "Human-readable discrepancy or check detail"
+    },
+    "evidence": {
+      "type": ["string", "null"],
+      "description": "Grounding the deriving agent used (file:line, RFC section, schema table.field)"
+    },
+    "score": {
+      "type": ["object", "null"],
+      "description": "Fault-finder scoring. Severity above 'minor' requires evidence (file:line / RFC section / schema field).",
+      "required": ["severity", "confidence"],
+      "properties": {
+        "severity": { "enum": ["minor", "major", "critical"] },
+        "confidence": { "enum": ["low", "medium", "high"] },
+        "evidence": { "type": ["string", "null"] }
+      }
+    },
+    "blind_breach": {
+      "type": "boolean",
+      "description": "True if the derive agent consulted the candidate content despite the blind protocol (after one retry); its derivation was discarded and the verdict forced to 'underivable'"
+    },
+    "escalation_outcome": {
+      "enum": ["none", "confirmed", "disputed"],
+      "description": "Tier 2 only. confirmed = independent re-exam + adjudication upheld the fault; disputed = standing disagreement after one capped round (valid terminal state, surfaced to user)"
+    }
+  }
+}

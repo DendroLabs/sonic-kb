@@ -99,6 +99,23 @@ the artifact it silently degrades to the annotated index.
 and function locations from the cloned source into `build/artifacts/` for use
 when authoring new content.
 
+## Verification Council
+
+Mechanical checks (steps 2-5 above) catch structural and path-shaped errors;
+semantic errors (wrong behavior claims, invented fields, wrong ordering) are
+caught by the verification council -- a multi-agent review that re-derives
+each claim *blind* (reviewers never see the candidate content, only derivation
+goals) from independent evidence sources: the source clones, the extracted
+CONFIG_DB schemas, protocol specs, and pure logic. A single fault-finder scores
+findings with evidence-gated severity. New KB content passes the council before
+commit; every finding is logged to `review/council-log.jsonl` (schema and
+details in `review/README.md`, trends via
+`python3 scripts/council/aggregate_log.py`).
+
+The council runs as a Claude Code workflow
+(`scripts/council/sonic-council.workflow.js`) and is not required to *use*
+the KB -- only to contribute content.
+
 ## Requirements
 
 - Python 3.11+
