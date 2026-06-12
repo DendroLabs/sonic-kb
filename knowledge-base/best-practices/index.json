@@ -79,6 +79,126 @@
       "category": "operations",
       "source": "SONiC warm restart HLD",
       "tags": ["warm-restart", "hitless", "upgrade", "operations"]
+    },
+    {
+      "topic": "container-restart-order",
+      "title": "Always restart SONiC containers in dependency order, not individually",
+      "content": "Restart SONiC containers using 'sudo systemctl' in the correct dependency order: database first, then syncd, then swss, then bgp/teamd/lldp/pmon, waiting for each to become healthy before starting the next. For a full system reload, prefer 'sudo config reload' or 'sudo reboot' which handle ordering internally. Restarting the database container while dependents are running destroys all volatile Redis state (APPL_DB, ASIC_DB, STATE_DB) and swsscommon daemons do not transparently reconnect, leaving the system in a stale or inconsistent state that persists even after containers report healthy. Verify recovery with 'redis-cli -n 1 KEYS ASIC_STATE:SAI_OBJECT_TYPE_PORT:*' and 'show interface status'.",
+      "category": "operations",
+      "source": "human-errors/wrong-reload-order.json",
+      "tags": ["container-restart", "dependency-order", "redis", "swss", "syncd", "database"]
+    },
+    {
+      "topic": "frr-daemon-restart",
+      "title": "Restart FRR by restarting the bgp container, never by killing individual daemons",
+      "content": "To restart FRR on SONiC, always use 'sudo systemctl restart bgp' at the host level so bgpcfgd runs its full initialization, re-reads CONFIG_DB, renders fresh FRR config templates, and calls 'vtysh -f' to load the authoritative config. Never kill individual FRR daemons via 'pkill bgpd', 'kill zebra', or 'docker exec bgp supervisorctl restart bgpd'. bgpcfgd only performs a full CONFIG_DB-to-FRR config render during container startup; it does not detect or re-apply config on individual daemon restarts, so bgpd re-reads its potentially stale on-disk config file (/etc/frr/bgpd.conf in the default separated mode, or /etc/frr/frr.conf in integrated mode) and neighbors, timers, or policies from CONFIG_DB are absent until the next container restart. Confirm recovery with 'docker exec bgp vtysh -c show bgp summary'.",
+      "category": "routing",
+      "source": "human-errors/wrong-frr-restart.json",
+      "tags": ["frr", "bgp", "bgpcfgd", "daemon-restart", "fpmsyncd", "bgp-container"]
+    },
+    {
+      "topic": "warmboot-cleanup",
+      "title": "Remove stale warmboot checkpoint files before initiating any warm or fast reboot",
+      "content": "Before any warm, express, or fast reboot, verify and remove leftover checkpoint files: 'sudo rm -f /host/warmboot/dump.rdb /host/warmboot/sai-warmboot.bin' and clear warmboot state with 'redis-cli -n 6 DEL WARM_RESTART_TABLE|system'. Use 'ls -la /host/warmboot/' to check for stale files and 'show reboot-cause history' to identify previous failed attempts. If a prior reboot failed before finalize-warmboot.sh ran, the warm init path will restore CONFIG_DB and ASIC state from the old checkpoint, silently discarding any configuration changes made after that snapshot and potentially programming incorrect routes, ACLs, or FDB entries.",
+      "category": "operations",
+      "source": "human-errors/stale-warmboot-files.json",
+      "tags": ["warmboot", "fast-reboot", "checkpoint-files", "dump-rdb", "sai-warmboot", "reboot"]
+    },
+    {
+      "topic": "interface-management",
+      "title": "Use the SONiC config CLI for all interface and address changes, never iproute2 directly",
+      "content": "Configure interfaces, IP addresses, and static routes exclusively through the SONiC config CLI ('config interface startup/shutdown', 'config interface ip add/remove', 'config route add') and persist with 'config save'. Use 'ip link show' and 'ip addr show' for read-only diagnostics only. Direct iproute2 writes bypass CONFIG_DB, which is the single source of truth: portmgrd and intfmgrd will silently revert manual kernel changes within seconds by re-applying CONFIG_DB state, routes added via 'ip route add' are never programmed into the ASIC, and all manual changes are wiped on the next 'config reload' or container restart. Detect divergence by diffing 'ip addr show' against 'show ip interfaces'.",
+      "category": "configuration",
+      "source": "human-errors/manual-ip-link.json",
+      "tags": ["interface-config", "ip-link", "iproute2", "portmgrd", "intfmgrd", "config-db"]
+    },
+    {
+      "topic": "image-integrity",
+      "title": "Never install packages with apt, dpkg --force, or pip directly on the SONiC host",
+      "content": "Add tools or libraries to SONiC by building a custom image via sonic-buildimage; never use 'apt-get install', 'dpkg -i', 'dpkg --force-all', or 'pip install' on the host or inside running containers. Packages installed this way go into the OverlayFS upper layer, which is discarded silently on the next 'sonic-installer' image upgrade. Worse, dpkg --force flags can replace shared libraries (libswsscommon, libpython3) that SONiC daemons link against, causing immediate crashes, while pip installs into /usr/lib/python3/dist-packages can break bgpcfgd and fpmsyncd with ImportError on the next restart. Check image integrity with 'dpkg --audit' and 'find /usr/lib/python3 -newer /etc/sonic/sonic_version.yml'.",
+      "category": "operations",
+      "source": "human-errors/dpkg-force-install.json",
+      "tags": ["image-integrity", "dpkg", "apt", "overlayfs", "sonic-installer", "immutable-image"]
+    },
+    {
+      "topic": "reboot-type-selection",
+      "title": "Verify platform support before choosing a reboot type",
+      "content": "Always run 'show platform summary' before selecting a reboot type. Express-reboot is supported only on Cisco 8000 hardware, which provides the SDK features required for sub-second data plane downtime. On Broadcom, NVIDIA/Mellanox, or Barefoot platforms, use 'warm-reboot' for minimal disruption (0-5s) or 'fast-reboot' for scheduled maintenance (~20-30s). Attempting express-reboot on an unsupported platform either fails immediately with a platform-not-supported error or, if forced, crashes syncd with SAI_STATUS_NOT_SUPPORTED and causes an uncontrolled cold boot with extended downtime.",
+      "category": "operations",
+      "source": "human-errors/express-reboot-wrong-platform.json",
+      "tags": ["reboot", "express-reboot", "warm-reboot", "fast-reboot", "platform", "cisco-8000"]
+    },
+    {
+      "topic": "vxlan-ordering",
+      "title": "Create the VLAN before adding a VXLAN tunnel map entry",
+      "content": "Always run 'config vlan add <id>' and confirm the VLAN exists in STATE_DB before issuing 'config vxlan map add'. vxlanmgrd's doVxlanTunnelMapCreateTask() creates a Linux VXLAN netdevice keyed to the VLAN; if the VLAN is absent, netdevice creation fails and no VXLAN_TUNNEL_MAP_TABLE entry is written to APPL_DB, silently blocking all subsequent SAI tunnel programming. Verify readiness with: show vlan brief; redis-cli -n 6 HGETALL 'VLAN_TABLE|Vlan<id>'.",
+      "category": "configuration",
+      "source": "code-paths/vxlan-vtep-create.json",
+      "tags": ["vxlan", "vlan", "vtep", "ordering", "vxlanmgrd", "tunnel-map"]
+    },
+    {
+      "topic": "acl-resource-check",
+      "title": "Check TCAM headroom with CRM before deploying ACL rules",
+      "content": "Run 'crm show resources acl-entry' and 'crm show resources acl-counter' before loading ACL rules via acl-loader. When the TCAM is full, sai_acl_api->create_acl_entry() returns SAI_STATUS_INSUFFICIENT_RESOURCES and syncd logs SAI_STATUS_TABLE_FULL; rules stop programming silently after the limit is hit, leaving a partial and potentially incorrect policy in hardware. Reduce rule count, split tables across pipeline stages, or free unused ACL entries before proceeding.",
+      "category": "configuration",
+      "source": "code-paths/acl-program.json",
+      "tags": ["acl", "tcam", "crm", "resource-exhaustion", "orchagent", "syncd"]
+    },
+    {
+      "topic": "lag-member-validation",
+      "title": "Match speed and MTU on all member ports before adding them to a LAG",
+      "content": "Before running 'config portchannel member add', confirm that the candidate port's speed and MTU equal those already set on the PortChannel; add_portchannel_member() enforces this check and rejects mismatched ports at the CLI. A mismatched or operationally down port will cause teammgrd to stall in the isPortStateOk/isLagStateOk wait loop, leaving LAG_MEMBER_TABLE absent from APPL_DB and LACP negotiation never starting. Verify: show interfaces status; docker exec teamd teamdctl PortChannel01 state view.",
+      "category": "configuration",
+      "source": "code-paths/lag-create.json",
+      "tags": ["lag", "portchannel", "lacp", "mtu", "speed", "teammgrd"]
+    },
+    {
+      "topic": "swss-warm-restart",
+      "title": "Enable warm restart for swss before any planned container restart",
+      "content": "Run 'config warm_restart enable swss' and verify with 'show warm_restart config' before restarting the swss container on a production switch. Without warm restart, orchagent sends a SAI switch finalize on exit that flushes all routes, neighbors, FDB entries, ACL entries, and tunnel objects from ASIC hardware; full cold replay of APPL_DB can take 60 seconds to over 3 minutes, causing total traffic loss. Most CONFIG_DB changes (IP, BGP, VLANs, ACLs) are applied live by the relevant *mgrd daemon and do not require a container restart at all.",
+      "category": "operations",
+      "source": "human-errors/restart-swss-during-traffic.json",
+      "tags": ["swss", "warm-restart", "orchagent", "traffic-loss", "sai-flush", "operations"]
+    },
+    {
+      "topic": "crm-thresholds",
+      "title": "Configure CRM high/low thresholds for all hardware resource types",
+      "content": "Set explicit high and low thresholds in the CRM CONFIG_DB table for routes, neighbors, nexthop groups, ACL entries, ACL tables, and FDB entries. Without configured thresholds, orchagent receives no early warning before SAI_STATUS_TABLE_FULL causes silent route or ACL programming failures. Verify current usage and thresholds with 'crm show resources all' and 'crm show thresholds'. Set threshold type to 'percentage' and configure high threshold at 85% and low threshold at 70% to allow time for remediation.",
+      "category": "monitoring",
+      "source": "build/artifacts/db_schemas.json (CRM table)",
+      "tags": ["crm", "hardware-resources", "thresholds", "acl", "route-table", "capacity-planning"]
+    },
+    {
+      "topic": "device-metadata",
+      "title": "Enable suppress-fib-pending in DEVICE_METADATA before deploying BGP",
+      "content": "Set 'localhost.suppress-fib-pending' to 'enabled' in DEVICE_METADATA before BGP sessions carry production traffic. When disabled (the default), BGP advertises routes to peers immediately after the FRR RIB selects them, before orchagent has programmed the forwarding entry into the ASIC. This creates a black-hole window where the local device receives traffic it cannot yet forward. Verify the setting with 'redis-cli -n 4 HGET DEVICE_METADATA|localhost suppress-fib-pending' and apply via 'config suppress-fib-pending enabled'.",
+      "category": "configuration",
+      "source": "build/artifacts/db_schemas.json (DEVICE_METADATA table)",
+      "tags": ["bgp", "fib", "device-metadata", "black-hole", "route-programming", "suppress-fib-pending"]
+    },
+    {
+      "topic": "mclag-prerequisites",
+      "title": "Validate all MCLAG_DOMAIN fields and PortChannel references before enabling MCLAG",
+      "content": "Before enabling MCLAG, confirm that 'source_ip' and 'peer_ip' are populated in the MCLAG_DOMAIN CONFIG_DB entry and that 'peer_link' is configured (optional in the YANG schema but required for a functional MCLAG domain). The 'source_ip' must match the IP address configured on the local loopback used for MCLAG keepalives; a mismatch causes the ICCP session to fail with keepalive timeouts even when IP connectivity exists. Every interface in MCLAG_INTERFACE must reference an existing PortChannel by name, because the YANG leafref enforces this constraint and misconfiguration will be rejected by the config validation layer. Verify the full domain config with 'show mclag brief' and interface bindings with 'show mclag interface'.",
+      "category": "configuration",
+      "source": "build/artifacts/db_schemas.json (MCLAG_DOMAIN table), protocols/mclag.json",
+      "tags": ["mclag", "portchannel", "iccp", "keepalive", "multi-chassis", "lag"]
+    },
+    {
+      "topic": "snmp-security",
+      "title": "Remove default SNMP community strings and restrict all communities to RO type",
+      "content": "Delete any default community strings such as 'public' or 'private' from SNMP_COMMUNITY and replace them with site-specific strings set to type 'RO'. The SNMP_COMMUNITY 'TYPE' field accepts 'RO' or 'RW'; an 'RW' community string permits SNMP SET operations that write directly to CONFIG_DB, bypassing all access controls and audit trails. Verify current communities with 'show snmp community' and remove unwanted entries with 'config snmp community del <name>'. Prefer SNMPv3 with authentication and encryption over community-string-based SNMPv2c for any management access.",
+      "category": "security",
+      "source": "build/artifacts/db_schemas.json (SNMP_COMMUNITY table)",
+      "tags": ["snmp", "security", "community-string", "config-db", "access-control", "snmpv3"]
+    },
+    {
+      "topic": "route-pipeline-debug",
+      "title": "Use the five-stage pipeline to isolate where a route stops being programmed",
+      "content": "When a route is visible in 'show ip route' but traffic is not forwarded, walk the pipeline in order: FRR RIB ('docker exec bgp vtysh -c show ip route <prefix>'), kernel FIB ('ip route show <prefix>'), APPL_DB ROUTE_TABLE ('redis-cli -n 0 HGETALL ROUTE_TABLE:<prefix>'), ASIC_DB SAI route entry ('redis-cli -n 1 keys ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY* | grep <prefix>'), and finally next-hop ARP resolution ('show arp | grep <gateway>'). Compare the count of entries at each stage to find the exact handoff where the route disappears, then consult the orchagent and syncd logs at that boundary for SAI errors or resource exhaustion messages.",
+      "category": "debugging",
+      "source": "diagnostics/route-missing-hardware.json",
+      "tags": ["routing", "hardware-forwarding", "asic-db", "orchagent", "fpmsyncd", "pipeline-debug"]
     }
   ]
 }
