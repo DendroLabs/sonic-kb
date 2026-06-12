@@ -236,6 +236,17 @@ def load_source_refs_index() -> dict[str, dict]:
     return _read_json(path)
 
 
+VEC_DIR = IDX_DIR
+
+
+@lru_cache(maxsize=1)
+def load_vector_index() -> dict | None:
+    path = VEC_DIR / "_vector_index.json"
+    if not path.exists():
+        return None
+    return _read_json(path)
+
+
 ARTIFACT_DIR = BASE_DIR / "build" / "artifacts"
 
 
@@ -283,5 +294,6 @@ def clear_caches() -> None:
     load_human_error_search_index.cache_clear()
     load_source_refs_index.cache_clear()
     load_source_functions_artifact.cache_clear()
+    load_vector_index.cache_clear()
     load_grounding_rules.cache_clear()
     _PROTO_PATHS.clear()

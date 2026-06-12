@@ -2,7 +2,7 @@
 
 Pre-compiled troubleshooting knowledge base for SONiC 202511, served as an MCP server for Claude Code.
 
-19 tools covering protocols, subsystems, config flows, diagnostics, log decoding, human-error detection, and operational procedures.
+20 tools covering protocols, subsystems, config flows, diagnostics, log decoding, human-error detection, operational procedures, and semantic search.
 
 ## Quick Start
 
@@ -56,7 +56,7 @@ Then configure your tool manually:
 
 ## Usage
 
-Once configured, the 19 tools are available automatically. Ask things like:
+Once configured, the 20 tools are available automatically. Ask things like:
 
 - "Why is my BGP session stuck in ACTIVE?"
 - "What happens when I edit config_db.json directly?"
@@ -77,15 +77,18 @@ python3 run_mcp.py
 | Subsystems | get_config_db_table, get_daemon_info, trace_config_flow, list_containers |
 | Diagnostics | get_log_message, detect_human_error, get_diagnostic_tree |
 | Operations | get_procedure, get_best_practices, get_grounding_rules, search_source_ref |
+| Search | search_kb (semantic similarity search across all content types) |
 
 ## Extending the KB
 
 1. Add/edit JSON files under `knowledge-base/`
 2. Rebuild indexes: `python3 scripts/build/05_build_indexes.py`
-3. Validate: `python3 scripts/build/20_validate_kb.py`
-4. Run the integration tests: `python3 -m pytest tests/ -q` (38 tests
-   covering all 19 tools; no clones or artifacts required)
-5. (Recommended) Verify source references against real SONiC source:
+3. Rebuild vector index: `python3 scripts/build/06_build_vector_index.py`
+   (requires `pip install -e '.[vector]'`)
+4. Validate: `python3 scripts/build/20_validate_kb.py`
+5. Run the integration tests: `python3 -m pytest tests/ -q` (43 tests
+   covering all 20 tools; no clones or artifacts required)
+6. (Recommended) Verify source references against real SONiC source:
    `scripts/build/01_clone_repos.sh` once to clone the 202511 repos into
    `build/repos/`, then `python3 scripts/build/21_verify_source_refs.py`
 

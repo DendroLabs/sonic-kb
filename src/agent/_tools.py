@@ -306,6 +306,34 @@ TOOL_DEFINITIONS: list[ToolDefinition] = [
             },
         },
     ),
+    # --- Semantic search ---
+    ToolDefinition(
+        name="search_kb",
+        description=(
+            "Semantic search across the entire knowledge base using natural language. "
+            "Describe a problem, symptom, or topic and get ranked results from all content "
+            "types (protocols, diagnostics, procedures, human errors, code paths, etc.). "
+            "Use this as a starting point when you don't know which specific tool to call."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural language search query (e.g., 'BGP session keeps flapping after config change')",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Number of results to return (default: 5, max: 20)",
+                },
+                "content_type": {
+                    "type": "string",
+                    "description": "Optional filter: protocol, subsystem, code-path, human-error, diagnostic, procedure, best-practice, log, definition",
+                },
+            },
+            "required": ["query"],
+        },
+    ),
     # --- Anti-hallucination ---
     ToolDefinition(
         name="get_grounding_rules",
@@ -360,6 +388,7 @@ def execute_tool(name: str, arguments: dict, tool_call_id: str = "") -> ToolResu
     try:
         from ..retrieval.best_practices import get_best_practices
         from ..retrieval.code_paths import get_code_path, list_code_paths, trace_config_flow
+        from ..retrieval.semantic_search import search_kb as _search_kb
         from ..retrieval.diagnostics import get_diagnostic_tree, list_diagnostic_trees
         from ..retrieval.human_errors import detect_human_error, get_human_error
         from ..retrieval.logs import get_log_message
@@ -431,6 +460,11 @@ def execute_tool(name: str, arguments: dict, tool_call_id: str = "") -> ToolResu
             "search_source_ref": lambda: _dispatch_source_ref_search(
                 arguments, load_source_refs_index, load_source_functions_artifact
             ),
+            "search_kb": lambda: _search_kb(
+                arguments["query"],
+                top_k=min(arguments.get("top_k", 5), 20),
+                content_type=arguments.get("content_type"),
+            ),
         }
 
         fn = dispatch.get(name)
@@ -458,6 +492,7 @@ def execute_tool(name: str, arguments: dict, tool_call_id: str = "") -> ToolResu
             "get_diagnostic_tree": ["symptom"],
             "get_procedure": ["procedure_id"],
             "search_source_ref": ["query"],
+            "search_kb": ["query"],
         }
         if name in _required:
             missing = [k for k in _required[name] if k not in arguments]

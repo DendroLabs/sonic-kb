@@ -11,7 +11,7 @@ import json
 import pytest
 
 from src.agent._tools import TOOL_DEFINITIONS, _serialize, execute_tool
-from src.retrieval._loader import load_source_functions_artifact
+from src.retrieval._loader import load_source_functions_artifact, load_vector_index
 
 
 def call(name: str, arguments: dict | None = None) -> dict:
@@ -45,6 +45,7 @@ HAPPY_PATH_CALLS = [
     ("get_best_practices", {}),
     ("get_grounding_rules", {}),
     ("search_source_ref", {"query": "doTask"}),
+    ("search_kb", {"query": "BGP session not establishing"}),
 ]
 
 
@@ -196,3 +197,42 @@ def test_search_source_ref_no_match_is_empty():
     data = call("search_source_ref", {"query": "zzz_no_such_symbol_zzz"})
     assert data["count"] == 0
     assert data["results"] == []
+
+
+# --- Semantic search (search_kb) ---
+
+_has_vector_index = load_vector_index() is not None
+_skip_no_vector = pytest.mark.skipif(not _has_vector_index, reason="vector index not built")
+
+st = pytest.importorskip("sentence_transformers", reason="sentence-transformers not installed")
+
+
+@_skip_no_vector
+def test_search_kb_returns_ranked_results():
+    data = call("search_kb", {"query": "BGP neighbor keeps going down"})
+    results = data["results"]
+    assert len(results) >= 1
+    assert all("score" in r and "id" in r and "type" in r for r in results)
+    scores = [r["score"] for r in results]
+    assert scores == sorted(scores, reverse=True), "results must be ranked by score"
+
+
+@_skip_no_vector
+def test_search_kb_content_type_filter():
+    data = call("search_kb", {"query": "configuration change", "content_type": "human-error"})
+    results = data["results"]
+    assert all(r["type"] == "human-error" for r in results)
+
+
+@_skip_no_vector
+def test_search_kb_top_k():
+    data = call("search_kb", {"query": "VLAN", "top_k": 3})
+    assert len(data["results"]) <= 3
+
+
+@_skip_no_vector
+def test_search_kb_bgp_query_finds_protocol():
+    data = call("search_kb", {"query": "BGP routing protocol session establishment"})
+    types = {r["type"] for r in data["results"]}
+    ids = {r["id"] for r in data["results"]}
+    assert "protocol" in types or any("bgp" in i for i in ids)
