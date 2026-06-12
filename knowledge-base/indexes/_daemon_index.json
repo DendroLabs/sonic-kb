@@ -461,6 +461,20 @@
     ],
     "purpose": "STP protocol daemon. Implements the STP/RSTP/PVST+ state machines: sends and receives BPDUs via raw sockets, runs port role selection and topology change handling. Receives configuration from stpmgrd and writes port forwarding state (Forwarding/Blocking/Disabled) to APPL_DB:STP_PORT_TABLE for orchagent to program ASIC port STP state."
   },
+  "fdbsyncd": {
+    "def_id": "daemon:fdbsyncd",
+    "process_name": "fdbsyncd",
+    "container": "swss",
+    "subscribes_to": [
+      "db:state_db",
+      "db:config_db",
+      "kernel:netlink (RTNLGRP_NEIGH, RTNLGRP_LINK)"
+    ],
+    "writes_to": [
+      "db:appl_db"
+    ],
+    "purpose": "FDB synchronization daemon for VXLAN-EVPN. Subscribes to STATE_DB FDB_TABLE (via SubscriberStateTable in fdbsync.cpp) and, when EVPN NVO is configured (CFG_VXLAN_EVPN_NVO_TABLE_NAME), programs learned MACs into the kernel bridge FDB via 'bridge fdb replace' netlink. Also handles VXLAN remote FDB entries (APPL_DB VXLAN_FDB_TABLE) and remote VNI table. Listens on netlink for RTM_NEWNEIGH/RTM_DELNEIGH/RTM_NEWLINK to sync kernel-learned VXLAN FDB back to SONiC tables. Supports Warm Restart via AppRestartAssist."
+  },
   "gbsyncd": {
     "def_id": "daemon:gbsyncd",
     "process_name": "gbsyncd",

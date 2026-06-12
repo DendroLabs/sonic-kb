@@ -339,15 +339,20 @@ TOOL_DEFINITIONS: list[ToolDefinition] = [
 
 
 def _serialize(result) -> str:
-    """Serialize a retrieval result to JSON string."""
+    """Serialize a retrieval result to JSON string with uniform kb_coverage."""
     if result is None:
         return json.dumps({"found": False, "kb_coverage": "not_indexed",
                           "coverage_note": "No matching data in the SONiC KB for this query."})
-    if isinstance(result, (dict, list)):
-        return json.dumps(result, indent=2, default=str)
+    if isinstance(result, dict):
+        out = {**result, "kb_coverage": result.get("kb_coverage", "indexed")}
+        return json.dumps(out, indent=2, default=str)
+    if isinstance(result, list):
+        return json.dumps({"results": result, "count": len(result),
+                          "kb_coverage": "indexed"}, indent=2, default=str)
     if hasattr(result, "__dataclass_fields__"):
-        return json.dumps(asdict(result), indent=2, default=str)
-    return json.dumps({"result": str(result)})
+        out = {**asdict(result), "kb_coverage": "indexed"}
+        return json.dumps(out, indent=2, default=str)
+    return json.dumps({"result": str(result), "kb_coverage": "indexed"})
 
 
 def execute_tool(name: str, arguments: dict, tool_call_id: str = "") -> ToolResult:
@@ -370,7 +375,7 @@ def execute_tool(name: str, arguments: dict, tool_call_id: str = "") -> ToolResu
             search_protocols_by_tag,
         )
         from ..retrieval.subsystems import get_daemon_info, get_subsystem_info, list_containers
-        from ..retrieval._loader import load_db_table_index, load_grounding_rules, load_source_refs_index
+        from ..retrieval._loader import load_db_table_index, load_grounding_rules, load_source_refs_index, load_source_functions_artifact
 
         dispatch: dict = {
             "get_protocol": lambda: get_protocol(arguments["protocol_id"]),
@@ -424,7 +429,7 @@ def execute_tool(name: str, arguments: dict, tool_call_id: str = "") -> ToolResu
             ),
             "get_grounding_rules": lambda: load_grounding_rules(),
             "search_source_ref": lambda: _dispatch_source_ref_search(
-                arguments, load_source_refs_index
+                arguments, load_source_refs_index, load_source_functions_artifact
             ),
         }
 
@@ -489,12 +494,34 @@ def _dispatch_config_db_table(arguments: dict, load_index) -> dict | None:
     return None
 
 
-def _dispatch_source_ref_search(arguments: dict, load_index) -> list[dict]:
-    """Search source references by keyword."""
+def _dispatch_source_ref_search(arguments: dict, load_index, load_artifact) -> list[dict]:
+    """Search source references by keyword.
+
+    Tier 1: annotated index from code-path steps (56 entries with actor/action context).
+    Tier 2: full source_functions.json artifact (18965 raw entries, local only).
+    """
     query = arguments["query"].lower()
     index = load_index()
     results = []
+    seen_functions: set[str] = set()
     for symbol, ref in index.items():
         if query in symbol.lower():
-            results.append({"symbol": symbol, **ref})
+            results.append({"symbol": symbol, "source": "annotated", **ref})
+            seen_functions.add(ref.get("source_function", ""))
+
+    artifact = load_artifact()
+    if artifact is not None:
+        for entry in artifact:
+            func = entry.get("function", "")
+            file = entry.get("file", "")
+            searchable = f"{func} {file} {entry.get('repo', '')}".lower()
+            if query in searchable and func not in seen_functions:
+                results.append({
+                    "symbol": func,
+                    "source": "artifact",
+                    "source_file": f"{entry['repo']}:{file}",
+                    "source_function": func,
+                    "line": entry.get("line", 0),
+                })
+                seen_functions.add(func)
     return results

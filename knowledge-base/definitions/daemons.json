@@ -617,6 +617,20 @@
     "related_daemons": ["daemon:stpmgrd", "daemon:orchagent"]
   },
   {
+    "def_id": "daemon:fdbsyncd",
+    "process_name": "fdbsyncd",
+    "container": "swss",
+    "repo": "sonic-swss",
+    "source_path": "fdbsyncd/fdbsyncd.cpp",
+    "purpose": "FDB synchronization daemon for VXLAN-EVPN. Subscribes to STATE_DB FDB_TABLE (via SubscriberStateTable in fdbsync.cpp) and, when EVPN NVO is configured (CFG_VXLAN_EVPN_NVO_TABLE_NAME), programs learned MACs into the kernel bridge FDB via 'bridge fdb replace' netlink. Also handles VXLAN remote FDB entries (APPL_DB VXLAN_FDB_TABLE) and remote VNI table. Listens on netlink for RTM_NEWNEIGH/RTM_DELNEIGH/RTM_NEWLINK to sync kernel-learned VXLAN FDB back to SONiC tables. Supports Warm Restart via AppRestartAssist.",
+    "subscribes_to": ["db:state_db", "db:config_db", "kernel:netlink (RTNLGRP_NEIGH, RTNLGRP_LINK)"],
+    "writes_to": ["db:appl_db"],
+    "restart_command": "sudo systemctl restart swss",
+    "restart_warning": "fdbsyncd runs inside the swss container. Restarting swss restarts orchagent and all *syncd/*mgrd daemons. On EVPN fabrics, restarting causes temporary loss of VXLAN remote MAC/VNI entries until fdbsyncd replays from STATE_DB and netlink.",
+    "restart_safe": false,
+    "related_daemons": ["daemon:orchagent", "daemon:vxlanmgrd"]
+  },
+  {
     "def_id": "daemon:gbsyncd",
     "process_name": "gbsyncd",
     "container": "syncd",

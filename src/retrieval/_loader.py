@@ -236,6 +236,18 @@ def load_source_refs_index() -> dict[str, dict]:
     return _read_json(path)
 
 
+ARTIFACT_DIR = BASE_DIR / "build" / "artifacts"
+
+
+@lru_cache(maxsize=1)
+def load_source_functions_artifact() -> list[dict] | None:
+    """Load the full source_functions.json artifact (18965 entries) if present locally."""
+    path = ARTIFACT_DIR / "source_functions.json"
+    if not path.exists():
+        return None
+    return _read_json(path)
+
+
 # --- Grounding Rules ---
 
 @lru_cache(maxsize=1)
@@ -270,5 +282,6 @@ def clear_caches() -> None:
     load_log_message_index.cache_clear()
     load_human_error_search_index.cache_clear()
     load_source_refs_index.cache_clear()
+    load_source_functions_artifact.cache_clear()
     load_grounding_rules.cache_clear()
     _PROTO_PATHS.clear()
