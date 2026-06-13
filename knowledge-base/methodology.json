@@ -1,0 +1,105 @@
+{
+  "methodology_version": "1.0",
+  "title": "SONiC Verified Troubleshooting Methodology",
+  "description": "Five-phase troubleshooting process with built-in evidence verification at each step. Follow these phases in order using the specified MCP tools.",
+
+  "phases": [
+    {
+      "phase": 1,
+      "name": "DEFINE",
+      "purpose": "Establish a precise problem statement from the operator's symptom report.",
+      "instructions": [
+        "Ask the operator: What is the symptom? When did it start? Which devices/interfaces/protocols are affected?",
+        "Search the KB for matching diagnostic trees and known failure patterns.",
+        "Identify the most specific diagnostic tree that matches the symptom."
+      ],
+      "tools": [
+        {"tool": "search_kb", "when": "Find KB content matching the reported symptom"},
+        {"tool": "get_diagnostic_tree", "when": "Load the decision tree for the symptom"},
+        {"tool": "detect_human_error", "when": "Check if the symptom matches a known operator mistake"}
+      ],
+      "exit_criteria": "A diagnostic tree is identified and the entry symptom matches the operator's report."
+    },
+    {
+      "phase": 2,
+      "name": "DIAGNOSE",
+      "purpose": "Walk the diagnostic tree with the operator, verifying each decision point.",
+      "instructions": [
+        "Present the current branch question and the commands to run.",
+        "Wait for the operator to report the command output.",
+        "Follow the matching branch to the next node.",
+        "At each branch, note which code path step the verification command corresponds to (cross-reference).",
+        "Continue until reaching a leaf node (finding)."
+      ],
+      "tools": [
+        {"tool": "get_diagnostic_tree", "when": "Load a specific node with node_id parameter for resumption"},
+        {"tool": "get_verify_commands", "when": "Get additional verification commands for a protocol state"},
+        {"tool": "get_log_message", "when": "Look up a log message the operator reports seeing"}
+      ],
+      "exit_criteria": "A leaf node (finding) is reached with a specific diagnosis."
+    },
+    {
+      "phase": 3,
+      "name": "EVIDENCE",
+      "purpose": "Build a cross-referenced evidence chain proving the diagnosis is correct.",
+      "instructions": [
+        "Call explain_diagnosis with the tree_id and leaf node_id.",
+        "Review the evidence chain: does the code path support the diagnosis? Does the protocol spec agree?",
+        "If completeness gaps exist, acknowledge them to the operator.",
+        "Present the evidence chain to the operator before proceeding to the fix."
+      ],
+      "tools": [
+        {"tool": "explain_diagnosis", "when": "ALWAYS call this after reaching a diagnostic leaf node"},
+        {"tool": "trace_config_flow", "when": "Get additional code path detail for the affected entity"},
+        {"tool": "get_protocol", "when": "Get full protocol documentation if more context is needed"}
+      ],
+      "exit_criteria": "Evidence chain is assembled and presented. The operator agrees the diagnosis is supported."
+    },
+    {
+      "phase": 4,
+      "name": "RESOLVE",
+      "purpose": "Propose and verify the fix before the operator executes it.",
+      "instructions": [
+        "Identify the fix from the diagnostic node's action field.",
+        "Call verify_action to trace what the fix command does under the hood.",
+        "Look up the relevant procedure if one exists.",
+        "Present the fix with: what it does, what DB tables it writes, what daemons process it, and how to verify it worked.",
+        "Include rollback steps from the procedure if available."
+      ],
+      "tools": [
+        {"tool": "verify_action", "when": "ALWAYS call this before recommending a fix command"},
+        {"tool": "get_procedure", "when": "Look up a relevant operational procedure"},
+        {"tool": "get_config_db_table", "when": "Verify CONFIG_DB table and field names in the fix"},
+        {"tool": "get_daemon_info", "when": "Get details about daemons involved in processing the fix"}
+      ],
+      "exit_criteria": "Fix is verified against code paths and DB schemas. Rollback plan is available."
+    },
+    {
+      "phase": 5,
+      "name": "VERIFY",
+      "purpose": "Confirm the fix resolved the original problem.",
+      "instructions": [
+        "Use the verification_plan from the evidence chain.",
+        "Ask the operator to run each verification command.",
+        "Check that the symptom from Phase 1 is resolved.",
+        "Check that no new symptoms were introduced.",
+        "If the fix did not work, return to Phase 2 with the new state."
+      ],
+      "tools": [
+        {"tool": "get_verify_commands", "when": "Get protocol-specific verification commands"},
+        {"tool": "get_diagnostic_tree", "when": "Re-enter the diagnostic tree if the fix didn't work"},
+        {"tool": "explain_diagnosis", "when": "Re-check the evidence if a different leaf is reached"}
+      ],
+      "exit_criteria": "All verification commands confirm the fix worked. Original symptom is resolved."
+    }
+  ],
+
+  "rules": [
+    "NEVER recommend a fix without first calling verify_action to trace what it does.",
+    "NEVER skip the EVIDENCE phase -- always call explain_diagnosis after reaching a finding.",
+    "If the evidence chain has completeness gaps, state them explicitly to the operator.",
+    "All verification commands come from the KB, not from LLM generation.",
+    "If a diagnostic tree does not exist for the symptom, state that the KB does not cover this scenario.",
+    "Present evidence deterministically: same diagnosis should always show the same evidence chain."
+  ]
+}

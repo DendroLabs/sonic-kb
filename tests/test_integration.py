@@ -45,6 +45,9 @@ HAPPY_PATH_CALLS = [
     ("get_best_practices", {}),
     ("get_grounding_rules", {}),
     ("search_source_ref", {"query": "doTask"}),
+    ("explain_diagnosis", {"tree_id": "bgp-not-establishing", "node_id": "n3"}),
+    ("verify_action", {"action": "config vlan add 100", "entity_type": "vlan"}),
+    ("get_troubleshoot_guide", {}),
 ]
 
 _has_vector_deps = load_vector_index() is not None
@@ -243,6 +246,98 @@ def test_search_kb_content_type_filter():
 def test_search_kb_top_k():
     data = call("search_kb", {"query": "VLAN", "top_k": 3})
     assert len(data["results"]) <= 3
+
+
+# --- Evidence chain (explain_diagnosis / verify_action) ---
+
+def test_explain_diagnosis_evidence_chain():
+    """explain_diagnosis returns a full evidence chain with all sections."""
+    data = call("explain_diagnosis", {"tree_id": "bgp-not-establishing", "node_id": "n3"})
+    assert data["diagnosis"]["tree_id"] == "bgp-not-establishing"
+    assert data["diagnosis"]["node_id"] == "n3"
+    assert "finding" in data["diagnosis"]
+    chain = data["evidence_chain"]
+    assert chain["diagnostic_path"]
+    assert chain["code_path_evidence"] is not None
+    assert chain["protocol_grounding"] is not None
+    assert data["completeness"]["has_diagnostic_path"]
+    assert data["completeness"]["has_code_path"]
+    assert data["completeness"]["has_protocol_grounding"]
+
+
+def test_explain_diagnosis_verify_commands():
+    """Verification plan collects commands from multiple sources."""
+    data = call("explain_diagnosis", {"tree_id": "bgp-not-establishing", "node_id": "n3"})
+    plan = data["evidence_chain"]["verification_plan"]
+    assert len(plan) >= 1
+    sources = {cmd["source"] for cmd in plan}
+    assert "diagnostic_node" in sources
+
+
+def test_explain_diagnosis_deterministic():
+    """Same inputs produce identical output."""
+    a = call("explain_diagnosis", {"tree_id": "bgp-not-establishing", "node_id": "n9"})
+    b = call("explain_diagnosis", {"tree_id": "bgp-not-establishing", "node_id": "n9"})
+    assert a == b
+
+
+def test_explain_diagnosis_graceful_no_code_path():
+    """Trees without related_code_paths still return results with gap flagged."""
+    data = call("explain_diagnosis", {"tree_id": "bfd-flapping", "node_id": "n3"})
+    assert data["diagnosis"]["tree_id"] == "bfd-flapping"
+    assert "no_code_path_coverage" in data["completeness"]["gaps"]
+
+
+def test_explain_diagnosis_invalid_node():
+    """Non-existent node_id returns not-found."""
+    result = execute_tool("explain_diagnosis", {"tree_id": "bgp-not-establishing", "node_id": "n999"})
+    data = json.loads(result.content)
+    assert data.get("found") is False
+
+
+def test_explain_diagnosis_branch_node_rejected():
+    """Branch nodes (not findings) are rejected with an error."""
+    result = execute_tool("explain_diagnosis", {"tree_id": "bgp-not-establishing", "node_id": "n1"})
+    data = json.loads(result.content)
+    assert "error" in data
+
+
+def test_verify_action_traces_code_path():
+    """verify_action traces a config command through the full data flow."""
+    data = call("verify_action", {"action": "config vlan add 100", "entity_type": "vlan"})
+    assert data["path_id"] == "vlan-create"
+    assert len(data["action_trace"]) >= 1
+    assert len(data["db_writes"]) >= 1
+    assert len(data["daemon_chain"]) >= 1
+    assert len(data["verify_commands"]) >= 1
+
+
+def test_verify_action_infers_entity_type():
+    """verify_action infers entity_type from the action text."""
+    data = call("verify_action", {"action": "config interface speed Ethernet0 100000"})
+    assert data["path_id"] == "port-config"
+
+
+def test_verify_action_unknown_entity():
+    """verify_action returns error for unrecognizable action."""
+    result = execute_tool("verify_action", {"action": "do something unknown"})
+    data = json.loads(result.content)
+    assert "error" in data
+
+
+def test_get_troubleshoot_guide_all_phases():
+    """get_troubleshoot_guide returns all 5 phases."""
+    data = call("get_troubleshoot_guide", {})
+    assert len(data["phases"]) == 5
+    phase_names = [p["name"] for p in data["phases"]]
+    assert phase_names == ["DEFINE", "DIAGNOSE", "EVIDENCE", "RESOLVE", "VERIFY"]
+
+
+def test_get_troubleshoot_guide_single_phase():
+    """get_troubleshoot_guide with phase parameter returns one phase."""
+    data = call("get_troubleshoot_guide", {"phase": 3})
+    assert data["name"] == "EVIDENCE"
+    assert "tools" in data
 
 
 @_skip_no_search

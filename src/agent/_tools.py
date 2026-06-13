@@ -363,6 +363,80 @@ TOOL_DEFINITIONS: list[ToolDefinition] = [
             "required": ["query"],
         },
     ),
+    # --- Runtime verification ---
+    ToolDefinition(
+        name="explain_diagnosis",
+        description=(
+            "Build a deterministic evidence chain for a diagnostic finding. "
+            "After walking a diagnostic tree to a leaf node (finding), call this "
+            "to get cross-referenced proof from code paths, protocols, DB schemas, "
+            "and human error patterns showing WHY this diagnosis is correct. "
+            "Same inputs always produce the same output."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "tree_id": {
+                    "type": "string",
+                    "description": "Diagnostic tree ID (e.g., 'bgp-not-establishing')",
+                },
+                "node_id": {
+                    "type": "string",
+                    "description": "Leaf node ID with the finding to explain (e.g., 'n3')",
+                },
+                "code_path_id": {
+                    "type": "string",
+                    "description": "Optional: override the code path to trace (e.g., 'vlan-create'). If omitted, uses the tree's related_code_paths or infers from tree_id.",
+                },
+            },
+            "required": ["tree_id", "node_id"],
+        },
+    ),
+    ToolDefinition(
+        name="verify_action",
+        description=(
+            "Verify a proposed fix command against the KB's code path and DB schema data. "
+            "Traces what happens when a config command is executed: CLI -> CONFIG_DB -> "
+            "daemon -> APPL_DB -> orchagent -> ASIC_DB -> hardware. Each DB write is "
+            "verified against the schema index. Call this BEFORE recommending any fix."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "The proposed fix command or description (e.g., 'config vlan add 100')",
+                },
+                "entity_type": {
+                    "type": "string",
+                    "description": "Optional: entity type to trace (vlan, port, route, lag, acl, tunnel, neighbor, fdb). Inferred from action if omitted.",
+                },
+                "expected_fix": {
+                    "type": "string",
+                    "description": "Optional: what the action should accomplish (for context in the trace)",
+                },
+            },
+            "required": ["action"],
+        },
+    ),
+    ToolDefinition(
+        name="get_troubleshoot_guide",
+        description=(
+            "Get the structured troubleshooting methodology. Returns a 5-phase "
+            "process (DEFINE, DIAGNOSE, EVIDENCE, RESOLVE, VERIFY) with specific "
+            "tools to call at each phase and rules for verified troubleshooting. "
+            "Call this at the start of any troubleshooting session."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "phase": {
+                    "type": "integer",
+                    "description": "Optional: return only a specific phase (1-5). Omit for all phases.",
+                },
+            },
+        },
+    ),
 ]
 
 
@@ -390,6 +464,7 @@ def execute_tool(name: str, arguments: dict, tool_call_id: str = "") -> ToolResu
         from ..retrieval.code_paths import get_code_path, list_code_paths, trace_config_flow
         from ..retrieval.semantic_search import search_kb as _search_kb
         from ..retrieval.diagnostics import get_diagnostic_tree, list_diagnostic_trees
+        from ..retrieval.evidence_chain import explain_diagnosis as _explain_diagnosis, verify_action as _verify_action
         from ..retrieval.human_errors import detect_human_error, get_human_error
         from ..retrieval.logs import get_log_message
         from ..retrieval.procedures import get_procedure, list_procedures
@@ -404,7 +479,7 @@ def execute_tool(name: str, arguments: dict, tool_call_id: str = "") -> ToolResu
             search_protocols_by_tag,
         )
         from ..retrieval.subsystems import get_daemon_info, get_subsystem_info, list_containers
-        from ..retrieval._loader import load_db_table_index, load_grounding_rules, load_source_refs_index, load_source_functions_artifact
+        from ..retrieval._loader import load_db_table_index, load_grounding_rules, load_methodology, load_source_refs_index, load_source_functions_artifact
 
         dispatch: dict = {
             "get_protocol": lambda: get_protocol(arguments["protocol_id"]),
@@ -465,6 +540,19 @@ def execute_tool(name: str, arguments: dict, tool_call_id: str = "") -> ToolResu
                 top_k=arguments.get("top_k", 5),
                 content_type=arguments.get("content_type"),
             ),
+            "explain_diagnosis": lambda: _explain_diagnosis(
+                arguments["tree_id"],
+                arguments["node_id"],
+                code_path_id=arguments.get("code_path_id"),
+            ),
+            "verify_action": lambda: _verify_action(
+                arguments["action"],
+                entity_type=arguments.get("entity_type"),
+                expected_fix=arguments.get("expected_fix"),
+            ),
+            "get_troubleshoot_guide": lambda: _dispatch_methodology(
+                arguments, load_methodology
+            ),
         }
 
         fn = dispatch.get(name)
@@ -493,6 +581,8 @@ def execute_tool(name: str, arguments: dict, tool_call_id: str = "") -> ToolResu
             "get_procedure": ["procedure_id"],
             "search_source_ref": ["query"],
             "search_kb": ["query"],
+            "explain_diagnosis": ["tree_id", "node_id"],
+            "verify_action": ["action"],
         }
         if name in _required:
             missing = [k for k in _required[name] if k not in arguments]
@@ -527,6 +617,18 @@ def _dispatch_config_db_table(arguments: dict, load_index) -> dict | None:
             if not db_name or db_name in k:
                 return v
     return None
+
+
+def _dispatch_methodology(arguments: dict, load_fn) -> dict | None:
+    """Return the troubleshooting methodology, optionally filtered to a single phase."""
+    data = load_fn()
+    phase_num = arguments.get("phase")
+    if phase_num is not None:
+        for p in data.get("phases", []):
+            if p.get("phase") == phase_num:
+                return p
+        return None
+    return data
 
 
 def _dispatch_source_ref_search(arguments: dict, load_index, load_artifact) -> list[dict]:

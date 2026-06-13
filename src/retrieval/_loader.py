@@ -256,6 +256,16 @@ def load_source_functions_artifact() -> list[dict] | None:
     return _read_json(path)
 
 
+# --- Methodology ---
+
+@lru_cache(maxsize=1)
+def load_methodology() -> dict:
+    path = KB_DIR / "methodology.json"
+    if not path.exists():
+        return {"phases": []}
+    return _read_json(path)
+
+
 # --- Grounding Rules ---
 
 @lru_cache(maxsize=1)
@@ -293,4 +303,5 @@ def clear_caches() -> None:
     load_source_functions_artifact.cache_clear()
     load_vector_index.cache_clear()
     load_grounding_rules.cache_clear()
+    load_methodology.cache_clear()
     _PROTO_PATHS.clear()
