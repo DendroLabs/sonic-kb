@@ -462,7 +462,7 @@ def execute_tool(name: str, arguments: dict, tool_call_id: str = "") -> ToolResu
             ),
             "search_kb": lambda: _search_kb(
                 arguments["query"],
-                top_k=min(arguments.get("top_k", 5), 20),
+                top_k=arguments.get("top_k", 5),
                 content_type=arguments.get("content_type"),
             ),
         }

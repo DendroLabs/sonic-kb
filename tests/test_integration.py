@@ -45,8 +45,15 @@ HAPPY_PATH_CALLS = [
     ("get_best_practices", {}),
     ("get_grounding_rules", {}),
     ("search_source_ref", {"query": "doTask"}),
-    ("search_kb", {"query": "BGP session not establishing"}),
 ]
+
+_has_vector_deps = load_vector_index() is not None
+try:
+    import sentence_transformers  # noqa: F401
+    _has_st = True
+except ImportError:
+    _has_st = False
+_can_search_kb = _has_vector_deps and _has_st
 
 
 @pytest.mark.parametrize("name,args", HAPPY_PATH_CALLS, ids=[c[0] for c in HAPPY_PATH_CALLS])
@@ -56,10 +63,19 @@ def test_tool_happy_path(name, args):
     assert data.get("found") is not False
 
 
+@pytest.mark.skipif(not _can_search_kb, reason="vector index or sentence-transformers not available")
+def test_search_kb_happy_path():
+    """search_kb tested separately because it requires optional [vector] deps."""
+    data = call("search_kb", {"query": "BGP session not establishing"})
+    assert data.get("kb_coverage") == "indexed"
+    assert data["count"] >= 1
+
+
 def test_all_tools_covered():
-    """Every defined tool has a happy-path test above."""
+    """Every defined tool has a happy-path test above or a dedicated happy-path test."""
     defined = {t.name for t in TOOL_DEFINITIONS}
     tested = {name for name, _ in HAPPY_PATH_CALLS}
+    tested.add("search_kb")
     assert defined == tested
 
 
@@ -201,13 +217,12 @@ def test_search_source_ref_no_match_is_empty():
 
 # --- Semantic search (search_kb) ---
 
-_has_vector_index = load_vector_index() is not None
-_skip_no_vector = pytest.mark.skipif(not _has_vector_index, reason="vector index not built")
+_skip_no_search = pytest.mark.skipif(
+    not _can_search_kb, reason="vector index or sentence-transformers not available"
+)
 
-st = pytest.importorskip("sentence_transformers", reason="sentence-transformers not installed")
 
-
-@_skip_no_vector
+@_skip_no_search
 def test_search_kb_returns_ranked_results():
     data = call("search_kb", {"query": "BGP neighbor keeps going down"})
     results = data["results"]
@@ -217,20 +232,20 @@ def test_search_kb_returns_ranked_results():
     assert scores == sorted(scores, reverse=True), "results must be ranked by score"
 
 
-@_skip_no_vector
+@_skip_no_search
 def test_search_kb_content_type_filter():
     data = call("search_kb", {"query": "configuration change", "content_type": "human-error"})
     results = data["results"]
     assert all(r["type"] == "human-error" for r in results)
 
 
-@_skip_no_vector
+@_skip_no_search
 def test_search_kb_top_k():
     data = call("search_kb", {"query": "VLAN", "top_k": 3})
     assert len(data["results"]) <= 3
 
 
-@_skip_no_vector
+@_skip_no_search
 def test_search_kb_bgp_query_finds_protocol():
     data = call("search_kb", {"query": "BGP routing protocol session establishment"})
     types = {r["type"] for r in data["results"]}

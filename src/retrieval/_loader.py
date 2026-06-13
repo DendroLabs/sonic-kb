@@ -236,12 +236,9 @@ def load_source_refs_index() -> dict[str, dict]:
     return _read_json(path)
 
 
-VEC_DIR = IDX_DIR
-
-
 @lru_cache(maxsize=1)
 def load_vector_index() -> dict | None:
-    path = VEC_DIR / "_vector_index.json"
+    path = IDX_DIR / "_vector_index.json"
     if not path.exists():
         return None
     return _read_json(path)

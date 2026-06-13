@@ -21,6 +21,7 @@ OUT_PATH = KB_DIR / "indexes" / "_vector_index.json"
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 FLOAT_PRECISION = 4
+TEXT_PREVIEW_LEN = 300
 
 
 def _read_json(path: Path) -> dict | list:
@@ -32,107 +33,63 @@ def _text(*parts: str) -> str:
     return ". ".join(p.strip().rstrip(".") for p in parts if p and p.strip())
 
 
-# --- Content extractors: each yields (id, type, title, text) tuples ---
+# --- Content extractors ---
 
 
-def extract_protocols() -> list[tuple[str, str, str, str]]:
+def _extract_dir(dir_name, content_type, id_field, title_field, text_fn):
+    """Generic extractor for directory-based KB content."""
     chunks = []
-    proto_dir = KB_DIR / "protocols"
-    for path in sorted(proto_dir.glob("*.json")):
+    for path in sorted((KB_DIR / dir_name).glob("*.json")):
         if path.name.startswith("_"):
             continue
         d = _read_json(path)
-        pid = d.get("protocol_id", path.stem)
-        title = d.get("protocol_name", pid)
-        parts = [title, d.get("purpose", "")]
-        for fm in d.get("failure_modes", []):
-            parts.append(fm.get("name", ""))
-            parts.append(fm.get("description", ""))
-        chunks.append((f"protocol:{pid}", "protocol", title, _text(*parts)))
+        cid = d.get(id_field, path.stem)
+        title = d.get(title_field, cid)
+        chunks.append((f"{content_type}:{cid}", content_type, title, text_fn(d, title)))
     return chunks
 
 
-def extract_subsystems() -> list[tuple[str, str, str, str]]:
-    chunks = []
-    sub_dir = KB_DIR / "subsystems"
-    for path in sorted(sub_dir.glob("*.json")):
-        if path.name.startswith("_"):
-            continue
-        d = _read_json(path)
-        sid = d.get("subsystem_id", path.stem)
-        title = d.get("display_name", sid)
-        parts = [title, d.get("purpose", "")]
-        for daemon in d.get("daemons", []):
-            parts.append(f"{daemon.get('name', '')}: {daemon.get('role', '')}")
-        chunks.append((f"subsystem:{sid}", "subsystem", title, _text(*parts)))
-    return chunks
+def _proto_text(d, title):
+    parts = [title, d.get("purpose", "")]
+    for fm in d.get("failure_modes", []):
+        parts.extend([fm.get("name", ""), fm.get("description", "")])
+    return _text(*parts)
 
 
-def extract_code_paths() -> list[tuple[str, str, str, str]]:
-    chunks = []
-    cp_dir = KB_DIR / "code-paths"
-    for path in sorted(cp_dir.glob("*.json")):
-        if path.name.startswith("_"):
-            continue
-        d = _read_json(path)
-        pid = d.get("path_id", path.stem)
-        title = d.get("display_name", pid)
-        parts = [title, d.get("trigger", "")]
-        for step in d.get("steps", []):
-            parts.append(step.get("action", ""))
-        chunks.append((f"code-path:{pid}", "code-path", title, _text(*parts)))
-    return chunks
+def _subsystem_text(d, title):
+    parts = [title, d.get("purpose", "")]
+    for daemon in d.get("daemons", []):
+        parts.append(f"{daemon.get('name', '')}: {daemon.get('role', '')}")
+    return _text(*parts)
 
 
-def extract_human_errors() -> list[tuple[str, str, str, str]]:
-    chunks = []
-    he_dir = KB_DIR / "human-errors"
-    for path in sorted(he_dir.glob("*.json")):
-        if path.name.startswith("_"):
-            continue
-        d = _read_json(path)
-        eid = d.get("error_id", path.stem)
-        title = d.get("display_name", eid)
-        parts = [title, d.get("pattern", ""), d.get("what_goes_wrong", "")]
-        for s in d.get("symptoms", []):
-            parts.append(s if isinstance(s, str) else s.get("description", ""))
-        parts.append(d.get("correct_procedure", ""))
-        chunks.append((f"human-error:{eid}", "human-error", title, _text(*parts)))
-    return chunks
+def _code_path_text(d, title):
+    parts = [title, d.get("trigger", "")]
+    for step in d.get("steps", []):
+        parts.append(step.get("action", ""))
+    return _text(*parts)
 
 
-def extract_diagnostics() -> list[tuple[str, str, str, str]]:
-    chunks = []
-    diag_dir = KB_DIR / "diagnostics"
-    for path in sorted(diag_dir.glob("*.json")):
-        if path.name.startswith("_"):
-            continue
-        d = _read_json(path)
-        tid = d.get("tree_id", path.stem)
-        title = d.get("display_name", tid)
-        parts = [title, d.get("entry_symptom", "")]
-        for node in d.get("nodes", []):
-            parts.append(node.get("question", ""))
-            parts.append(node.get("finding", ""))
-            parts.append(node.get("action", ""))
-        chunks.append((f"diagnostic:{tid}", "diagnostic", title, _text(*parts)))
-    return chunks
+def _human_error_text(d, title):
+    parts = [title, d.get("pattern", ""), d.get("what_goes_wrong", "")]
+    for s in d.get("symptoms", []):
+        parts.append(s if isinstance(s, str) else s.get("description", ""))
+    parts.append(d.get("correct_procedure", ""))
+    return _text(*parts)
 
 
-def extract_procedures() -> list[tuple[str, str, str, str]]:
-    chunks = []
-    proc_dir = KB_DIR / "procedures"
-    for path in sorted(proc_dir.glob("*.json")):
-        if path.name.startswith("_"):
-            continue
-        d = _read_json(path)
-        pid = d.get("procedure_id", path.stem)
-        title = d.get("procedure_name", pid)
-        parts = [title, d.get("purpose", "")]
-        for step in d.get("steps", []):
-            parts.append(step.get("action", ""))
-        chunks.append((f"procedure:{pid}", "procedure", title, _text(*parts)))
-    return chunks
+def _diagnostic_text(d, title):
+    parts = [title, d.get("entry_symptom", "")]
+    for node in d.get("nodes", []):
+        parts.extend([node.get("question", ""), node.get("finding", ""), node.get("action", "")])
+    return _text(*parts)
+
+
+def _procedure_text(d, title):
+    parts = [title, d.get("purpose", "")]
+    for step in d.get("steps", []):
+        parts.append(step.get("action", ""))
+    return _text(*parts)
 
 
 def extract_best_practices() -> list[tuple[str, str, str, str]]:
@@ -141,11 +98,12 @@ def extract_best_practices() -> list[tuple[str, str, str, str]]:
     if not bp_path.exists():
         return chunks
     data = _read_json(bp_path)
-    for i, p in enumerate(data.get("practices", [])):
-        title = p.get("title", f"practice-{i}")
-        topic = p.get("topic", "")
+    for p in data.get("practices", []):
+        title = p.get("title", "untitled")
+        topic = p.get("topic", "general")
+        slug = title.lower()[:40].replace(" ", "-").strip("-")
+        bp_id = f"best-practice:{topic}:{slug}"
         content = p.get("content", "")
-        bp_id = f"best-practice:{topic}:{i}"
         chunks.append((bp_id, "best-practice", title, _text(title, content)))
     return chunks
 
@@ -213,21 +171,23 @@ def extract_definitions() -> list[tuple[str, str, str, str]]:
     return chunks
 
 
+_DIR_SOURCES = [
+    ("protocols", "protocol", "protocol_id", "protocol_name", _proto_text),
+    ("subsystems", "subsystem", "subsystem_id", "display_name", _subsystem_text),
+    ("code-paths", "code-path", "path_id", "display_name", _code_path_text),
+    ("human-errors", "human-error", "error_id", "display_name", _human_error_text),
+    ("diagnostics", "diagnostic", "tree_id", "display_name", _diagnostic_text),
+    ("procedures", "procedure", "procedure_id", "procedure_name", _procedure_text),
+]
+
+
 def collect_all_chunks() -> list[tuple[str, str, str, str]]:
-    extractors = [
-        extract_protocols,
-        extract_subsystems,
-        extract_code_paths,
-        extract_human_errors,
-        extract_diagnostics,
-        extract_procedures,
-        extract_best_practices,
-        extract_logs,
-        extract_definitions,
-    ]
     all_chunks = []
-    for fn in extractors:
-        all_chunks.extend(fn())
+    for args in _DIR_SOURCES:
+        all_chunks.extend(_extract_dir(*args))
+    all_chunks.extend(extract_best_practices())
+    all_chunks.extend(extract_logs())
+    all_chunks.extend(extract_definitions())
     return all_chunks
 
 
@@ -264,7 +224,7 @@ def build_vector_index() -> None:
             "id": cid,
             "type": ctype,
             "title": title,
-            "text": text[:300],
+            "text": text[:TEXT_PREVIEW_LEN],
             "embedding": [round(float(v), FLOAT_PRECISION) for v in emb],
         })
 
