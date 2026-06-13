@@ -1,0 +1,161 @@
+                        SONIC VERIFICATION COUNCIL
+                        ==========================
+
+  KB Content File
+       |
+       v
++----------------------------------------------+
+| 1. DECOMPOSER  (Sonnet)                     |
+|                                              |
+|  Reads candidate file, breaks into 10-20     |
+|  typed atomic claims:                        |
+|                                              |
+|   config-syntax | source-ref                 |
+|   protocol-behavior | internal-logic         |
+|                                              |
+|  Each claim gets:                            |
+|   - blind_goal (question, NO answer leaked)  |
+|   - candidate_answer (what the file says)    |
++----------------------------------------------+
+       |
+       | claims routed by type
+       v
++----------------------------------------------+
+| 2. BLIND RE-DERIVATION  (per evidence source)|
+|                                              |
+|  Each domain agent gets ONLY the blind_goal  |
+|  and its own evidence -- NEVER the candidate.|
+|                                              |
+|  +------------+  +------------+              |
+|  | Config     |  | Arch       |              |
+|  | (Haiku)    |  | (Sonnet)   |              |
+|  | Evidence:  |  | Evidence:  |              |
+|  | db_schemas |  | build/     |              |
+|  | .json      |  | repos/     |              |
+|  | (206 tbls) |  | (grep src) |              |
+|  +------------+  +------------+              |
+|  +------------+  +------------+              |
+|  | RFC        |  | Logic      |              |
+|  | (Sonnet)   |  | (Sonnet)   |              |
+|  | Evidence:  |  | Evidence:  |              |
+|  | RFC/IEEE   |  | NONE -     |              |
+|  | standards  |  | internal   |              |
+|  |            |  | reasoning  |              |
+|  +------------+  +------------+              |
+|                                              |
+|  Blind protocol enforced mechanically:       |
+|  - Agents told NOT to read KB files          |
+|  - Output scanned for breach (regex)         |
+|  - Breach -> one retry with warning          |
+|  - 2nd breach -> derivation discarded        |
++----------------------------------------------+
+       |
+       v
++----------------------------------------------+
+| 3. MECHANICAL DIFF  (Haiku)                 |
+|                                              |
+|  derivation vs candidate -- pure text diff   |
+|  No outside knowledge, just compare strings  |
+|                                              |
+|  Verdicts per claim:                         |
+|    match       - same substance              |
+|    partial     - overlap, concrete mismatch  |
+|    mismatch    - derivation contradicts       |
+|    underivable - evidence source can't answer |
+|                                              |
+|  Guard: underivable derivation can never     |
+|  become match (mechanically forced back)     |
++----------------------------------------------+
+       |
+       v
++----------------------------------------------+
+| 4. WHOLE-CHECK  (Sonnet, logic agent)        |
+|                                              |
+|  Three checks no part-level agent can do:    |
+|                                              |
+|  a. Completeness                             |
+|     Did decomposer miss any assertions?      |
+|     (unverified leaps hide in gaps)          |
+|                                              |
+|  b. Consistency                              |
+|     Do verified parts agree with each other? |
+|     (step 3 assumes state step 2 didn't set) |
+|                                              |
+|  c. Entailment                               |
+|     Do parts add up to the file's overall    |
+|     conclusion?                              |
++----------------------------------------------+
+       |
+       v
++----------------------------------------------+
+| 5. FAULT-FINDER  (Sonnet) -- ONE adversary  |
+|                                              |
+|  Reads the candidate file + all findings.    |
+|  Scores each: severity x confidence          |
+|                                              |
+|  Evidence gate:                              |
+|    severity > minor REQUIRES cited evidence  |
+|    (file:line, RFC section, schema field)    |
+|    No evidence -> stays minor, period.       |
+|                                              |
+|  May add extra_concerns the council missed.  |
++----------------------------------------------+
+       |
+       | Tier 1 stops here (content entering KB)
+       | Tier 2 continues (audit / dispute)
+       v
++----------------------------------------------+
+| 6. ESCALATION  (Tier 2 only, one round)     |
+|                                              |
+|  major+ AND evidenced findings:              |
+|                                              |
+|  +------------------------------------------+|
+|  | RE-EXAM: domain agent re-verifies the    ||
+|  | original claim fresh, given the fault-   ||
+|  | finder's evidence (NOT "do you agree?")  ||
+|  +------------------------------------------+|
+|       |                    |                  |
+|    claim holds         claim fails            |
+|       |                    |                  |
+|       v                    v                  |
+|   DISPUTED           ADJUDICATION            |
+|   (logged)           (logic agent)            |
+|                            |                  |
+|                 +----------+---------+        |
+|                 |                    |         |
+|             confirmed           disputed      |
+|             (error is real)     (logged)       |
++----------------------------------------------+
+       |
+       v
++----------------------------------------------+
+| OUTPUT: JSONL records -> council-log.jsonl   |
+|                                              |
+| Per finding:                                 |
+|  {content_file, claim, agent, method,        |
+|   verdict, evidence, score,                  |
+|   escalation_outcome}                        |
+|                                              |
+| Terminal states:                             |
+|  match / partial / mismatch / underivable    |
+|  escalation: none / confirmed / disputed     |
++----------------------------------------------+
+
+
+  COST TIERS (by persistence, not question type)
+  -----------------------------------------------
+  Tier 0  Interactive question    1 domain agent
+  Tier 1  Content entering KB     Full council, no escalation
+  Tier 2  /sonic-council or       Full council + escalation
+          user dispute
+
+
+  KEY DESIGN INSIGHT
+  ------------------
+  Domain agents never see the candidate answer. They independently
+  derive their own answer from evidence, then a mechanical diff
+  catches disagreements. This avoids both confirmation bias
+  ("looks right to me") and adversarial fault-finding bias
+  ("let me manufacture objections"). The single fault-finder is
+  the only adversarial agent, and it is evidence-gated to prevent
+  noise.
