@@ -2,6 +2,7 @@
 name = "sonic-knowledge-base"
 version = "0.1.0"
 description = "Pre-compiled SONiC troubleshooting knowledge base with MCP server"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "rich>=13.0",
